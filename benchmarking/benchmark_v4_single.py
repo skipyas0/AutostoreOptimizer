@@ -142,7 +142,7 @@ def _run_warmstart(cfg: dict, heuristic_module: str) -> dict:
     move_cap = cfg.get("movecap", None)
 
     # 1. Generate data (single call shared by heuristic and CP)
-    S, L, K, orders_req, rt, p, N = generate_data(
+    instance = generate_data(
         num_stations=num_stations,
         lanes_per_station=lanes_per_station,
         num_orders=num_orders,
@@ -150,7 +150,8 @@ def _run_warmstart(cfg: dict, heuristic_module: str) -> dict:
         seed=seed,
         pick_touch_time=pick_touch_time,
     )
-    rt_ret = dict(rt)
+    S, L, K, orders_req, rt, p, N = instance
+    rt_ret = instance.rt_ret
     O = sorted(orders_req.keys())
 
     # 2. Run heuristic

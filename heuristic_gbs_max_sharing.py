@@ -8,6 +8,7 @@ to "max_sharing" instead of "readiness_weighted".
 
 from heuristic_gbs import run_gbs_adaptive, run_gbs
 import time
+from instance import Instance
 from datagen import generate_data
 import argparse
 
@@ -30,7 +31,7 @@ def solve_heuristic_instance(config: dict, return_raw: bool = False):
     # Default changed here:
     gbs_rule = config.get("gbs_rule", "max_sharing")
 
-    S, L, K, orders_req, rt, p, N = generate_data(
+    instance = generate_data(
         num_stations=num_stations,
         lanes_per_station=lanes_per_station,
         num_orders=num_orders,
@@ -38,30 +39,27 @@ def solve_heuristic_instance(config: dict, return_raw: bool = False):
         seed=seed,
         pick_touch_time=pick_touch_time,
     )
-    rt_ret = dict(rt)
-    O = sorted(orders_req.keys())
+    S, L, K, orders_req, rt, p, N = instance
+    O = instance.O
 
     t0 = time.perf_counter()
     if gbs_rule == "adaptive":
         sol = run_gbs_adaptive(
-            S, L, K, O,
-            orders_req, rt, rt_ret, p,
-            N, horizon, move_cap,
-            alpha, beta
+            instance,
+            horizon=horizon, move_cap=move_cap,
+            alpha=alpha, beta=beta
         )
     else:
         sol = run_gbs(
-            S, L, K, O,
-            orders_req, rt, rt_ret, p,
-            N, horizon, move_cap,
-            alpha, beta,
+            instance,
+            horizon=horizon, move_cap=move_cap,
+            alpha=alpha, beta=beta,
             scoring_rule=gbs_rule
         )
     elapsed = time.perf_counter() - t0
     status = "Feasible" if sol.feasible else "Infeasible"
     violations = validate_solution(
-        sol, S, L, K, O, orders_req, rt, rt_ret, p, N,
-        horizon=horizon, move_cap=move_cap,
+        sol, instance, horizon=horizon, move_cap=move_cap
     )
     if violations:
         print(f"VALIDATION FAILED ({len(violations)} violations)")
@@ -110,7 +108,7 @@ def main() -> None:
     args = ap.parse_args()
 
     print("Generating data...")
-    S, L, K, orders_req, rt, p, N = generate_data(
+    instance = generate_data(
         num_stations=args.stations,
         lanes_per_station=args.lanes,
         num_orders=args.orders,
@@ -118,8 +116,8 @@ def main() -> None:
         seed=args.seed,
         pick_touch_time=args.pick,
     )
-    rt_ret = dict(rt)
-    O = sorted(orders_req.keys())
+    S, L, K, orders_req, rt, p, N = instance
+    O = instance.O
 
     print(f"Stations={len(S)}, Lanes={len(L)}, SKUs={len(K)}, Orders={len(O)}, RobotLimit={args.movecap}\n")
 
@@ -127,13 +125,13 @@ def main() -> None:
     t0 = time.perf_counter()
     if args.rule == 'adaptive':
         sol = run_gbs_adaptive(
-            S, L, K, O, orders_req, rt, rt_ret, p, N,
+            instance,
             horizon=args.horizon, move_cap=args.movecap,
             ALPHA=args.alpha, BETA=args.beta
         )
     else:
         sol = run_gbs(
-            S, L, K, O, orders_req, rt, rt_ret, p, N,
+            instance,
             horizon=args.horizon, move_cap=args.movecap,
             ALPHA=args.alpha, BETA=args.beta,
             scoring_rule=args.rule
@@ -147,8 +145,7 @@ def main() -> None:
     print(f"Time:        {elapsed:.4f}s")
 
     violations = validate_solution(
-        sol, S, L, K, O, orders_req, rt, rt_ret, p, N,
-        horizon=args.horizon, move_cap=args.movecap,
+        sol, instance, horizon=args.horizon, move_cap=args.movecap
     )
     if violations:
         print(f"VALIDATION FAILED ({len(violations)} violations)")
@@ -162,7 +159,7 @@ def main() -> None:
             from schedule_visualizer import plot_schedule
             from autostore_heuristic import build_viz_handles
             mock_sol, handles = build_viz_handles(
-                sol, S, L, K, O, orders_req, rt, rt_ret, p,
+                sol, instance
             )
             plot_schedule(mock_sol, handles)
         except Exception as exc:

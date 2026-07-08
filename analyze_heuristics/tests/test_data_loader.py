@@ -30,7 +30,7 @@ CP_FILE_CONTENT = {
 
 @pytest.fixture
 def tmp_base(tmp_path):
-    cp_dir = tmp_path / "logs" / "v6_and_smg_1_newdatagen"
+    cp_dir = tmp_path / "logs" / "v6_CPGWS_2_newdatagen"
     cp_dir.mkdir(parents=True)
     (cp_dir / "warmstart_orders_val10_seed0.json").write_text(json.dumps(CP_FILE_CONTENT))
     return tmp_path
@@ -99,7 +99,7 @@ AMA_2PHASE_FILE_CONTENT = {
 
 @pytest.fixture
 def tmp_base_heuristics(tmp_path):
-    h_dir = tmp_path / "results" / "heuristic_local" / "greedy_ama_cfss_rdi_gbs"
+    h_dir = tmp_path / "results" / "heuristic_local" / "full_final"
     h_dir.mkdir(parents=True)
     (h_dir / "autostore_heuristic_orders_val10_seed0.json").write_text(
         json.dumps(GREEDY_FILE_CONTENT))
@@ -172,7 +172,7 @@ AMA_SGC_NO_RUNS = {
 
 @pytest.fixture
 def tmp_base_configs(tmp_path):
-    h_dir = tmp_path / "results" / "heuristic_local" / "greedy_ama_cfss_rdi_gbs"
+    h_dir = tmp_path / "results" / "heuristic_local" / "full_final"
     h_dir.mkdir(parents=True)
     (h_dir / "heuristic_ama_sgc_movecap_val10_seed0.json").write_text(
         json.dumps(AMA_SGC_WITH_RUNS))
@@ -209,7 +209,7 @@ def test_load_configs_columns(tmp_base_configs):
 
 
 def test_load_all_returns_three_dataframes(tmp_base_configs):
-    cp_dir = tmp_base_configs / "logs" / "v6_and_smg_1_newdatagen"
+    cp_dir = tmp_base_configs / "logs" / "v6_CPGWS_2_newdatagen"
     cp_dir.mkdir(parents=True)
     (cp_dir / "warmstart_movecap_val10_seed0.json").write_text(json.dumps(CP_FILE_CONTENT))
     df_configs, df_heuristics, df_cp = load_all(tmp_base_configs)

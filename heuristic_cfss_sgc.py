@@ -18,6 +18,7 @@ import os
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Optional
+from instance import Instance
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -242,16 +243,9 @@ def score_cluster_at_station(
 # ============================================================
 
 def run_cfss_sgc(
-        S: list[int], L: list[int], K: list[int], O: list[int],
-        orders_req: dict[int, list[int]],
-        rt: dict[int, int], rt_ret: dict[int, int], p: dict[int, int],
-        N: dict[int, int],
-        horizon: int,
-        move_cap: Optional[int] = None,
-        ALPHA: float = 1.0,
-        BETA: float = 0.0,
-        sim_threshold: float = 0.1,
-        max_cluster_orders: int = 8,
+        instance,
+        *args,
+        **kwargs
 ) -> Solution:
     """Cluster-First Schedule-Second SGC heuristic.
 
@@ -262,6 +256,36 @@ def run_cfss_sgc(
     5. Globally interleave, picking earliest available station and its best order.
     6. Return assembled Solution.
     """
+    if not isinstance(instance, Instance):
+        S = instance
+        L = args[0]
+        K = args[1]
+        O = args[2]
+        orders_req = args[3]
+        rt = args[4]
+        rt_ret = args[5]
+        p = args[6]
+        N = args[7]
+        horizon = kwargs.get('horizon', args[8] if len(args) > 8 else 10000)
+        move_cap = kwargs.get('move_cap', args[9] if len(args) > 9 else None)
+        ALPHA = kwargs.get('ALPHA', args[10] if len(args) > 10 else 1.0)
+        BETA = kwargs.get('BETA', args[11] if len(args) > 11 else 0.0)
+        sim_threshold = kwargs.get('sim_threshold', args[12] if len(args) > 12 else 0.1)
+        max_cluster_orders = kwargs.get('max_cluster_orders', args[13] if len(args) > 13 else 8)
+        instance = Instance(S, L, K, orders_req, rt, p, N, rt_ret=rt_ret)
+    else:
+        horizon = kwargs.get('horizon', args[0] if len(args) > 0 else 10000)
+        move_cap = kwargs.get('move_cap', args[1] if len(args) > 1 else None)
+        ALPHA = kwargs.get('ALPHA', args[2] if len(args) > 2 else 1.0)
+        BETA = kwargs.get('BETA', args[3] if len(args) > 3 else 0.0)
+        sim_threshold = kwargs.get('sim_threshold', args[4] if len(args) > 4 else 0.1)
+        max_cluster_orders = kwargs.get('max_cluster_orders', args[5] if len(args) > 5 else 8)
+        rt_ret = kwargs.get('rt_ret', args[6] if len(args) > 6 else None)
+
+    S, L, K, orders_req, rt, p, N = instance
+    O = instance.O
+    if rt_ret is None:
+        rt_ret = instance.rt_ret
     sim_matrix = build_similarity_matrix(O, orders_req, rt, rt_ret)
     clusters = agglomerative_cluster(
         O, orders_req, sim_matrix, rt,
@@ -415,7 +439,7 @@ def solve_heuristic_instance(config: dict, return_raw: bool = False):
     sim_threshold = config.get("sim_threshold", 0.1)
     max_cluster_orders = config.get("max_cluster_orders", 4)
 
-    S, L, K, orders_req, rt, p, N = generate_data(
+    instance = generate_data(
         num_stations=num_stations,
         lanes_per_station=lanes_per_station,
         num_orders=num_orders,
@@ -423,20 +447,19 @@ def solve_heuristic_instance(config: dict, return_raw: bool = False):
         seed=seed,
         pick_touch_time=pick_touch_time,
     )
-    rt_ret = dict(rt)
-    O = sorted(orders_req.keys())
+    S, L, K, orders_req, rt, p, N = instance
+    O = instance.O
 
     t0 = time.perf_counter()
     sol = run_cfss_sgc(
-        S, L, K, O, orders_req, rt, rt_ret, p, N,
+        instance,
         horizon=horizon, move_cap=move_cap, ALPHA=alpha, BETA=beta,
         sim_threshold=sim_threshold, max_cluster_orders=max_cluster_orders,
     )
     elapsed = time.perf_counter() - t0
     status = "Feasible" if sol.feasible else "Infeasible"
     violations = validate_solution(
-        sol, S, L, K, O, orders_req, rt, rt_ret, p, N,
-        horizon=horizon, move_cap=move_cap,
+        sol, instance, horizon=horizon, move_cap=move_cap
     )
     if violations:
         print(f"VALIDATION FAILED ({len(violations)} violations)")
@@ -488,7 +511,7 @@ def main() -> None:
     args = ap.parse_args()
 
     print("Generating data...")
-    S, L, K, orders_req, rt, p, N = generate_data(
+    instance = generate_data(
         num_stations=args.stations,
         lanes_per_station=args.lanes,
         num_orders=args.orders,
@@ -496,8 +519,8 @@ def main() -> None:
         seed=args.seed,
         pick_touch_time=args.pick,
     )
-    rt_ret = dict(rt)
-    O = sorted(orders_req.keys())
+    S, L, K, orders_req, rt, p, N = instance
+    O = instance.O
 
     print(f"Stations={len(S)}, Lanes={len(L)}, SKUs={len(K)}, Orders={len(O)}, RobotLimit={args.movecap}\n")
 
@@ -507,7 +530,7 @@ def main() -> None:
     )
     t0 = time.perf_counter()
     sol = run_cfss_sgc(
-        S, L, K, O, orders_req, rt, rt_ret, p, N,
+        instance,
         horizon=args.horizon, move_cap=args.movecap,
         ALPHA=args.alpha, BETA=args.beta,
         sim_threshold=args.sim_threshold,
@@ -522,8 +545,7 @@ def main() -> None:
     print(f"Time:        {elapsed:.4f}s")
 
     violations = validate_solution(
-        sol, S, L, K, O, orders_req, rt, rt_ret, p, N,
-        horizon=args.horizon, move_cap=args.movecap,
+        sol, instance, horizon=args.horizon, move_cap=args.movecap
     )
     if violations:
         print(f"VALIDATION FAILED ({len(violations)} violations)")
@@ -536,7 +558,7 @@ def main() -> None:
         try:
             from schedule_visualizer import plot_schedule
             mock_sol, handles = build_viz_handles(
-                sol, S, L, K, O, orders_req, rt, rt_ret, p,
+                sol, instance
             )
             plot_schedule(mock_sol, handles)
         except Exception as exc:

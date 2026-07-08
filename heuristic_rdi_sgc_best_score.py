@@ -8,6 +8,7 @@ to "best_score" instead of "sum_rt_asc".
 
 from heuristic_rdi_sgc import run_rdi_sgc
 import time
+from instance import Instance
 from datagen import generate_data
 import argparse
 
@@ -30,7 +31,7 @@ def solve_heuristic_instance(config: dict, return_raw: bool = False):
     # Default changed here:
     tiebreaker = config.get("tiebreaker", "best_score")
 
-    S, L, K, orders_req, rt, p, N = generate_data(
+    instance = generate_data(
         num_stations=num_stations,
         lanes_per_station=lanes_per_station,
         num_orders=num_orders,
@@ -38,14 +39,12 @@ def solve_heuristic_instance(config: dict, return_raw: bool = False):
         seed=seed,
         pick_touch_time=pick_touch_time,
     )
-    rt_ret = dict(rt)
-    O = sorted(orders_req.keys())
+    S, L, K, orders_req, rt, p, N = instance
+    O = instance.O
 
     t0 = time.perf_counter()
     sol = run_rdi_sgc(
-        S=S, L=L, K=K, O=O,
-        orders_req=orders_req, rt=rt,
-        rt_ret=rt_ret, p=p, N=N,
+        instance,
         horizon=horizon, move_cap=move_cap,
         ALPHA=alpha, BETA=beta,
         regret_k=config.get("regret_k", 2),
@@ -55,8 +54,7 @@ def solve_heuristic_instance(config: dict, return_raw: bool = False):
     elapsed = time.perf_counter() - t0
     status = "Feasible" if sol.feasible else "Infeasible"
     violations = validate_solution(
-        sol, S, L, K, O, orders_req, rt, rt_ret, p, N,
-        horizon=horizon, move_cap=move_cap,
+        sol, instance, horizon=horizon, move_cap=move_cap
     )
     if violations:
         print(f"VALIDATION FAILED ({len(violations)} violations)")
@@ -101,20 +99,21 @@ def main() -> None:
     args = ap.parse_args()
 
     print("Generating data...")
-    S, L, K, orders_req, rt, p, N = generate_data(
+    instance = generate_data(
         num_stations=args.stations, lanes_per_station=args.lanes,
         num_orders=args.orders, num_skus=args.skus, seed=args.seed,
         pick_touch_time=args.pick
     )
-    rt_ret = dict(rt)
-    O = sorted(orders_req.keys())
+    S, L, K, orders_req, rt, p, N = instance
+    O = instance.O
+    rt_ret = instance.rt_ret
 
     print(f"Stations={len(S)}, Lanes={len(L)}, SKUs={len(K)}, Orders={len(O)}, RobotLimit={args.movecap}\n")
     print(f"Running RDI-SGC (regret_k={args.regret_k}, tiebreaker={args.tiebreaker}, lazy={not args.no_lazy})")
 
     t0 = time.perf_counter()
     sol = run_rdi_sgc(
-        S, L, K, O, orders_req, rt, rt_ret, p, N,
+        instance,
         horizon=args.horizon, move_cap=args.movecap,
         ALPHA=args.alpha, BETA=args.beta, regret_k=args.regret_k,
         use_lazy=not args.no_lazy, tiebreaker=args.tiebreaker
@@ -128,8 +127,7 @@ def main() -> None:
     print(f"Time:        {elapsed:.4f}s")
 
     violations = validate_solution(
-        sol, S, L, K, O, orders_req, rt, rt_ret, p, N,
-        horizon=args.horizon, move_cap=args.movecap,
+        sol, instance, horizon=args.horizon, move_cap=args.movecap
     )
     if violations:
         print(f"VALIDATION FAILED ({len(violations)} violations)")

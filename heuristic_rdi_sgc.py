@@ -6,6 +6,7 @@ from autostore_heuristic import commit_plan, validate_solution, init_state
 from typing import Literal
 from dataclasses import dataclass
 from typing import Optional, Dict, Set, List
+from instance import Instance
 
 
 def build_sku_order_index(orders_req: Dict[int, List[int]]) -> Dict[int, Set[int]]:
@@ -240,14 +241,42 @@ def compute_dirty_set(
 
 
 def run_rdi_sgc(
-    S: List[int], L: List[int], K: List[int], O: List[int],
-    orders_req: Dict[int, List[int]], rt: Dict[int, int],
-    rt_ret: Dict[int, int], p: Dict[int, int], N: Dict[int, int],
-    horizon: int, move_cap: Optional[int] = None,
-    ALPHA: float = 1.0, BETA: float = 0.0,
-    regret_k: int = 2, use_lazy: bool = True,
-    tiebreaker: Literal["sharing_degree", "best_score", "sum_rt_asc"] = "sharing_degree"
+    instance,
+    *args,
+    **kwargs
 ) -> Solution:
+    if not isinstance(instance, Instance):
+        S = instance
+        L = args[0]
+        K = args[1]
+        O = args[2]
+        orders_req = args[3]
+        rt = args[4]
+        rt_ret = args[5]
+        p = args[6]
+        N = args[7]
+        horizon = kwargs.get('horizon', args[8] if len(args) > 8 else 10000)
+        move_cap = kwargs.get('move_cap', args[9] if len(args) > 9 else None)
+        ALPHA = kwargs.get('ALPHA', args[10] if len(args) > 10 else 1.0)
+        BETA = kwargs.get('BETA', args[11] if len(args) > 11 else 0.0)
+        regret_k = kwargs.get('regret_k', args[12] if len(args) > 12 else 2)
+        use_lazy = kwargs.get('use_lazy', args[13] if len(args) > 13 else True)
+        tiebreaker = kwargs.get('tiebreaker', args[14] if len(args) > 14 else "sharing_degree")
+        instance = Instance(S, L, K, orders_req, rt, p, N, rt_ret=rt_ret)
+    else:
+        horizon = kwargs.get('horizon', args[0] if len(args) > 0 else 10000)
+        move_cap = kwargs.get('move_cap', args[1] if len(args) > 1 else None)
+        ALPHA = kwargs.get('ALPHA', args[2] if len(args) > 2 else 1.0)
+        BETA = kwargs.get('BETA', args[3] if len(args) > 3 else 0.0)
+        regret_k = kwargs.get('regret_k', args[4] if len(args) > 4 else 2)
+        use_lazy = kwargs.get('use_lazy', args[5] if len(args) > 5 else True)
+        tiebreaker = kwargs.get('tiebreaker', args[6] if len(args) > 6 else "sharing_degree")
+        rt_ret = kwargs.get('rt_ret', args[7] if len(args) > 7 else None)
+
+    S, L, K, orders_req, rt, p, N = instance
+    O = instance.O
+    if rt_ret is None:
+        rt_ret = instance.rt_ret
     state = init_state(S, L, K, N, horizon, move_cap)
 
     demand_count = defaultdict(int)
@@ -358,7 +387,7 @@ def solve_heuristic_instance(config: dict, return_raw: bool = False):
     alpha = config.get("alpha", 1.0)
     beta = config.get("beta", 0.0)
 
-    S, L, K, orders_req, rt, p, N = generate_data(
+    instance = generate_data(
         num_stations=num_stations,
         lanes_per_station=lanes_per_station,
         num_orders=num_orders,
@@ -366,14 +395,12 @@ def solve_heuristic_instance(config: dict, return_raw: bool = False):
         seed=seed,
         pick_touch_time=pick_touch_time,
     )
-    rt_ret = dict(rt)
-    O = sorted(orders_req.keys())
+    S, L, K, orders_req, rt, p, N = instance
+    O = instance.O
 
     t0 = time.perf_counter()
     sol = run_rdi_sgc(
-        S=S, L=L, K=K, O=O,
-        orders_req=orders_req, rt=rt,
-        rt_ret=rt_ret, p=p, N=N,
+        instance,
         horizon=horizon, move_cap=move_cap,
         ALPHA=alpha, BETA=beta,
         regret_k=config.get("regret_k", 2),
@@ -383,8 +410,7 @@ def solve_heuristic_instance(config: dict, return_raw: bool = False):
     elapsed = time.perf_counter() - t0
     status = "Feasible" if sol.feasible else "Infeasible"
     violations = validate_solution(
-        sol, S, L, K, O, orders_req, rt, rt_ret, p, N,
-        horizon=horizon, move_cap=move_cap,
+        sol, instance, horizon=horizon, move_cap=move_cap
     )
     if violations:
         print(f"VALIDATION FAILED ({len(violations)} violations)")
@@ -430,20 +456,20 @@ def main():
     args = ap.parse_args()
 
     print("Generating data...")
-    S, L, K, orders_req, rt, p, N = generate_data(
+    instance = generate_data(
         num_stations=args.stations, lanes_per_station=args.lanes,
         num_orders=args.orders, num_skus=args.skus, seed=args.seed,
         pick_touch_time=args.pick
     )
-    rt_ret = dict(rt)
-    O = sorted(orders_req.keys())
+    S, L, K, orders_req, rt, p, N = instance
+    O = instance.O
 
     print(f"Stations={len(S)}, Lanes={len(L)}, SKUs={len(K)}, Orders={len(O)}, RobotLimit={args.movecap}\n")
     print(f"Running RDI-SGC (regret_k={args.regret_k}, tiebreaker={args.tiebreaker}, lazy={not args.no_lazy})")
 
     t0 = time.perf_counter()
     sol = run_rdi_sgc(
-        S, L, K, O, orders_req, rt, rt_ret, p, N,
+        instance,
         horizon=args.horizon, move_cap=args.movecap,
         ALPHA=args.alpha, BETA=args.beta, regret_k=args.regret_k,
         use_lazy=not args.no_lazy, tiebreaker=args.tiebreaker
@@ -457,8 +483,7 @@ def main():
     print(f"Time:        {elapsed:.4f}s")
 
     violations = validate_solution(
-        sol, S, L, K, O, orders_req, rt, rt_ret, p, N,
-        horizon=args.horizon, move_cap=args.movecap,
+        sol, instance, horizon=args.horizon, move_cap=args.movecap
     )
     if violations:
         print(f"VALIDATION FAILED ({len(violations)} violations)")
@@ -472,7 +497,7 @@ def main():
             from schedule_visualizer import plot_schedule
             from autostore_heuristic import build_viz_handles
             mock_sol, handles = build_viz_handles(
-                sol, S, L, K, O, orders_req, rt, rt_ret, p,
+                sol, instance
             )
             plot_schedule(mock_sol, handles)
         except Exception as exc:

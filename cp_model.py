@@ -8,6 +8,7 @@ from docplex.cp.model import CpoModel
 from docplex.cp.solver.solver_listener import CpoSolverListener
 
 from datagen import generate_data, generate_data_legacy
+from instance import Instance
 
 try:
     from schedule_visualizer import plot_schedule, write_html
@@ -77,15 +78,18 @@ def _old_generate_data(
             req = {rng.choice(K)}
         orders_requirements[o] = sorted(req)
 
-    return S, L, K, orders_requirements, rt, p, N
+    return Instance(S, L, K, orders_requirements, rt, p, N, rt_ret=dict(rt))
 
 # --------------------------
 # Model building (v3)
 # --------------------------
 
 
-def build_model(S, L, K, orders_req, rt, p, rt_return=None, add_symmetry_breaking=True, horizon=0, move_cap=None,
-                N=None):
+def build_model(
+        instance,
+        *args,
+        **kwargs
+):
     """
     Intervals per (s,k,e):
       - F[s,k,e] : fetch (size = rt[k])
@@ -96,6 +100,28 @@ def build_model(S, L, K, orders_req, rt, p, rt_return=None, add_symmetry_breakin
     Station capacity: no_overlap over B[s,*,*] (exactly one bin at station).
     Global single-bin per SKU: no_overlap over {F,B,R} across all stations.
     """
+    if not isinstance(instance, Instance):
+        S = instance
+        L = args[0]
+        K = args[1]
+        orders_req = args[2]
+        rt = args[3]
+        p = args[4]
+        rt_return = kwargs.get('rt_return', args[5] if len(args) > 5 else None)
+        add_symmetry_breaking = kwargs.get('add_symmetry_breaking', args[6] if len(args) > 6 else True)
+        horizon = kwargs.get('horizon', args[7] if len(args) > 7 else 0)
+        move_cap = kwargs.get('move_cap', args[8] if len(args) > 8 else None)
+        N = kwargs.get('N', args[9] if len(args) > 9 else None)
+        instance = Instance(S, L, K, orders_req, rt, p, N or {}, rt_ret=rt_return)
+    else:
+        rt_return = kwargs.get('rt_return', args[0] if len(args) > 0 else None)
+        add_symmetry_breaking = kwargs.get('add_symmetry_breaking', args[1] if len(args) > 1 else True)
+        horizon = kwargs.get('horizon', args[2] if len(args) > 2 else 0)
+        move_cap = kwargs.get('move_cap', args[3] if len(args) > 3 else None)
+
+    S, L, K, orders_req, rt, p, N = instance
+    if rt_return is None:
+        rt_return = instance.rt_ret
     mdl = CpoModel()
     O = sorted(orders_req.keys())
     if rt_return is None:
@@ -485,7 +511,7 @@ def solve_instance(config):
 
     # --- 2. Generate Data ---
     try:
-        S, L, K, orders_req, rt, p, N = _old_generate_data(
+        instance = _old_generate_data(
             num_stations=num_stations,
             lanes_per_station=lanes_per_station,
             num_orders=num_orders,
@@ -493,7 +519,8 @@ def solve_instance(config):
             seed=seed,
             pick_touch_time=pick_touch_time,
         )
-        rt_return = dict(rt)
+        S, L, K, orders_req, rt, p, N = instance
+        rt_return = instance.rt_ret
         if is_verbose:
             print("=== Generated data ===")
             print(f"Stations S={S}  |L|={len(L)} lanes each")
@@ -527,12 +554,11 @@ def solve_instance(config):
             print(f"Using move capacity: {move_cap}")
 
         mdl, handles = build_model(
-            S, L, K, orders_req, rt, p,
+            instance,
             rt_return=rt_return,
             add_symmetry_breaking=add_symmetry_breaking,
             horizon=horizon,
-            move_cap=move_cap,
-            N=N
+            move_cap=move_cap
         )
         num_vars = len(mdl.get_all_variables())
         if is_verbose:
@@ -1088,7 +1114,7 @@ def main():
         gen_fn = generate_data
     else:
         gen_fn = _old_generate_data
-    S, L, K, orders_req, rt, p, N = gen_fn(
+    instance = gen_fn(
         num_stations=args.stations,
         lanes_per_station=args.lanes,
         num_orders=args.orders,
@@ -1096,7 +1122,8 @@ def main():
         seed=args.seed,
         pick_touch_time=args.pick,
     )
-    rt_return = dict(rt)  # symmetric by default; customize if needed
+    S, L, K, orders_req, rt, p, N = instance
+    rt_return = instance.rt_ret
 
     print("=== Generated data ===")
     print(f"Stations S={S}  |L|={len(L)} lanes each")
@@ -1114,9 +1141,9 @@ def main():
     if args.horizon > 0:
         print(f"Adding maximal horizon constraint: end <= {args.horizon}")
 
-    mdl, handles = build_model(S, L, K, orders_req, rt, p, rt_return=rt_return,
+    mdl, handles = build_model(instance, rt_return=rt_return,
                                add_symmetry_breaking=add_symmetry_breaking,
-                               horizon=args.horizon, move_cap=args.movecap, N=N)
+                               horizon=args.horizon, move_cap=args.movecap)
     print("\nSolving...")
     print(f"Number of variables: {len(mdl.get_all_variables())}")
     sol = mdl.solve(

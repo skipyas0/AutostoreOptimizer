@@ -36,6 +36,7 @@ Sources:
 import math
 import random
 from typing import Dict, List, Optional, Tuple
+from instance import Instance
 
 
 # ---------------------------------------------------------------------------
@@ -285,15 +286,7 @@ def generate_data(
     bin_count_model: str = "popularity_correlated",
     grid_depth: int = 16,
     verbose: bool = False,
-) -> Tuple[
-    List[int],                         # S
-    List[int],                         # L
-    List[int],                         # K
-    Dict[int, List[int]],              # orders_requirements
-    Dict[int, int],                    # rt
-    Dict[int, int],                    # p
-    Dict[int, int],                    # N
-]:
+) -> Instance:
     """Generate realistic synthetic AutoStore scheduling data.
 
     Parameters
@@ -448,10 +441,11 @@ def generate_data(
 
         orders_requirements[o] = sorted(req)
 
+    instance = Instance(S, L, K, orders_requirements, rt, p, N, rt_ret=dict(rt))
     if verbose:
-        print_data_summary(S, L, K, orders_requirements, rt, p, N)
+        instance.print_summary()
 
-    return S, L, K, orders_requirements, rt, p, N
+    return instance
 
 
 # ---------------------------------------------------------------------------
@@ -467,8 +461,7 @@ def generate_data_legacy(
     pick_touch_time: int = 4,
     order_size_dist: str = "poisson2_to_1_6",
     max_bins_per_sku: int = 5,
-) -> Tuple[List[int], List[int], List[int], Dict[int, List[int]],
-           Dict[int, int], Dict[int, int], Dict[int, int]]:
+) -> Instance:
     """Backward-compatible wrapper using all legacy settings."""
     return generate_data(
         num_stations=num_stations,
@@ -491,24 +484,53 @@ def generate_data_legacy(
 # ---------------------------------------------------------------------------
 
 def print_data_summary(
-    S, L, K, orders_requirements, rt, p, N,
+    *args, **kwargs
 ) -> None:
     """Print a human-readable summary of the generated instance."""
+    if len(args) == 1 and isinstance(args[0], Instance):
+        args[0].print_summary()
+        return
+
+    if 'instance' in kwargs and isinstance(kwargs['instance'], Instance):
+        kwargs['instance'].print_summary()
+        return
+
+    if len(args) == 7:
+        instance = Instance(*args)
+        instance.print_summary()
+        return
+
+    S = kwargs.get('S', args[0] if len(args) > 0 else None)
+    L = kwargs.get('L', args[1] if len(args) > 1 else None)
+    K = kwargs.get('K', args[2] if len(args) > 2 else None)
+    orders_requirements = kwargs.get('orders_requirements', kwargs.get('orders_req', args[3] if len(args) > 3 else None))
+    rt = kwargs.get('rt', args[4] if len(args) > 4 else None)
+    p = kwargs.get('p', args[5] if len(args) > 5 else None)
+    N = kwargs.get('N', args[6] if len(args) > 6 else None)
+
+    if all(x is not None for x in (S, L, K, orders_requirements, rt, p, N)):
+        instance = Instance(S, L, K, orders_requirements, rt, p, N, rt_ret=dict(rt))
+        # Helper to perform the actual printing logic, usually attached to instance
+        _internal_print_summary(instance)
+    else:
+        raise ValueError("Invalid arguments for print_data_summary")
+
+def _internal_print_summary(instance: Instance) -> None:
     import itertools as _itertools
 
-    num_orders = len(orders_requirements)
-    order_sizes = [len(v) for v in orders_requirements.values()]
-    rt_vals = list(rt.values())
-    p_vals = list(p.values())
-    n_vals = list(N.values())
+    num_orders = len(instance.orders_req)
+    order_sizes = [len(v) for v in instance.orders_req.values()]
+    rt_vals = list(instance.rt.values())
+    p_vals = list(instance.p.values())
+    n_vals = list(instance.N.values())
 
     # SKU frequency across orders
     sku_freq: Dict[int, int] = {}
-    for reqs in orders_requirements.values():
+    for reqs in instance.orders_req.values():
         for k in reqs:
             sku_freq[k] = sku_freq.get(k, 0) + 1
-    used_skus = [k for k in K if sku_freq.get(k, 0) > 0]
-    unused_skus = len(K) - len(used_skus)
+    used_skus = [k for k in instance.K if sku_freq.get(k, 0) > 0]
+    unused_skus = len(instance.K) - len(used_skus)
 
     # Pareto check: what fraction of picks come from top 20% of used SKUs
     if used_skus:
@@ -525,8 +547,8 @@ def print_data_summary(
     if pairs:
         jaccards = []
         for i, j in pairs:
-            si = set(orders_requirements[i])
-            sj = set(orders_requirements[j])
+            si = set(instance.orders_req[i])
+            sj = set(instance.orders_req[j])
             inter = len(si & sj)
             union = len(si | sj)
             jaccards.append(inter / union if union else 0)
@@ -537,10 +559,10 @@ def print_data_summary(
     print("=" * 60)
     print("  AutoStore Instance Summary")
     print("=" * 60)
-    print(f"  Stations:  {len(S)}")
-    print(f"  Lanes/st:  {len(L)}")
+    print(f"  Stations:  {len(instance.S)}")
+    print(f"  Lanes/st:  {len(instance.L)}")
     print(f"  Orders:    {num_orders}")
-    print(f"  SKUs:      {len(K)}  (used: {len(used_skus)}, unused: {unused_skus})")
+    print(f"  SKUs:      {len(instance.K)}  (used: {len(used_skus)}, unused: {unused_skus})")
     print()
     print(f"  Order size:  min={min(order_sizes)}, max={max(order_sizes)}, "
           f"mean={sum(order_sizes)/len(order_sizes):.2f}, "
@@ -605,7 +627,7 @@ def main():
                     help="Path to dump the instance as JSON")
     args = ap.parse_args()
 
-    S, L, K, orders_req, rt, p, N = generate_data(
+    instance = generate_data(
         num_stations=args.stations,
         lanes_per_station=args.lanes,
         num_orders=args.orders,
@@ -621,15 +643,14 @@ def main():
         grid_depth=args.grid_depth,
     )
 
-    print_data_summary(S, L, K, orders_req, rt, p, N)
-
+    instance.print_summary()
     if args.json:
         data = {
-            "S": S, "L": L, "K": K,
-            "orders_requirements": {str(k): v for k, v in orders_req.items()},
-            "rt": {str(k): v for k, v in rt.items()},
-            "p": {str(k): v for k, v in p.items()},
-            "N": {str(k): v for k, v in N.items()},
+            "S": instance.S, "L": instance.L, "K": instance.K,
+            "orders_requirements": {str(k): v for k, v in instance.orders_req.items()},
+            "rt": {str(k): v for k, v in instance.rt.items()},
+            "p": {str(k): v for k, v in instance.p.items()},
+            "N": {str(k): v for k, v in instance.N.items()},
         }
         with open(args.json, "w") as f:
             json.dump(data, f, indent=2)

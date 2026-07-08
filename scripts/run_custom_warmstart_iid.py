@@ -21,7 +21,7 @@ config = {
 
 def main():
     print("Generating data...")
-    S, L, K, orders_req, rt, p, N = generate_data(
+    instance = generate_data(
         num_stations=config['stations'],
         lanes_per_station=config['lanes'],
         num_orders=config['orders'],
@@ -29,14 +29,14 @@ def main():
         seed=config['seed'],
         pick_touch_time=config['pick']
     )
-    O = sorted(orders_req.keys())
-    rt_return = dict(rt)
+    S, L, K, orders_req, rt, p, N = instance
+    rt_return = instance.rt_ret
     print(orders_req)
 
     print("Running RDI-SGC Heuristic...")
     t_heur = time.perf_counter()
     heur_sol = run_rdi_sgc(
-        S, L, K, O, orders_req, rt, rt_return, p, N,
+        instance,
         horizon=config['horizon'], move_cap=config['movecap'], ALPHA=config['alpha'], BETA=config['beta']
     )
     print(
@@ -44,9 +44,9 @@ def main():
 
     print("Building CP Model...")
     mdl, handles = build_model(
-        S, L, K, orders_req, rt, p, rt_return=rt_return,
+        instance, rt_return=rt_return,
         add_symmetry_breaking=config['symmetry_breaking'],
-        horizon=config['horizon'], move_cap=config['movecap'], N=N
+        horizon=config['horizon'], move_cap=config['movecap']
     )
 
     print(f"\n=== RDI-SGC Heuristic Result ===")
@@ -56,8 +56,8 @@ def main():
     print(f"Time:        {time.perf_counter() - t_heur:.4f}s")
 
     violations = validate_solution(
-        heur_sol, S, L, K, O, orders_req, rt, rt_return, p, N,
-        horizon=config['horizon'], move_cap=config['movecap'],
+        heur_sol, instance,
+        horizon=config['horizon'], move_cap=config['movecap']
     )
     if violations:
         print(f"VALIDATION FAILED ({len(violations)} violations)")

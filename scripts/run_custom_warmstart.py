@@ -19,7 +19,7 @@ except ImportError:
 
 def main():
     print("Generating data...")
-    S, L, K, orders_req, rt, p, N = generate_data(
+    instance = generate_data(
         num_stations=config['stations'],
         lanes_per_station=config['lanes'],
         num_orders=config['orders'],
@@ -27,12 +27,12 @@ def main():
         seed=config['seed'],
         pick_touch_time=config['pick']
     )
-    O = sorted(orders_req.keys())
-    rt_return = dict(rt)
+    S, L, K, orders_req, rt, p, N = instance
+    rt_return = instance.rt_ret
 
     print("Running AMA-SGC Heuristic...")
     sol_heur, best_config, all_runs = run_ama_sgc(
-        S, L, K, O, orders_req, rt, rt_return, p, N,
+        instance,
         horizon=20000, move_cap=config['movecap'],
         mode="two_phase", verbose=True
     )
@@ -40,9 +40,9 @@ def main():
 
     print("Building CP Model...")
     mdl, handles = build_model(
-        S, L, K, orders_req, rt, p, rt_return=rt_return,
+        instance, rt_return=rt_return,
         add_symmetry_breaking=config['symmetry_breaking'],
-        horizon=20000, move_cap=config['movecap'], N=N
+        horizon=20000, move_cap=config['movecap']
     )
 
     print("Injecting Warmstart...")

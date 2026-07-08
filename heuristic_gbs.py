@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import Optional, TypedDict
 import copy
+from instance import Instance
 
 from autostore_heuristic import (
     BinEvent, DifferenceArray, BinCopyPool, Solution, build_viz_handles, validate_solution
@@ -313,16 +314,38 @@ def check_completions(
 
 
 def run_gbs(
-    S: list[int], L: list[int], K: list[int], O: list[int],
-    orders_req: dict[int, list[int]],
-    rt: dict[int, int], rt_ret: dict[int, int], p: dict[int, int],
-    N: dict[int, int],
-    horizon: int,
-    move_cap: Optional[int] = None,
-    ALPHA: float = 1.0,
-    BETA: float = 0.0,
-    scoring_rule: str = "max_sharing",
+    instance,
+    *args,
+    **kwargs
 ) -> Solution:
+    if not isinstance(instance, Instance):
+        S = instance
+        L = args[0]
+        K = args[1]
+        O = args[2]
+        orders_req = args[3]
+        rt = args[4]
+        rt_ret = args[5]
+        p = args[6]
+        N = args[7]
+        horizon = kwargs.get('horizon', args[8] if len(args) > 8 else 10000)
+        move_cap = kwargs.get('move_cap', args[9] if len(args) > 9 else None)
+        ALPHA = kwargs.get('ALPHA', args[10] if len(args) > 10 else 1.0)
+        BETA = kwargs.get('BETA', args[11] if len(args) > 11 else 0.0)
+        scoring_rule = kwargs.get('scoring_rule', args[12] if len(args) > 12 else "max_sharing")
+        instance = Instance(S, L, K, orders_req, rt, p, N, rt_ret=rt_ret)
+    else:
+        horizon = kwargs.get('horizon', args[0] if len(args) > 0 else 10000)
+        move_cap = kwargs.get('move_cap', args[1] if len(args) > 1 else None)
+        ALPHA = kwargs.get('ALPHA', args[2] if len(args) > 2 else 1.0)
+        BETA = kwargs.get('BETA', args[3] if len(args) > 3 else 0.0)
+        scoring_rule = kwargs.get('scoring_rule', args[4] if len(args) > 4 else "max_sharing")
+        rt_ret = kwargs.get('rt_ret', args[5] if len(args) > 5 else None)
+
+    S, L, K, orders_req, rt, p, N = instance
+    O = instance.O
+    if rt_ret is None:
+        rt_ret = instance.rt_ret
     # 1. Simple greedy partition of orders to stations to preserve sharing while balancing load
     O_sorted = sorted(O, key=lambda o: sum(rt[k] for k in orders_req[o]), reverse=True)
     station_orders = {s: [] for s in S}
@@ -437,15 +460,36 @@ def run_gbs(
 
 
 def run_gbs_adaptive(
-    S: list[int], L: list[int], K: list[int], O: list[int],
-    orders_req: dict[int, list[int]],
-    rt: dict[int, int], rt_ret: dict[int, int], p: dict[int, int],
-    N: dict[int, int],
-    horizon: int,
-    move_cap: Optional[int] = None,
-    ALPHA: float = 1.0,
-    BETA: float = 0.0,
+    instance,
+    *args,
+    **kwargs
 ) -> Solution:
+    if not isinstance(instance, Instance):
+        S = instance
+        L = args[0]
+        K = args[1]
+        O = args[2]
+        orders_req = args[3]
+        rt = args[4]
+        rt_ret = args[5]
+        p = args[6]
+        N = args[7]
+        horizon = kwargs.get('horizon', args[8] if len(args) > 8 else 10000)
+        move_cap = kwargs.get('move_cap', args[9] if len(args) > 9 else None)
+        ALPHA = kwargs.get('ALPHA', args[10] if len(args) > 10 else 1.0)
+        BETA = kwargs.get('BETA', args[11] if len(args) > 11 else 0.0)
+        instance = Instance(S, L, K, orders_req, rt, p, N, rt_ret=rt_ret)
+    else:
+        horizon = kwargs.get('horizon', args[0] if len(args) > 0 else 10000)
+        move_cap = kwargs.get('move_cap', args[1] if len(args) > 1 else None)
+        ALPHA = kwargs.get('ALPHA', args[2] if len(args) > 2 else 1.0)
+        BETA = kwargs.get('BETA', args[3] if len(args) > 3 else 0.0)
+        rt_ret = kwargs.get('rt_ret', args[4] if len(args) > 4 else None)
+
+    S, L, K, orders_req, rt, p, N = instance
+    O = instance.O
+    if rt_ret is None:
+        rt_ret = instance.rt_ret
     best_sol = None
     best_obj = float('inf')
     best_moves = float('inf')
@@ -461,8 +505,12 @@ def run_gbs_adaptive(
         L_c = list(L)
         K_c = list(K)
 
-        sol = run_gbs(S_c, L_c, K_c, O_c, orders_req_c, rt_c, rt_ret_c, p_c,
-                      N_c, horizon, move_cap, ALPHA, BETA, scoring_rule=rule)
+        instance_c = Instance(S_c, L_c, K_c, orders_req_c, rt_c, p_c, N_c, rt_ret=rt_ret_c)
+        sol = run_gbs(
+            instance_c,
+            horizon=horizon, move_cap=move_cap, ALPHA=ALPHA, BETA=BETA,
+            scoring_rule=rule, rt_ret=rt_ret_c,
+        )
         if not sol.feasible:
             continue
 
@@ -494,7 +542,7 @@ def solve_heuristic_instance(config: dict, return_raw: bool = False):
     beta = config.get("beta", 0.0)
     gbs_rule = config.get("gbs_rule", "readiness_weighted")
 
-    S, L, K, orders_req, rt, p, N = generate_data(
+    instance = generate_data(
         num_stations=num_stations,
         lanes_per_station=lanes_per_station,
         num_orders=num_orders,
@@ -502,30 +550,27 @@ def solve_heuristic_instance(config: dict, return_raw: bool = False):
         seed=seed,
         pick_touch_time=pick_touch_time,
     )
-    rt_ret = dict(rt)
-    O = sorted(orders_req.keys())
+    S, L, K, orders_req, rt, p, N = instance
+    O = instance.O
 
     t0 = time.perf_counter()
     if gbs_rule == "adaptive":
         sol = run_gbs_adaptive(
-            S, L, K, O,
-            orders_req, rt, rt_ret, p,
-            N, horizon, move_cap,
-            alpha, beta
+            instance,
+            horizon=horizon, move_cap=move_cap,
+            ALPHA=alpha, BETA=beta
         )
     else:
         sol = run_gbs(
-            S, L, K, O,
-            orders_req, rt, rt_ret, p,
-            N, horizon, move_cap,
-            alpha, beta,
+            instance,
+            horizon=horizon, move_cap=move_cap,
+            ALPHA=alpha, BETA=beta,
             scoring_rule=gbs_rule
         )
     elapsed = time.perf_counter() - t0
     status = "Feasible" if sol.feasible else "Infeasible"
     violations = validate_solution(
-        sol, S, L, K, O, orders_req, rt, rt_ret, p, N,
-        horizon=horizon, move_cap=move_cap,
+        sol, instance, horizon=horizon, move_cap=move_cap
     )
     if violations:
         print(f"VALIDATION FAILED ({len(violations)} violations)")
@@ -577,7 +622,7 @@ def main() -> None:
     args = ap.parse_args()
 
     print("Generating data...")
-    S, L, K, orders_req, rt, p, N = generate_data(
+    instance = generate_data(
         num_stations=args.stations,
         lanes_per_station=args.lanes,
         num_orders=args.orders,
@@ -585,8 +630,8 @@ def main() -> None:
         seed=args.seed,
         pick_touch_time=args.pick,
     )
-    rt_ret = dict(rt)
-    O = sorted(orders_req.keys())
+    S, L, K, orders_req, rt, p, N = instance
+    O = instance.O
 
     print(f"Stations={len(S)}, Lanes={len(L)}, SKUs={len(K)}, Orders={len(O)}, RobotLimit={args.movecap}\n")
 
@@ -594,13 +639,13 @@ def main() -> None:
     t0 = time.perf_counter()
     if args.rule == 'adaptive':
         sol = run_gbs_adaptive(
-            S, L, K, O, orders_req, rt, rt_ret, p, N,
+            instance,
             horizon=args.horizon, move_cap=args.movecap,
             ALPHA=args.alpha, BETA=args.beta
         )
     else:
         sol = run_gbs(
-            S, L, K, O, orders_req, rt, rt_ret, p, N,
+            instance,
             horizon=args.horizon, move_cap=args.movecap,
             ALPHA=args.alpha, BETA=args.beta,
             scoring_rule=args.rule
@@ -614,8 +659,7 @@ def main() -> None:
     print(f"Time:        {elapsed:.4f}s")
 
     violations = validate_solution(
-        sol, S, L, K, O, orders_req, rt, rt_ret, p, N,
-        horizon=args.horizon, move_cap=args.movecap,
+        sol, instance, horizon=args.horizon, move_cap=args.movecap
     )
     if violations:
         print(f"VALIDATION FAILED ({len(violations)} violations)")
@@ -628,7 +672,7 @@ def main() -> None:
         try:
             from schedule_visualizer import plot_schedule
             mock_sol, handles = build_viz_handles(
-                sol, S, L, K, O, orders_req, rt, rt_ret, p,
+                sol, instance
             )
             plot_schedule(mock_sol, handles)
         except Exception as exc:

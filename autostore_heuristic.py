@@ -7,6 +7,7 @@ import heapq
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Optional
+from instance import Instance
 
 
 # ============================================================
@@ -507,16 +508,39 @@ def init_state(
 
 
 def run_sgc(
-        S: list[int], L: list[int], K: list[int], O: list[int],
-        orders_req: dict[int, list[int]],
-        rt: dict[int, int], rt_ret: dict[int, int], p: dict[int, int],
-        N: dict[int, int],
-        horizon: int,
-        move_cap: Optional[int] = None,
-        ALPHA: float = 1.0,
-        BETA: float = 0.0,
+        instance,
+        *args,
+        **kwargs
 ) -> Solution:
     """Run the Simple Greedy Constructive heuristic. [P1-7]"""
+    if not isinstance(instance, Instance):
+        # Backward compatibility fallback
+        S = instance
+        L = args[0]
+        K = args[1]
+        O = args[2]
+        orders_req = args[3]
+        rt = args[4]
+        rt_ret = args[5]
+        p = args[6]
+        N = args[7]
+        horizon = kwargs.get('horizon', args[8] if len(args) > 8 else 10000)
+        move_cap = kwargs.get('move_cap', args[9] if len(args) > 9 else None)
+        ALPHA = kwargs.get('ALPHA', args[10] if len(args) > 10 else 1.0)
+        BETA = kwargs.get('BETA', args[11] if len(args) > 11 else 0.0)
+        instance = Instance(S, L, K, orders_req, rt, p, N, rt_ret=rt_ret)
+    else:
+        horizon = kwargs.get('horizon', args[0] if len(args) > 0 else 10000)
+        move_cap = kwargs.get('move_cap', args[1] if len(args) > 1 else None)
+        ALPHA = kwargs.get('ALPHA', args[2] if len(args) > 2 else 1.0)
+        BETA = kwargs.get('BETA', args[3] if len(args) > 3 else 0.0)
+        rt_ret = kwargs.get('rt_ret', args[4] if len(args) > 4 else None)
+
+    S, L, K, orders_req, rt, p, N = instance
+    O = instance.O
+    if 'rt_ret' not in locals() or rt_ret is None:
+        rt_ret = instance.rt_ret
+
     state = init_state(S, L, K, N, horizon, move_cap)
 
     demand_count: dict[int, int] = defaultdict(int)
@@ -611,9 +635,8 @@ class _MockCPSol:
 
 def build_viz_handles(
         solution: "Solution",
-        S: list[int], L: list[int], K: list[int], O: list[int],
-        orders_req: dict[int, list[int]],
-        rt: dict[int, int], rt_ret: dict[int, int], p: dict[int, int],
+        instance,
+        *args,
         **kwargs
 ) -> tuple["_MockCPSol", dict]:
     """Convert a heuristic Solution to (mock_cp_sol, handles) for schedule_visualizer2.
@@ -621,6 +644,23 @@ def build_viz_handles(
     The returned pair can be passed directly to ``plot_schedule(mock_sol, handles)``
     without any docplex dependency.
     """
+    if not isinstance(instance, Instance):
+        S = instance
+        L = args[0]
+        K = args[1]
+        O = args[2]
+        orders_req = args[3]
+        rt = args[4]
+        rt_ret = args[5]
+        p = args[6]
+        instance = Instance(S, L, K, orders_req, rt, p, {}, rt_ret=rt_ret)
+    else:
+        rt_ret = kwargs.pop('rt_ret', None)
+
+    S, L, K, orders_req, rt, p, N = instance
+    O = instance.O
+    if rt_ret is None:
+        rt_ret = instance.rt_ret
     sol = _MockCPSol()
     I_os: dict = {}
     I_os_lane: dict = {}
@@ -773,14 +813,33 @@ def solve_heuristic_instance(config: dict, return_raw: bool = False):
 
 def validate_solution(
         solution: Solution,
-        S: list[int], L: list[int], K: list[int], O: list[int],
-        orders_req: dict[int, list[int]],
-        rt: dict[int, int], rt_ret: dict[int, int], p: dict[int, int],
-        N: dict[int, int],
-        horizon: int,
-        move_cap: Optional[int] = None,
+        instance,
+        *args,
+        **kwargs
 ) -> list[str]:
     """Validate a heuristic solution. Returns list of violation strings (empty = valid)."""
+    if not isinstance(instance, Instance):
+        S = instance
+        L = args[0]
+        K = args[1]
+        O = args[2]
+        orders_req = args[3]
+        rt = args[4]
+        rt_ret = args[5]
+        p = args[6]
+        N = args[7]
+        horizon = kwargs.get('horizon', args[8] if len(args) > 8 else 10000)
+        move_cap = kwargs.get('move_cap', args[9] if len(args) > 9 else None)
+        instance = Instance(S, L, K, orders_req, rt, p, N, rt_ret=rt_ret)
+    else:
+        horizon = kwargs.get('horizon', args[0] if len(args) > 0 else 10000)
+        move_cap = kwargs.get('move_cap', args[1] if len(args) > 1 else None)
+        rt_ret = kwargs.get('rt_ret', args[2] if len(args) > 2 else None)
+
+    S, L, K, orders_req, rt, p, N = instance
+    O = instance.O
+    if rt_ret is None:
+        rt_ret = instance.rt_ret
     violations: list[str] = []
 
     # 1. Every order assigned exactly once
@@ -927,9 +986,11 @@ def main():
     ap.add_argument("--beta", type=float, default=0.0)
     ap.add_argument("--no_vis", action="store_true", help="Skip HTML schedule visualisation")
     args = ap.parse_args()
+    
 
     print("Generating data...")
-    S, L, K, orders_req, rt, p, N = generate_data(
+    print("Generating data...")
+    instance = generate_data(
         num_stations=args.stations,
         lanes_per_station=args.lanes,
         num_orders=args.orders,
@@ -937,8 +998,8 @@ def main():
         seed=args.seed,
         pick_touch_time=args.pick,
     )
-    rt_ret = dict(rt)
-    O = sorted(orders_req.keys())
+    S, L, K, orders_req, rt, p, N = instance
+    O = instance.O
 
     print(f"Stations={len(S)}, Lanes={len(L)}, SKUs={len(K)}, Orders={len(O)}")
     # print(f"N (bins per SKU): { {k: N[k] for k in K} }")
@@ -949,7 +1010,7 @@ def main():
     print(f"\nRunning SGC heuristic (alpha={args.alpha}, beta={args.beta})...")
     t0 = time.perf_counter()
     sol = run_sgc(
-        S, L, K, O, orders_req, rt, rt_ret, p, N,
+        instance,
         horizon=args.horizon, move_cap=args.movecap,
         ALPHA=args.alpha, BETA=args.beta,
     )
@@ -982,8 +1043,7 @@ def main():
                   f"orders={ev.orders_served}")
 
     violations = validate_solution(
-        sol, S, L, K, O, orders_req, rt, rt_ret, p, N,
-        horizon=args.horizon, move_cap=args.movecap,
+        sol, instance, horizon=args.horizon, move_cap=args.movecap
     )
     if violations:
         print(f"\n=== VALIDATION FAILED ({len(violations)} violations) ===")
@@ -994,8 +1054,8 @@ def main():
 
     if not args.no_vis:
         try:
-            from schedule_visualizer2 import plot_schedule, write_html
-            mock_sol, handles = build_viz_handles(sol, S, L, K, O, orders_req, rt, rt_ret, p)
+            from schedule_visualizer import plot_schedule, write_html
+            mock_sol, handles = build_viz_handles(sol, instance)
             fig = plot_schedule(mock_sol, handles, show=True)
             html_file = "./autostore_heuristic_solution.html"
             write_html(fig, html_file)
