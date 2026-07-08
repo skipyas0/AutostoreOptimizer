@@ -13,7 +13,20 @@ conda env create -f environment.yml
 conda activate autostore
 ```
 
-*(Note: Depending on your local configuration, the environment might have been named `iid` previously. You can still use it or create a new one using the command above.)*
+Alternative: use pip or uv with 'requirements.txt' and then install cplex manually.
+
+```bash
+uv venv --python 3.10
+uv pip install -r requirements.txt
+uv pip install cplex
+```
+
+It's also necessary to download the IBM CPLEX Studio (ideally the unrestricted version, available for free for academic use).
+Then run this command in the project's environment.
+
+```bash
+docplex config --upgrade <PATH_TO_CPLEX_STUDIO>
+```
 
 ## Repository Structure
 
