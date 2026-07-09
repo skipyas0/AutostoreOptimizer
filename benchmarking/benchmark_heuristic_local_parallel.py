@@ -139,7 +139,7 @@ def main():
         "--modules",
         nargs="+",
         help="List of python module names to benchmark",
-        default=["heuristic_gbs_critical_path", "heuristic_gbs_max_sharing", "heuristic_rdi_sgc_best_score", "heuristic_rdi_sgc_sharing_degree"]
+        default=["ama_sgc_neural_mlp"]
     )
     parser.add_argument(
         "--output-dir",

@@ -95,6 +95,12 @@ class Instance:
         else:
             avg_jaccard = 0.0
 
+        # Supply (number of bins per SKU) and demand (number of orders per SKU)
+        supply = [n_vals[k] for k in used_skus]
+        demand = [sku_freq[k] for k in used_skus]
+        supply_demand_ratio = sum(supply) / sum(demand) if demand else 0
+        supply_demand_ratio_stdev = sum((s - d)**2 for s, d in zip(supply, demand)) / len(supply) if supply else 0
+
         return {
             "num_stations": len(self.S),
             "num_lanes": len(self.L),
@@ -106,19 +112,75 @@ class Instance:
             "order_size_max": max(order_sizes) if order_sizes else 0,
             "order_size_mean": sum(order_sizes) / len(order_sizes) if order_sizes else 0.0,
             "order_size_median": sorted(order_sizes)[len(order_sizes)//2] if order_sizes else 0,
+            "order_size_stdev": sum((x - sum(order_sizes) / len(order_sizes))**2 for x in order_sizes) / len(order_sizes) if order_sizes else 0.0,
+            
             "rt_min": min(rt_vals) if rt_vals else 0,
             "rt_max": max(rt_vals) if rt_vals else 0,
             "rt_mean": sum(rt_vals) / len(rt_vals) if rt_vals else 0.0,
+            "rt_stdev": sum((x - sum(rt_vals) / len(rt_vals))**2 for x in rt_vals) / len(rt_vals) if rt_vals else 0.0,
+            
             "p_min": min(p_vals) if p_vals else 0,
             "p_max": max(p_vals) if p_vals else 0,
             "p_mean": sum(p_vals) / len(p_vals) if p_vals else 0.0,
+            "p_stdev": sum((x - sum(p_vals) / len(p_vals))**2 for x in p_vals) / len(p_vals) if p_vals else 0.0,
+            
             "n_min": min(n_vals) if n_vals else 0,
             "n_max": max(n_vals) if n_vals else 0,
             "n_mean": sum(n_vals) / len(n_vals) if n_vals else 0.0,
+            "n_stdev": sum((x - sum(n_vals) / len(n_vals))**2 for x in n_vals) / len(n_vals) if n_vals else 0.0,
+
+            "sku_freq_min": min(sku_freq.values()) if sku_freq.values() else 0,
+            "sku_freq_max": max(sku_freq.values()) if sku_freq.values() else 0,
+            "sku_freq_mean": sum(sku_freq.values()) / len(sku_freq.values()) if sku_freq.values() else 0.0,
+            "sku_freq_stdev": sum((x - sum(sku_freq.values()) / len(sku_freq.values()))**2 for x in sku_freq.values()) / len(sku_freq.values()) if sku_freq.values() else 0.0,
+            
             "pareto_ratio": pareto_ratio,
             "avg_jaccard": avg_jaccard,
             "total_pick_lines": sum(order_sizes),
+
+            "supply_demand_ratio": supply_demand_ratio,
+            "supply_demand_ratio_stdev": supply_demand_ratio_stdev,
         }
+
+    def get_features(self) -> List[float]:
+        """
+        Convert statistics dict to a list of numeric features and normalize to around 0..1.
+        """
+        stats = self.get_statistics()
+        return [
+            stats["num_stations"] / 20,
+            stats["num_lanes"] / 20,
+            stats["num_orders"] / 1000,
+            stats["num_skus"] / 10000,
+            stats["used_skus"] / stats["num_skus"],
+            stats["order_size_min"] / 10,
+            stats["order_size_max"] / 10,
+            stats["order_size_mean"] / 10,
+            stats["order_size_median"] / 10,
+            stats["order_size_stdev"] / 10,
+            stats["rt_min"] / 100,
+            stats["rt_max"] / 100,
+            stats["rt_mean"] / 100,
+            stats["rt_stdev"] / 100,
+            stats["p_min"] / 10,
+            stats["p_max"] / 10,
+            stats["p_mean"] / 10,
+            stats["p_stdev"] / 10,
+            stats["n_min"] / 5,
+            stats["n_max"] / 5,
+            stats["n_mean"] / 5,
+            stats["n_stdev"] / 5,
+            stats["sku_freq_min"] / stats["num_orders"],
+            stats["sku_freq_max"] / stats["num_orders"],
+            stats["sku_freq_mean"] / stats["num_orders"],
+            stats["sku_freq_stdev"] / stats["num_orders"],
+            stats["pareto_ratio"],
+            stats["avg_jaccard"],
+            stats["total_pick_lines"] / 5,
+            stats["supply_demand_ratio"] / 2,
+            stats["supply_demand_ratio_stdev"] / 2,
+        ]
+
 
     def print_summary(self) -> None:
         """Print a human-readable summary of the instance."""

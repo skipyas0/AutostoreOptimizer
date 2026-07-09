@@ -6,3 +6,7 @@ logs
 results
 *.html
 *.txt
+*.pkl
+*.zip
+*.pt
+*.csv
