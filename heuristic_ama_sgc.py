@@ -6,16 +6,24 @@ Runs the SGC construction multiple times with different combinations of
 order-priority rule and bin-fetch ordering rule, then returns the best solution.
 Mirrors variable names from the CP model (cp_model.py).
 """
-from autostore_heuristic import (
-    BinEvent, OrderPlan, HeuristicState, Solution,
-    init_state, commit_plan, validate_solution, compute_U,
-    find_shared_bin, earliest_feasible_fetch,
-    build_viz_handles,
-)
-import sys
+
 import os
+import sys
 from collections import defaultdict
 from typing import Optional
+
+from autostore_heuristic import (
+    BinEvent,
+    HeuristicState,
+    OrderPlan,
+    Solution,
+    build_viz_handles,
+    commit_plan,
+    earliest_feasible_fetch,
+    find_shared_bin,
+    init_state,
+    validate_solution,
+)
 from instance import Instance
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -25,10 +33,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # Step 1: Precompute order-level and SKU-level statistics
 # ============================================================
 
+
 def precompute_attributes(
-        instance,
-        *args,
-        **kwargs
+    instance, *args, **kwargs
 ) -> tuple[dict[int, dict], dict[int, dict]]:
     """Compute all order-level and SKU-level statistics used by sorting rules.
 
@@ -37,21 +44,15 @@ def precompute_attributes(
       sku_attrs[k] is a dict of attribute_key -> value for SKU k
     """
     if not isinstance(instance, Instance):
-        O = instance
-        orders_req = args[0]
-        rt = args[1]
-        rt_ret = args[2]
-        p = args[3]
-        N = args[4]
-        K = args[5]
-        instance = Instance([], [], K, orders_req, rt, p, N, rt_ret=rt_ret)
+        raise ValueError
     else:
-        rt_ret = kwargs.get('rt_ret', args[0] if len(args) > 0 else None)
+        rt_ret = kwargs.get("rt_ret", args[0] if len(args) > 0 else None)
 
     S, L, K, orders_req, rt, p, N = instance
     O = instance.O
     if rt_ret is None:
         rt_ret = instance.rt_ret
+
     # demand_count[k] = number of orders that need SKU k
     demand_count: dict[int, int] = defaultdict(int)
     for o in O:
@@ -83,10 +84,13 @@ def precompute_attributes(
         # sku_contention: sum of demand[k]/N[k] — high means copy pressure
         sku_contention = sum(demand_count[k] / max(N[k], 1) for k in req)
         # sharing_degree: number of other orders that share at least one SKU
-        sharing_degree = len({
-            o2 for o2 in O if o2 != o
-            and any(k in orders_req.get(o2, []) for k in req)
-        })
+        sharing_degree = len(
+            {
+                o2
+                for o2 in O
+                if o2 != o and any(k in orders_req.get(o2, []) for k in req)
+            }
+        )
         min_copies = min((N[k] for k in req), default=1)
 
         order_attrs[o] = {
@@ -107,21 +111,22 @@ def precompute_attributes(
 # Step 2: Parameterised sorting functions
 # ============================================================
 
+
 def sort_orders(
-        O: list[int],
-        order_attrs: dict[int, dict],
-        attr_key: str,
-        descending: bool,
+    O: list[int],
+    order_attrs: dict[int, dict],
+    attr_key: str,
+    descending: bool,
 ) -> list[int]:
     """Sort order ids by the given attribute key and direction."""
     return sorted(O, key=lambda o: order_attrs[o][attr_key], reverse=descending)
 
 
 def sort_skus_for_order(
-        order_skus: list[int],
-        sku_attrs: dict[int, dict],
-        attr_key: str,
-        descending: bool,
+    order_skus: list[int],
+    sku_attrs: dict[int, dict],
+    attr_key: str,
+    descending: bool,
 ) -> list[int]:
     """Sort SKU ids within an order by the given attribute key and direction."""
     return sorted(order_skus, key=lambda k: sku_attrs[k][attr_key], reverse=descending)
@@ -131,17 +136,22 @@ def sort_skus_for_order(
 # Step 3: plan_order_at_station accepting bin-sort parameters
 # ============================================================
 
+
 def plan_order_at_station_parameterised(
-        o: int, s: int,
-        state: HeuristicState,
-        orders_req: dict[int, list[int]],
-        rt: dict[int, int], rt_ret: dict[int, int], p: dict[int, int],
-        N: dict[int, int],
-        horizon: int,
-        ALPHA: float, BETA: float,
-        sku_attrs: dict[int, dict],
-        bin_attr_key: str,
-        bin_descending: bool,
+    o: int,
+    s: int,
+    state: HeuristicState,
+    orders_req: dict[int, list[int]],
+    rt: dict[int, int],
+    rt_ret: dict[int, int],
+    p: dict[int, int],
+    N: dict[int, int],
+    horizon: int,
+    ALPHA: float,
+    BETA: float,
+    sku_attrs: dict[int, dict],
+    bin_attr_key: str,
+    bin_descending: bool,
 ) -> Optional[OrderPlan]:
     """Tentatively schedule order o at station s with parameterised bin-fetch ordering.
 
@@ -158,7 +168,9 @@ def plan_order_at_station_parameterised(
     t_order_start = t_lane
 
     # Parameterised bin-fetch ordering
-    skus_sorted = sort_skus_for_order(orders_req[o], sku_attrs, bin_attr_key, bin_descending)
+    skus_sorted = sort_skus_for_order(
+        orders_req[o], sku_attrs, bin_attr_key, bin_descending
+    )
 
     t_cursor = t_order_start
     current_station_free = state.pickface_free[s]
@@ -194,8 +206,15 @@ def plan_order_at_station_parameterised(
             earliest_presence = max(t_cursor, current_station_free)
             desired_fetch = earliest_presence - rt[k]
             t_fetch, copy_id = earliest_feasible_fetch(
-                k, s, desired_fetch, state, rt, rt_ret,
-                pending_moves, pending_copies, horizon,
+                k,
+                s,
+                desired_fetch,
+                state,
+                rt,
+                rt_ret,
+                pending_moves,
+                pending_copies,
+                horizon,
             )
         except ValueError:
             return None
@@ -227,10 +246,14 @@ def plan_order_at_station_parameterised(
         current_station_free = max(current_station_free, presence_end)
 
         ev = BinEvent(
-            sku=k, copy_id=copy_id,
-            fetch_start=t_fetch, fetch_end=fetch_end,
-            presence_start=presence_start, presence_end=presence_end,
-            return_start=return_start, return_end=return_end,
+            sku=k,
+            copy_id=copy_id,
+            fetch_start=t_fetch,
+            fetch_end=fetch_end,
+            presence_start=presence_start,
+            presence_end=presence_end,
+            return_start=return_start,
+            return_end=return_end,
             orders_served=[o],
         )
         new_bin_events.append(ev)
@@ -238,13 +261,18 @@ def plan_order_at_station_parameterised(
         pending_moves.append((return_start, return_end))
         pending_copies[k].append((copy_id, return_end))
 
-    order_start = min((ps for ps, pe in pick_times_dict.values()), default=t_order_start)
+    order_start = min(
+        (ps for ps, pe in pick_times_dict.values()), default=t_order_start
+    )
     order_end = max((pe for ps, pe in pick_times_dict.values()), default=t_order_start)
     score = ALPHA * order_end + BETA * (order_end - order_start)
 
     return OrderPlan(
-        order=o, station=s, lane=best_lane,
-        start=order_start, end=order_end,
+        order=o,
+        station=s,
+        lane=best_lane,
+        start=order_start,
+        end=order_end,
         bin_events=new_bin_events,
         shared_picks=shared_picks,
         score=score,
@@ -256,44 +284,13 @@ def plan_order_at_station_parameterised(
 # Step 4: run_sgc_parameterised
 # ============================================================
 
-def run_sgc_parameterised(
-        instance,
-        *args,
-        **kwargs
-) -> Solution:
+
+def run_sgc_parameterised(instance, *args, **kwargs) -> Solution:
     """Run SGC with parameterised order-sort and bin-fetch-sort rules."""
     if not isinstance(instance, Instance):
-        def get_arg(name, idx, default):
-            if name in kwargs:
-                return kwargs[name]
-            real_idx = idx + 8
-            if len(args) > real_idx:
-                return args[real_idx]
-            return default
-
-        S = instance
-        L = args[0]
-        K = args[1]
-        O = args[2]
-        orders_req = args[3]
-        rt = args[4]
-        rt_ret = args[5]
-        p = args[6]
-        N = args[7]
-        horizon = get_arg('horizon', 0, 10000)
-        move_cap = get_arg('move_cap', 1, None)
-        if move_cap is None:
-            move_cap = kwargs.get('movecap', None)
-        ALPHA = get_arg('ALPHA', 2, 1.0)
-        BETA = get_arg('BETA', 3, 0.0)
-        order_attrs = get_arg('order_attrs', 4, None)
-        sku_attrs = get_arg('sku_attrs', 5, None)
-        order_attr_key = get_arg('order_attr_key', 6, None)
-        order_descending = get_arg('order_descending', 7, None)
-        bin_attr_key = get_arg('bin_attr_key', 8, None)
-        bin_descending = get_arg('bin_descending', 9, None)
-        instance = Instance(S, L, K, orders_req, rt, p, N, rt_ret=rt_ret)
+        raise ValueError
     else:
+
         def get_arg_new(name, idx, default):
             if name in kwargs:
                 return kwargs[name]
@@ -301,19 +298,19 @@ def run_sgc_parameterised(
                 return args[idx]
             return default
 
-        horizon = get_arg_new('horizon', 0, 10000)
-        move_cap = get_arg_new('move_cap', 1, None)
+        horizon = get_arg_new("horizon", 0, 10000)
+        move_cap = get_arg_new("move_cap", 1, None)
         if move_cap is None:
-            move_cap = kwargs.get('movecap', None)
-        ALPHA = get_arg_new('ALPHA', 2, 1.0)
-        BETA = get_arg_new('BETA', 3, 0.0)
-        order_attrs = get_arg_new('order_attrs', 4, None)
-        sku_attrs = get_arg_new('sku_attrs', 5, None)
-        order_attr_key = get_arg_new('order_attr_key', 6, None)
-        order_descending = get_arg_new('order_descending', 7, None)
-        bin_attr_key = get_arg_new('bin_attr_key', 8, None)
-        bin_descending = get_arg_new('bin_descending', 9, None)
-        rt_ret = kwargs.get('rt_ret', args[10] if len(args) > 10 else None)
+            move_cap = kwargs.get("movecap", None)
+        ALPHA = get_arg_new("ALPHA", 2, 1.0)
+        BETA = get_arg_new("BETA", 3, 0.0)
+        order_attrs = get_arg_new("order_attrs", 4, None)
+        sku_attrs = get_arg_new("sku_attrs", 5, None)
+        order_attr_key = get_arg_new("order_attr_key", 6, None)
+        order_descending = get_arg_new("order_descending", 7, None)
+        bin_attr_key = get_arg_new("bin_attr_key", 8, None)
+        bin_descending = get_arg_new("bin_descending", 9, None)
+        rt_ret = kwargs.get("rt_ret", args[10] if len(args) > 10 else None)
 
     S, L, K, orders_req, rt, p, N = instance
     O = instance.O
@@ -332,9 +329,20 @@ def run_sgc_parameterised(
 
         for s in S:
             plan = plan_order_at_station_parameterised(
-                o, s, state, orders_req, rt, rt_ret, p, N,
-                horizon, ALPHA, BETA,
-                sku_attrs, bin_attr_key, bin_descending,
+                o,
+                s,
+                state,
+                orders_req,
+                rt,
+                rt_ret,
+                p,
+                N,
+                horizon,
+                ALPHA,
+                BETA,
+                sku_attrs,
+                bin_attr_key,
+                bin_descending,
             )
             if plan is not None and (best_plan is None or plan.score < best_plan.score):
                 best_plan = plan
@@ -342,8 +350,10 @@ def run_sgc_parameterised(
         if best_plan is not None:
             commit_plan(best_plan, state)
             order_assignments[o] = (
-                best_plan.station, best_plan.lane,
-                best_plan.start, best_plan.end,
+                best_plan.station,
+                best_plan.lane,
+                best_plan.start,
+                best_plan.end,
             )
             for k, times in best_plan.pick_times.items():
                 pick_events_map[(o, best_plan.station, k)] = times
@@ -369,8 +379,14 @@ def run_sgc_parameterised(
 # ============================================================
 
 ORDER_ATTRS = [
-    "sum_rt", "order_size", "sum_cycle", "max_rt",
-    "sku_rarity", "sku_contention", "sharing_degree", "min_copies",
+    "sum_rt",
+    "order_size",
+    "sum_cycle",
+    "max_rt",
+    "sku_rarity",
+    "sku_contention",
+    "sharing_degree",
+    "min_copies",
 ]
 BIN_ATTRS = ["rt", "p", "cycle", "demand_ratio", "copies", "demand"]
 DIRECTIONS = [True, False]  # True = descending, False = ascending
@@ -399,9 +415,7 @@ def _compute_objective(sol: Solution, ALPHA: float, BETA: float, S: list[int]) -
 
 
 def run_ama_sgc(
-        instance,
-        *args,
-        **kwargs
+    instance, *args, **kwargs
 ) -> tuple[Solution, tuple[str, bool, str, bool], list[dict]]:
     """Run Adaptive Multi-Attribute SGC.
 
@@ -418,30 +432,15 @@ def run_ama_sgc(
         all_runs includes dicts with performance metrics for each configuration.
     """
     if not isinstance(instance, Instance):
-        S = instance
-        L = args[0]
-        K = args[1]
-        O = args[2]
-        orders_req = args[3]
-        rt = args[4]
-        rt_ret = args[5]
-        p = args[6]
-        N = args[7]
-        horizon = kwargs.get('horizon', args[8] if len(args) > 8 else 10000)
-        move_cap = kwargs.get('move_cap', args[9] if len(args) > 9 else None)
-        ALPHA = kwargs.get('ALPHA', args[10] if len(args) > 10 else 1.0)
-        BETA = kwargs.get('BETA', args[11] if len(args) > 11 else 0.0)
-        mode = kwargs.get('mode', args[12] if len(args) > 12 else "full_grid")
-        verbose = kwargs.get('verbose', args[13] if len(args) > 13 else False)
-        instance = Instance(S, L, K, orders_req, rt, p, N, rt_ret=rt_ret)
+        raise ValueError
     else:
-        horizon = kwargs.get('horizon', args[0] if len(args) > 0 else 10000)
-        move_cap = kwargs.get('move_cap', args[1] if len(args) > 1 else None)
-        ALPHA = kwargs.get('ALPHA', args[2] if len(args) > 2 else 1.0)
-        BETA = kwargs.get('BETA', args[3] if len(args) > 3 else 0.0)
-        mode = kwargs.get('mode', args[4] if len(args) > 4 else "full_grid")
-        verbose = kwargs.get('verbose', args[5] if len(args) > 5 else False)
-        rt_ret = kwargs.get('rt_ret', args[6] if len(args) > 6 else None)
+        horizon = kwargs.get("horizon", args[0] if len(args) > 0 else 10000)
+        move_cap = kwargs.get("move_cap", args[1] if len(args) > 1 else None)
+        ALPHA = kwargs.get("ALPHA", args[2] if len(args) > 2 else 1.0)
+        BETA = kwargs.get("BETA", args[3] if len(args) > 3 else 0.0)
+        mode = kwargs.get("mode", args[4] if len(args) > 4 else "full_grid")
+        verbose = kwargs.get("verbose", args[5] if len(args) > 5 else False)
+        rt_ret = kwargs.get("rt_ret", args[6] if len(args) > 6 else None)
 
     S, L, K, orders_req, rt, p, N = instance
     O = instance.O
@@ -455,16 +454,28 @@ def run_ama_sgc(
     best_config: tuple[str, bool, str, bool] = ("sharing_degree", False, "demand", True)
     all_runs: list[dict] = []
 
-    def record_run(phase: str, oa: str, od: bool, ba: str, bd: bool, sol_run: Solution, obj_val: float):
-        all_runs.append({
-            "phase": phase,
-            "order_attr": oa, "order_desc": od,
-            "bin_attr": ba, "bin_desc": bd,
-            "feasible": sol_run.feasible,
-            "makespan": float(sol_run.makespan) if sol_run.feasible else None,
-            "total_moves": sol_run.total_moves if sol_run.feasible else None,
-            "objective": float(obj_val) if sol_run.feasible else None,
-        })
+    def record_run(
+        phase: str,
+        oa: str,
+        od: bool,
+        ba: str,
+        bd: bool,
+        sol_run: Solution,
+        obj_val: float,
+    ):
+        all_runs.append(
+            {
+                "phase": phase,
+                "order_attr": oa,
+                "order_desc": od,
+                "bin_attr": ba,
+                "bin_desc": bd,
+                "feasible": sol_run.feasible,
+                "makespan": float(sol_run.makespan) if sol_run.feasible else None,
+                "total_moves": sol_run.total_moves if sol_run.feasible else None,
+                "objective": float(obj_val) if sol_run.feasible else None,
+            }
+        )
 
     if mode == "full_grid":
         for oa in ORDER_ATTRS:
@@ -549,7 +560,10 @@ def run_ama_sgc(
 
     if verbose:
         oa, od, ba, bd = best_config
-        def dir_str(d): return "desc" if d else "asc"
+
+        def dir_str(d):
+            return "desc" if d else "asc"
+
         print(
             f"[AMA-SGC] Best config: order={oa}({dir_str(od)}), "
             f"bin={ba}({dir_str(bd)}), obj={best_obj:.1f}"
@@ -562,6 +576,7 @@ def run_ama_sgc(
 # ============================================================
 # Step 6: solve_heuristic_instance wrapper
 # ============================================================
+
 
 def solve_heuristic_instance(config: dict, return_raw: bool = False):
     """Run one AMA-SGC instance described by *config*.
@@ -584,6 +599,7 @@ def solve_heuristic_instance(config: dict, return_raw: bool = False):
         }
     """
     import time
+
     from datagen import generate_data
 
     num_stations = config.get("stations", 1)
@@ -612,14 +628,15 @@ def solve_heuristic_instance(config: dict, return_raw: bool = False):
     t0 = time.perf_counter()
     sol, best_config, all_runs = run_ama_sgc(
         instance,
-        horizon=horizon, move_cap=move_cap, ALPHA=alpha, BETA=beta,
+        horizon=horizon,
+        move_cap=move_cap,
+        ALPHA=alpha,
+        BETA=beta,
         mode=mode,
     )
     elapsed = time.perf_counter() - t0
     status = "Feasible" if sol.feasible else "Infeasible"
-    violations = validate_solution(
-        sol, instance, horizon=horizon, move_cap=move_cap
-    )
+    violations = validate_solution(sol, instance, horizon=horizon, move_cap=move_cap)
     if violations:
         print(f"VALIDATION FAILED ({len(violations)} violations)")
         status = "Invalid"
@@ -645,10 +662,12 @@ def solve_heuristic_instance(config: dict, return_raw: bool = False):
 # Step 7: CLI entry point
 # ============================================================
 
+
 def main() -> None:
     """CLI entry point for running the AMA-SGC heuristic standalone."""
     import argparse
     import time
+
     from datagen import generate_data
 
     ap = argparse.ArgumentParser(
@@ -665,11 +684,17 @@ def main() -> None:
     ap.add_argument("--alpha", type=float, default=1.0)
     ap.add_argument("--beta", type=float, default=0.0)
     ap.add_argument(
-        "--mode", choices=["full_grid", "two_phase"], default="full_grid",
+        "--mode",
+        choices=["full_grid", "two_phase"],
+        default="full_grid",
         help="full_grid: 192 runs; two_phase: 28 runs (faster, may miss interactions)",
     )
-    ap.add_argument("--verbose", action="store_true", help="Print winning attribute combination")
-    ap.add_argument("--no_vis", action="store_true", help="Skip HTML schedule visualisation")
+    ap.add_argument(
+        "--verbose", action="store_true", help="Print winning attribute combination"
+    )
+    ap.add_argument(
+        "--no_vis", action="store_true", help="Skip HTML schedule visualisation"
+    )
     args = ap.parse_args()
 
     print("Generating data...")
@@ -684,21 +709,31 @@ def main() -> None:
     S, L, K, orders_req, rt, p, N = instance
     O = instance.O
 
-    print(f"Stations={len(S)}, Lanes={len(L)}, SKUs={len(K)}, Orders={len(O)}, RobotLimit={args.movecap}\n")
+    print(
+        f"Stations={len(S)}, Lanes={len(L)}, SKUs={len(K)}, Orders={len(O)}, RobotLimit={args.movecap}\n"
+    )
 
-    print(f"\nRunning AMA-SGC heuristic (alpha={args.alpha}, beta={args.beta}, mode={args.mode})...")
+    print(
+        f"\nRunning AMA-SGC heuristic (alpha={args.alpha}, beta={args.beta}, mode={args.mode})..."
+    )
     t0 = time.perf_counter()
     sol, best_config, all_runs = run_ama_sgc(
         instance,
-        horizon=args.horizon, move_cap=args.movecap,
-        ALPHA=args.alpha, BETA=args.beta,
-        mode=args.mode, verbose=True,
+        horizon=args.horizon,
+        move_cap=args.movecap,
+        ALPHA=args.alpha,
+        BETA=args.beta,
+        mode=args.mode,
+        verbose=True,
     )
     elapsed = time.perf_counter() - t0
 
     oa, od, ba, bd = best_config
-    def dir_str(d): return "desc" if d else "asc"
-    print(f"\n=== AMA-SGC Result ===")
+
+    def dir_str(d):
+        return "desc" if d else "asc"
+
+    print("\n=== AMA-SGC Result ===")
     print(f"Feasible:    {sol.feasible}")
     print(f"Makespan:    {sol.makespan}")
     print(f"Total bin events (moves/2): {sol.total_moves // 2}")
@@ -718,9 +753,8 @@ def main() -> None:
     if not args.no_vis:
         try:
             from schedule_visualizer import plot_schedule
-            mock_sol, handles = build_viz_handles(
-                sol, instance
-            )
+
+            mock_sol, handles = build_viz_handles(sol, instance)
             plot_schedule(mock_sol, handles)
         except Exception as exc:
             print(f"[VIS] Skipped: {exc}")

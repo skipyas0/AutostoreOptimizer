@@ -285,6 +285,7 @@ def generate_data(
     pick_time_model: str = "variable",
     bin_count_model: str = "popularity_correlated",
     grid_depth: int = 16,
+    movecap: int = None,
     verbose: bool = False,
 ) -> Instance:
     """Generate realistic synthetic AutoStore scheduling data.
@@ -441,12 +442,12 @@ def generate_data(
 
         orders_requirements[o] = sorted(req)
 
-    instance = Instance(S, L, K, orders_requirements, rt, p, N, rt_ret=dict(rt))
+    instance = Instance(S, L, K, orders_requirements, rt, p, N, rt_ret=dict(rt), movecap=movecap, seed=seed)
     if verbose:
         instance.print_summary()
 
     return instance
-
+ 
 
 # ---------------------------------------------------------------------------
 # Legacy wrapper: identical interface to old generate_data

@@ -27,61 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # Step 1: Weighted Jaccard similarity
 # ============================================================
 
-def compute_demand_count(
-        orders_req: dict[int, list[int]],
-        K: list[int],
-) -> dict[int, int]:
-    """Count how many orders need each SKU."""
-    count: dict[int, int] = defaultdict(int)
-    for o in orders_req:
-        for k in orders_req[o]:
-            count[k] += 1
-    return dict(count)
-
-
-def compute_weighted_jaccard(
-        o1: int, o2: int,
-        orders_req: dict[int, list[int]],
-        rt: dict[int, int],
-        rt_ret: dict[int, int],
-) -> float:
-    """Retrieval-time-weighted Jaccard similarity between two orders.
-
-    J_w(o, o') = Σ_{k ∈ R_o ∩ R_o'} (rt[k]+rt_ret[k])
-                 / Σ_{k ∈ R_o ∪ R_o'} (rt[k]+rt_ret[k])
-
-    Returns 0.0 when both orders are empty or have no union.
-    """
-    set1 = set(orders_req[o1])
-    set2 = set(orders_req[o2])
-    intersection = set1 & set2
-    union = set1 | set2
-
-    union_weight = sum(rt[k] + rt_ret[k] for k in union)
-    if union_weight == 0:
-        return 0.0
-    intersection_weight = sum(rt[k] + rt_ret[k] for k in intersection)
-    return intersection_weight / union_weight
-
-
-def build_similarity_matrix(
-        O: list[int],
-        orders_req: dict[int, list[int]],
-        rt: dict[int, int],
-        rt_ret: dict[int, int],
-) -> dict[tuple[int, int], float]:
-    """Compute pairwise weighted Jaccard for all order pairs (upper triangle).
-
-    Returns {(o1, o2): similarity} where o1 < o2 in the O list index sense.
-    """
-    sim: dict[tuple[int, int], float] = {}
-    for i in range(len(O)):
-        for j in range(i + 1, len(O)):
-            o1, o2 = O[i], O[j]
-            key = (o1, o2) if o1 < o2 else (o2, o1)
-            sim[key] = compute_weighted_jaccard(o1, o2, orders_req, rt, rt_ret)
-    return sim
-
+from jaccard_similarity import build_similarity_matrix
 
 # ============================================================
 # Step 2: Agglomerative clustering with capacity constraints
@@ -286,7 +232,8 @@ def run_cfss_sgc(
     O = instance.O
     if rt_ret is None:
         rt_ret = instance.rt_ret
-    sim_matrix = build_similarity_matrix(O, orders_req, rt, rt_ret)
+    sim_matrix, _ = build_similarity_matrix(O, orders_req, rt, rt_ret)
+
     clusters = agglomerative_cluster(
         O, orders_req, sim_matrix, rt,
         threshold=sim_threshold,

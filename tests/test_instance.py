@@ -59,7 +59,6 @@ def test_instance_statistics(capsys):
     assert stats["rt_mean"] == 20.0
     assert stats["p_mean"] == 4.0
     assert stats["n_mean"] == 2.0
-    assert stats["total_pick_lines"] == 4
 
     # Test print_summary
     inst.print_summary()

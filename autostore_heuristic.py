@@ -3,12 +3,13 @@
 AutoStore Simple Greedy Constructive (SGC) Heuristic.
 Mirrors variable names from the CP model (cp_model.py).
 """
+
 import heapq
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Optional
-from instance import Instance
 
+from instance import Instance
 
 # ============================================================
 # PHASE 0 — Infrastructure
@@ -16,9 +17,11 @@ from instance import Instance
 
 # ------ [P0-4] BinEvent dataclass ------
 
+
 @dataclass
 class BinEvent:
     """One bin visit at a station: fetch -> presence -> return."""
+
     sku: int
     copy_id: int
     fetch_start: int
@@ -32,9 +35,11 @@ class BinEvent:
 
 # ------ [P0-4 cont.] OrderPlan dataclass ------
 
+
 @dataclass
 class OrderPlan:
     """Result of tentatively scheduling one order at one station."""
+
     order: int
     station: int
     lane: int
@@ -43,10 +48,13 @@ class OrderPlan:
     bin_events: list[BinEvent]  # new bin events created
     shared_picks: list[tuple[int, BinEvent, int]]  # (sku, bin_event, pick_end)
     score: float = float("inf")
-    pick_times: dict[int, tuple[int, int]] = field(default_factory=dict)  # sku -> (pick_start, pick_end)
+    pick_times: dict[int, tuple[int, int]] = field(
+        default_factory=dict
+    )  # sku -> (pick_start, pick_end)
 
 
 # ------ [P0-2] DifferenceArray class ------
+
 
 class DifferenceArray:
     """Tracks concurrent moves via a difference array + prefix sum."""
@@ -93,7 +101,7 @@ class DifferenceArray:
         t2 = min(t2, self.H)
         if t1 > t2:
             return 0
-        return max(self.prefix[t1:t2 + 1])
+        return max(self.prefix[t1 : t2 + 1])
 
     def delay_for_movecap(self, t_start: int, duration: int, cap: int) -> int:
         """Slide t_start forward until [t_start, t_start+duration) fits under cap."""
@@ -115,8 +123,11 @@ class DifferenceArray:
         return t  # may exceed horizon — caller must check
 
     def delay_for_movecap_with_pending(
-            self, t_start: int, duration: int, cap: int,
-            pending_moves: list[tuple[int, int]]
+        self,
+        t_start: int,
+        duration: int,
+        cap: int,
+        pending_moves: list[tuple[int, int]],
     ) -> int:
         """Like delay_for_movecap but also accounts for uncommitted pending moves."""
         if cap is None:
@@ -130,7 +141,7 @@ class DifferenceArray:
             ok = True
             for i in range(t, t + duration):
                 total = self.prefix[i]
-                for (ms, me) in pending_moves:
+                for ms, me in pending_moves:
                     if ms <= i < me:
                         total += 1
                 if total >= cap:
@@ -143,6 +154,7 @@ class DifferenceArray:
 
 
 # ------ [P0-3] BinCopyPool class ------
+
 
 class BinCopyPool:
     """Min-heap tracking N[k] physical copy availability times for one SKU."""
@@ -184,9 +196,11 @@ class BinCopyPool:
 
 # ------ [P0-5] HeuristicState ------
 
+
 @dataclass
 class HeuristicState:
     """Mutable state tracked during the greedy constructive loop."""
+
     lane_free: dict[tuple[int, int], int]  # (s, ln) -> earliest free time
     pickface_free: dict[int, int]  # s -> earliest time pickface is free
     move_da: DifferenceArray  # global move profile
@@ -198,13 +212,13 @@ class HeuristicState:
     last_pick: dict[int, int]  # s -> latest pick end at s
     move_cap: Optional[int]  # global MoveCap (None = no cap)
 
-    
-
 
 # ------ [P0-6] compute_U ------
 
-def compute_U(orders_req: dict[int, list[int]], K: list[int],
-              L: list[int]) -> dict[int, int]:
+
+def compute_U(
+    orders_req: dict[int, list[int]], K: list[int], L: list[int]
+) -> dict[int, int]:
     """Compute U[k] = ceil(demand_k / |L|), mirroring the CP model."""
     need_count: dict[int, int] = defaultdict(int)
     for o in orders_req:
@@ -224,8 +238,8 @@ def compute_U(orders_req: dict[int, list[int]], K: list[int],
 
 # ------ [P1-1] static_priority_sort ------
 
-def static_priority_sort(orders_req: dict[int, list[int]],
-                         O: list[int]) -> list[int]:
+
+def static_priority_sort(orders_req: dict[int, list[int]], O: list[int]) -> list[int]:
     """Sort order ids by sharing degree ascending (fewest shared SKUs first)."""
     req_sets = {o: set(req) for o, req in orders_req.items()}
 
@@ -238,8 +252,10 @@ def static_priority_sort(orders_req: dict[int, list[int]],
 
 # ------ [P1-2] find_shared_bin ------
 
-def find_shared_bin(station_bin_events: list[BinEvent], k: int,
-                    t_cursor: int, p: dict[int, int]) -> Optional[BinEvent]:
+
+def find_shared_bin(
+    station_bin_events: list[BinEvent], k: int, t_cursor: int, p: dict[int, int]
+) -> Optional[BinEvent]:
     """Find an existing BinEvent at a station for SKU k whose presence covers t_cursor."""
     # We can use a bin even if it arrives AFTER t_cursor (we just wait for it).
     # We prefer the earliest-starting feasible bin that can fit us.
@@ -260,13 +276,17 @@ def find_shared_bin(station_bin_events: list[BinEvent], k: int,
 
 # ------ [P1-3] earliest_feasible_fetch ------
 
+
 def earliest_feasible_fetch(
-        k: int, s: int, desired_start: int,
-        state: HeuristicState,
-        rt: dict[int, int], rt_ret: dict[int, int],
-        pending_moves: list[tuple[int, int]],
-        pending_copies: dict[int, list[tuple[int, int]]],
-        horizon: int,
+    k: int,
+    s: int,
+    desired_start: int,
+    state: HeuristicState,
+    rt: dict[int, int],
+    rt_ret: dict[int, int],
+    pending_moves: list[tuple[int, int]],
+    pending_copies: dict[int, list[tuple[int, int]]],
+    horizon: int,
 ) -> tuple[int, int]:
     """Find earliest fetch start for SKU k at station s, respecting all constraints.
 
@@ -281,7 +301,7 @@ def earliest_feasible_fetch(
     pending_for_k = pending_copies.get(k, [])
     if pending_for_k:
         effective_times: list[tuple[int, int]] = list(pool._heap)
-        for (pcid, p_ret_end) in pending_for_k:
+        for pcid, p_ret_end in pending_for_k:
             for i, (t, cid) in enumerate(effective_times):
                 if cid == pcid:
                     effective_times[i] = (max(t, p_ret_end), cid)
@@ -299,22 +319,29 @@ def earliest_feasible_fetch(
         )
 
     if t_start + rt[k] + rt_ret[k] > horizon:
-        raise ValueError(f"SKU {k} infeasible: fetch start {t_start} exceeds horizon {horizon}")
+        raise ValueError(
+            f"SKU {k} infeasible: fetch start {t_start} exceeds horizon {horizon}"
+        )
 
     return t_start, copy_id
 
 
 # ------ [P1-4] plan_order_at_station ------
 
+
 def plan_order_at_station(
-        o: int, s: int,
-        state: HeuristicState,
-        orders_req: dict[int, list[int]],
-        rt: dict[int, int], rt_ret: dict[int, int], p: dict[int, int],
-        N: dict[int, int],
-        horizon: int,
-        ALPHA: float, BETA: float,
-        demand_count: dict[int, int],
+    o: int,
+    s: int,
+    state: HeuristicState,
+    orders_req: dict[int, list[int]],
+    rt: dict[int, int],
+    rt_ret: dict[int, int],
+    p: dict[int, int],
+    N: dict[int, int],
+    horizon: int,
+    ALPHA: float,
+    BETA: float,
+    demand_count: dict[int, int],
 ) -> Optional[OrderPlan]:
     """Tentatively schedule order o at station s. Returns OrderPlan or None if infeasible."""
     L_at_s = [ln for (ss, ln) in state.lane_free if ss == s]
@@ -327,7 +354,9 @@ def plan_order_at_station(
     t_order_start = t_lane
 
     # Sort SKUs by demand descending (most popular first)
-    skus_sorted = sorted(orders_req[o], key=lambda k: demand_count.get(k, 0), reverse=True)
+    skus_sorted = sorted(
+        orders_req[o], key=lambda k: demand_count.get(k, 0), reverse=True
+    )
 
     # t_cursor tracks when the ORDER is free (picker availability).
     # We decouple this from pickface availability (current_station_free).
@@ -371,8 +400,15 @@ def plan_order_at_station(
             desired_fetch = earliest_presence - rt[k]
 
             t_fetch, copy_id = earliest_feasible_fetch(
-                k, s, desired_fetch, state, rt, rt_ret,
-                pending_moves, pending_copies, horizon,
+                k,
+                s,
+                desired_fetch,
+                state,
+                rt,
+                rt_ret,
+                pending_moves,
+                pending_copies,
+                horizon,
             )
         except ValueError:
             return None
@@ -405,10 +441,14 @@ def plan_order_at_station(
         current_station_free = max(current_station_free, presence_end)
 
         ev = BinEvent(
-            sku=k, copy_id=copy_id,
-            fetch_start=t_fetch, fetch_end=fetch_end,
-            presence_start=presence_start, presence_end=presence_end,
-            return_start=return_start, return_end=return_end,
+            sku=k,
+            copy_id=copy_id,
+            fetch_start=t_fetch,
+            fetch_end=fetch_end,
+            presence_start=presence_start,
+            presence_end=presence_end,
+            return_start=return_start,
+            return_end=return_end,
             orders_served=[o],
         )
         new_bin_events.append(ev)
@@ -416,13 +456,18 @@ def plan_order_at_station(
         pending_moves.append((return_start, return_end))
         pending_copies[k].append((copy_id, return_end))
 
-    order_start = min((ps for ps, pe in pick_times_dict.values()), default=t_order_start)
+    order_start = min(
+        (ps for ps, pe in pick_times_dict.values()), default=t_order_start
+    )
     order_end = max((pe for ps, pe in pick_times_dict.values()), default=t_order_start)
     score = ALPHA * order_end + BETA * (order_end - order_start)
 
     return OrderPlan(
-        order=o, station=s, lane=best_lane,
-        start=order_start, end=order_end,
+        order=o,
+        station=s,
+        lane=best_lane,
+        start=order_start,
+        end=order_end,
         bin_events=new_bin_events,
         shared_picks=shared_picks,
         score=score,
@@ -432,6 +477,7 @@ def plan_order_at_station(
 
 # ------ [P1-6] commit_plan ------
 
+
 def commit_plan(plan: OrderPlan, state: HeuristicState) -> None:
     """Commit a chosen OrderPlan into the mutable HeuristicState."""
     s = plan.station
@@ -440,7 +486,9 @@ def commit_plan(plan: OrderPlan, state: HeuristicState) -> None:
     state.lane_free[(s, ln)] = plan.end
     state.pickface_free[s] = max(
         state.pickface_free[s],
-        max((ev.presence_end for ev in plan.bin_events), default=state.pickface_free[s])
+        max(
+            (ev.presence_end for ev in plan.bin_events), default=state.pickface_free[s]
+        ),
     )
 
     for ev in plan.bin_events:
@@ -467,21 +515,29 @@ def commit_plan(plan: OrderPlan, state: HeuristicState) -> None:
 
 # ------ [P1-7] run_sgc ------
 
+
 @dataclass
 class Solution:
     """Complete heuristic solution."""
+
     order_assignments: dict[int, tuple[int, int, int, int]]  # o -> (s, ln, start, end)
     bin_events: dict[int, list[BinEvent]]  # s -> list of BinEvents
     makespan: int
     total_moves: int
     feasible: bool
-    pick_events: dict[tuple[int, int, int], tuple[int, int]] = field(default_factory=dict)
+    pick_events: dict[tuple[int, int, int], tuple[int, int]] = field(
+        default_factory=dict
+    )
     # (o, s, k) -> (pick_start, pick_end)
 
 
 def init_state(
-        S: list[int], L: list[int], K: list[int],
-        N: dict[int, int], horizon: int, move_cap: Optional[int],
+    S: list[int],
+    L: list[int],
+    K: list[int],
+    N: dict[int, int],
+    horizon: int,
+    move_cap: Optional[int],
 ) -> HeuristicState:
     """Build initial HeuristicState with everything at t=0."""
     lane_free = {(s, ln): 0 for s in S for ln in L}
@@ -507,38 +563,20 @@ def init_state(
     )
 
 
-def run_sgc(
-        instance,
-        *args,
-        **kwargs
-) -> Solution:
+def run_sgc(instance, *args, **kwargs) -> Solution:
     """Run the Simple Greedy Constructive heuristic. [P1-7]"""
     if not isinstance(instance, Instance):
-        # Backward compatibility fallback
-        S = instance
-        L = args[0]
-        K = args[1]
-        O = args[2]
-        orders_req = args[3]
-        rt = args[4]
-        rt_ret = args[5]
-        p = args[6]
-        N = args[7]
-        horizon = kwargs.get('horizon', args[8] if len(args) > 8 else 10000)
-        move_cap = kwargs.get('move_cap', args[9] if len(args) > 9 else None)
-        ALPHA = kwargs.get('ALPHA', args[10] if len(args) > 10 else 1.0)
-        BETA = kwargs.get('BETA', args[11] if len(args) > 11 else 0.0)
-        instance = Instance(S, L, K, orders_req, rt, p, N, rt_ret=rt_ret)
+        raise ValueError
     else:
-        horizon = kwargs.get('horizon', args[0] if len(args) > 0 else 10000)
-        move_cap = kwargs.get('move_cap', args[1] if len(args) > 1 else None)
-        ALPHA = kwargs.get('ALPHA', args[2] if len(args) > 2 else 1.0)
-        BETA = kwargs.get('BETA', args[3] if len(args) > 3 else 0.0)
-        rt_ret = kwargs.get('rt_ret', args[4] if len(args) > 4 else None)
+        horizon = kwargs.get("horizon", args[0] if len(args) > 0 else 10000)
+        move_cap = kwargs.get("move_cap", args[1] if len(args) > 1 else None)
+        ALPHA = kwargs.get("ALPHA", args[2] if len(args) > 2 else 1.0)
+        BETA = kwargs.get("BETA", args[3] if len(args) > 3 else 0.0)
+        rt_ret = kwargs.get("rt_ret", args[4] if len(args) > 4 else None)
 
     S, L, K, orders_req, rt, p, N = instance
     O = instance.O
-    if 'rt_ret' not in locals() or rt_ret is None:
+    if "rt_ret" not in locals() or rt_ret is None:
         rt_ret = instance.rt_ret
 
     state = init_state(S, L, K, N, horizon, move_cap)
@@ -559,7 +597,18 @@ def run_sgc(
 
         for s in S:
             plan = plan_order_at_station(
-                o, s, state, orders_req, rt, rt_ret, p, N, horizon, ALPHA, BETA, demand_count
+                o,
+                s,
+                state,
+                orders_req,
+                rt,
+                rt_ret,
+                p,
+                N,
+                horizon,
+                ALPHA,
+                BETA,
+                demand_count,
             )
             if plan is not None and (best_plan is None or plan.score < best_plan.score):
                 best_plan = plan
@@ -567,8 +616,10 @@ def run_sgc(
         if best_plan is not None:
             commit_plan(best_plan, state)
             order_assignments[o] = (
-                best_plan.station, best_plan.lane,
-                best_plan.start, best_plan.end,
+                best_plan.station,
+                best_plan.lane,
+                best_plan.start,
+                best_plan.end,
             )
             for k, times in best_plan.pick_times.items():
                 pick_events_map[(o, best_plan.station, k)] = times
@@ -576,13 +627,13 @@ def run_sgc(
             failed_orders.append(o)
 
     makespan = max((end for _, _, _, end in order_assignments.values()), default=0)
-    total_moves = sum(
-        len(evts) * 2 for evts in state.station_bin_events.values()
-    )
+    total_moves = sum(len(evts) * 2 for evts in state.station_bin_events.values())
     feasible = len(failed_orders) == 0
 
     if failed_orders:
-        print(f"[SGC] WARNING: {len(failed_orders)} orders could not be scheduled: {failed_orders}")
+        print(
+            f"[SGC] WARNING: {len(failed_orders)} orders could not be scheduled: {failed_orders}"
+        )
 
     return Solution(
         order_assignments=order_assignments,
@@ -598,14 +649,17 @@ def run_sgc(
 # Visualisation helpers (bridge to schedule_visualizer2)
 # ============================================================
 
+
 class _MockIV:
     """Placeholder for a CP interval variable — used only as a unique dict key."""
+
     __slots__ = ()
 
 
 @dataclass
 class _MockIVSol:
     """Lightweight stand-in for a CP interval-variable solution."""
+
     present: bool
     start: int = 0
     end: int = 0
@@ -634,10 +688,7 @@ class _MockCPSol:
 
 
 def build_viz_handles(
-        solution: "Solution",
-        instance,
-        *args,
-        **kwargs
+    solution: "Solution", instance, *args, **kwargs
 ) -> tuple["_MockCPSol", dict]:
     """Convert a heuristic Solution to (mock_cp_sol, handles) for schedule_visualizer2.
 
@@ -655,7 +706,7 @@ def build_viz_handles(
         p = args[6]
         instance = Instance(S, L, K, orders_req, rt, p, {}, rt_ret=rt_ret)
     else:
-        rt_ret = kwargs.pop('rt_ret', None)
+        rt_ret = kwargs.pop("rt_ret", None)
 
     S, L, K, orders_req, rt, p, N = instance
     O = instance.O
@@ -674,7 +725,9 @@ def build_viz_handles(
     # copy making multiple visits does not overwrite earlier F/B/R dict entries.
     # (copy_id is reused across visits; we need a collision-free key for the viz dicts.)
     visit_counters: dict[tuple[int, int], int] = defaultdict(int)
-    visit_idx_lookup: dict[tuple[int, int, int], int] = {}  # (s, k, presence_start) -> visit_idx
+    visit_idx_lookup: dict[
+        tuple[int, int, int], int
+    ] = {}  # (s, k, presence_start) -> visit_idx
 
     # Order windows: I_os and I_os_lane
     for o in O:
@@ -687,8 +740,9 @@ def build_viz_handles(
             for ln in L:
                 iv2 = _MockIV()
                 I_os_lane[(o, s, ln)] = iv2
-                sol._set(iv2, present=(s == s_sel and ln == ln_sel),
-                         start=t_start, end=t_end)
+                sol._set(
+                    iv2, present=(s == s_sel and ln == ln_sel), start=t_start, end=t_end
+                )
 
     # Bin fetch / presence / return — keyed by visit index, not physical copy_id
     for s, evts in solution.bin_events.items():
@@ -715,8 +769,11 @@ def build_viz_handles(
     # Pick and consumption intervals
     for (o, s, k), (ps, pe) in solution.pick_events.items():
         matched_be = next(
-            (be for be in solution.bin_events.get(s, [])
-             if be.sku == k and be.presence_start <= ps < be.presence_end),
+            (
+                be
+                for be in solution.bin_events.get(s, [])
+                if be.sku == k and be.presence_start <= ps < be.presence_end
+            ),
             None,
         )
         if matched_be is not None:
@@ -730,11 +787,22 @@ def build_viz_handles(
         sol._set(iv_c, present=True, start=ps, end=pe)
 
     handles = {
-        "I_os": I_os, "I_os_lane": I_os_lane,
-        "C": C, "P": P, "F": F, "R": R, "B": B,
-        "U": U, "orders_req": orders_req,
-        "rt": rt, "rt_return": rt_ret, "p": p,
-        "S": S, "L": L, "K": K, "O": O,
+        "I_os": I_os,
+        "I_os_lane": I_os_lane,
+        "C": C,
+        "P": P,
+        "F": F,
+        "R": R,
+        "B": B,
+        "U": U,
+        "orders_req": orders_req,
+        "rt": rt,
+        "rt_return": rt_ret,
+        "p": p,
+        "S": S,
+        "L": L,
+        "K": K,
+        "O": O,
     }
     handles.update(kwargs)
     return sol, handles
@@ -743,6 +811,7 @@ def build_viz_handles(
 # ============================================================
 # Benchmarking API (mirrors solve_instance in CP model)
 # ============================================================
+
 
 def solve_heuristic_instance(config: dict, return_raw: bool = False):
     """Run one heuristic instance described by *config*.
@@ -762,8 +831,8 @@ def solve_heuristic_instance(config: dict, return_raw: bool = False):
             'total_moves':     int,
         }
     """
-    import sys
     import os
+    import sys
     import time
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -792,8 +861,21 @@ def solve_heuristic_instance(config: dict, return_raw: bool = False):
     O = sorted(orders_req.keys())
 
     t0 = time.perf_counter()
-    sol = run_sgc(S, L, K, O, orders_req, rt, rt_ret, p, N,
-                  horizon=horizon, move_cap=move_cap, ALPHA=alpha, BETA=beta)
+    sol = run_sgc(
+        S,
+        L,
+        K,
+        O,
+        orders_req,
+        rt,
+        rt_ret,
+        p,
+        N,
+        horizon=horizon,
+        move_cap=move_cap,
+        ALPHA=alpha,
+        BETA=beta,
+    )
     elapsed = time.perf_counter() - t0
 
     res = {
@@ -811,30 +893,17 @@ def solve_heuristic_instance(config: dict, return_raw: bool = False):
 # [P1-9] Validator
 # ============================================================
 
+
 def validate_solution(
-        solution: Solution,
-        instance,
-        *args,
-        **kwargs
+    solution: Solution, instance: Instance, *args, **kwargs
 ) -> list[str]:
     """Validate a heuristic solution. Returns list of violation strings (empty = valid)."""
     if not isinstance(instance, Instance):
-        S = instance
-        L = args[0]
-        K = args[1]
-        O = args[2]
-        orders_req = args[3]
-        rt = args[4]
-        rt_ret = args[5]
-        p = args[6]
-        N = args[7]
-        horizon = kwargs.get('horizon', args[8] if len(args) > 8 else 10000)
-        move_cap = kwargs.get('move_cap', args[9] if len(args) > 9 else None)
-        instance = Instance(S, L, K, orders_req, rt, p, N, rt_ret=rt_ret)
+        raise ValueError
     else:
-        horizon = kwargs.get('horizon', args[0] if len(args) > 0 else 10000)
-        move_cap = kwargs.get('move_cap', args[1] if len(args) > 1 else None)
-        rt_ret = kwargs.get('rt_ret', args[2] if len(args) > 2 else None)
+        horizon = kwargs.get("horizon", args[0] if len(args) > 0 else 10000)
+        move_cap = kwargs.get("move_cap", args[1] if len(args) > 1 else None)
+        rt_ret = kwargs.get("rt_ret", args[2] if len(args) > 2 else None)
 
     S, L, K, orders_req, rt, p, N = instance
     O = instance.O
@@ -864,7 +933,9 @@ def validate_solution(
     # 3. Pickface: at most one bin present at each station at any time
     for s in S:
         events = solution.bin_events.get(s, [])
-        presence_intervals = [(ev.presence_start, ev.presence_end, ev.sku) for ev in events]
+        presence_intervals = [
+            (ev.presence_start, ev.presence_end, ev.sku) for ev in events
+        ]
         presence_intervals.sort()
         for i in range(len(presence_intervals) - 1):
             _, end_i, k_i = presence_intervals[i]
@@ -884,7 +955,7 @@ def validate_solution(
         if len(all_blocks) <= N[k]:
             continue
         events_sweep: list[tuple[int, int]] = []
-        for (bs, be) in all_blocks:
+        for bs, be in all_blocks:
             events_sweep.append((bs, +1))
             events_sweep.append((be, -1))
         events_sweep.sort(key=lambda x: (x[0], x[1]))
@@ -905,7 +976,7 @@ def validate_solution(
                 move_events.append((ev.fetch_start, ev.fetch_end))
                 move_events.append((ev.return_start, ev.return_end))
         sweep: list[tuple[int, int]] = []
-        for (ms, me) in move_events:
+        for ms, me in move_events:
             sweep.append((ms, +1))
             sweep.append((me, -1))
         sweep.sort(key=lambda x: (x[0], x[1]))
@@ -962,12 +1033,13 @@ def validate_solution(
 # Standalone entry point (mirrors CP model CLI)
 # ============================================================
 
+
 def main():
     """CLI entry point for running the SGC heuristic standalone."""
     import argparse
-    import time
-    import sys
     import os
+    import sys
+    import time
 
     # Add project dir to path so we can import from the CP model
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -984,9 +1056,10 @@ def main():
     ap.add_argument("--horizon", type=int, default=10000)
     ap.add_argument("--alpha", type=float, default=1.0)
     ap.add_argument("--beta", type=float, default=0.0)
-    ap.add_argument("--no_vis", action="store_true", help="Skip HTML schedule visualisation")
+    ap.add_argument(
+        "--no_vis", action="store_true", help="Skip HTML schedule visualisation"
+    )
     args = ap.parse_args()
-    
 
     print("Generating data...")
     print("Generating data...")
@@ -1011,24 +1084,26 @@ def main():
     t0 = time.perf_counter()
     sol = run_sgc(
         instance,
-        horizon=args.horizon, move_cap=args.movecap,
-        ALPHA=args.alpha, BETA=args.beta,
+        horizon=args.horizon,
+        move_cap=args.movecap,
+        ALPHA=args.alpha,
+        BETA=args.beta,
     )
     elapsed = time.perf_counter() - t0
 
-    print(f"\n=== SGC Result ===")
+    print("\n=== SGC Result ===")
     print(f"Feasible: {sol.feasible}")
     print(f"Makespan: {sol.makespan}")
     print(f"Total bin events (moves/2): {sol.total_moves // 2}")
     print(f"Time: {elapsed:.4f}s")
 
-    print(f"\nOrder assignments:")
+    print("\nOrder assignments:")
     for o in O:
         if o in sol.order_assignments:
             s, ln, start, end = sol.order_assignments[o]
             print(f"  Order {o:>2} -> S{s} L{ln} [{start}, {end})")
 
-    print(f"\nStation timelines:")
+    print("\nStation timelines:")
     for s in S:
         events = sol.bin_events.get(s, [])
         if not events:
@@ -1036,11 +1111,13 @@ def main():
             continue
         print(f"  Station {s}:")
         for ev in sorted(events, key=lambda e: e.fetch_start):
-            print(f"    SKU {ev.sku} copy={ev.copy_id}: "
-                  f"F[{ev.fetch_start},{ev.fetch_end}) "
-                  f"B[{ev.presence_start},{ev.presence_end}) "
-                  f"R[{ev.return_start},{ev.return_end}) "
-                  f"orders={ev.orders_served}")
+            print(
+                f"    SKU {ev.sku} copy={ev.copy_id}: "
+                f"F[{ev.fetch_start},{ev.fetch_end}) "
+                f"B[{ev.presence_start},{ev.presence_end}) "
+                f"R[{ev.return_start},{ev.return_end}) "
+                f"orders={ev.orders_served}"
+            )
 
     violations = validate_solution(
         sol, instance, horizon=args.horizon, move_cap=args.movecap
@@ -1055,6 +1132,7 @@ def main():
     if not args.no_vis:
         try:
             from schedule_visualizer import plot_schedule, write_html
+
             mock_sol, handles = build_viz_handles(sol, instance)
             fig = plot_schedule(mock_sol, handles, show=True)
             html_file = "./autostore_heuristic_solution.html"

@@ -1,7 +1,14 @@
-from typing import Dict, List, Tuple, Any
+from typing import Any, Dict, List
+
+import numpy as np
+
+from constants import PARAM_LEVELS, REFERENCE_CONFIG
+from jaccard_similarity import compute_jaccard_weighted_and_unweighted
+
 
 class Instance:
     """Represents an order scheduling instance for a robotic compact storage system (AutoStore)."""
+
     def __init__(
         self,
         S: List[int],
@@ -11,6 +18,8 @@ class Instance:
         rt: Dict[int, int],
         p: Dict[int, int],
         N: Dict[int, int],
+        movecap: int,
+        seed: int,
         rt_ret: Dict[int, int] = None,
     ):
         self.S = S
@@ -21,6 +30,10 @@ class Instance:
         self.p = p
         self.N = N
         self._rt_ret = rt_ret if rt_ret is not None else dict(rt)
+        self._movecap = movecap
+        self._seed = seed
+        self.stats = self.get_statistics()
+        self.features = self.get_features()
 
     @property
     def orders_requirements(self) -> Dict[int, List[int]]:
@@ -52,54 +65,88 @@ class Instance:
     def rt_ret(self, value: Dict[int, int]):
         self._rt_ret = value
 
+    @property
+    def movecap(self) -> int:
+        return self._movecap
+
+    @property
+    def seed(self) -> int:
+        return self._seed
+
     def get_statistics(self) -> Dict[str, Any]:
         """Calculate and return key statistics about the instance."""
         import itertools as _itertools
 
         num_orders = len(self._orders_requirements)
-        order_sizes = [len(v) for v in self._orders_requirements.values()]
-        rt_vals = list(self.rt.values())
-        p_vals = list(self.p.values())
-        n_vals = list(self.N.values())
 
-        # SKU frequency across orders
-        sku_freq: Dict[int, int] = {}
-        for reqs in self._orders_requirements.values():
-            for k in reqs:
-                sku_freq[k] = sku_freq.get(k, 0) + 1
-        used_skus = [k for k in self.K if sku_freq.get(k, 0) > 0]
+        # Convert to numpy arrays for vectorized operations
+        order_sizes = np.array([len(v) for v in self._orders_requirements.values()])
+        rt_vals = np.array(list(self.rt.values()))
+        p_vals = np.array(list(self.p.values()))
+        n_vals = np.array(list(self.N.values()))
+
+        # SKU frequency across orders (demand for SKUs) via flat array
+        all_skus = np.concatenate(
+            [np.array(reqs) for reqs in self._orders_requirements.values()]
+        )
+        unique_skus, sku_freq_vals = np.unique(all_skus, return_counts=True)
+
+        # Order time intensities (how long would unparallelized orders take)
+        rt2p = rt_vals * 2 + p_vals
+        order_times_list = np.array(
+            [rt2p[list(reqs)].sum() for reqs in self._orders_requirements.values()]
+        )
+
+        used_skus_mask = np.isin(np.array(self.K), unique_skus)
+        used_skus = list(np.array(self.K)[used_skus_mask])
         unused_skus = len(self.K) - len(used_skus)
 
-        # Pareto check: what fraction of picks come from top 20% of used SKUs
-        if used_skus:
-            sorted_by_freq = sorted(used_skus, key=lambda k: sku_freq[k], reverse=True)
-            top20_count = max(1, len(sorted_by_freq) // 5)
-            top20_picks = sum(sku_freq[k] for k in sorted_by_freq[:top20_count])
-            total_picks = sum(sku_freq.values())
-            pareto_ratio = top20_picks / total_picks if total_picks else 0
-        else:
-            pareto_ratio = 0.0
+        # Pareto checks for top x% of SKUs
+        sku_freq_arr = sku_freq_vals  # already sorted by unique_skus order
+        total_picks = sku_freq_arr.sum()
+        sku_freq_sorted = np.sort(sku_freq_arr)[::-1]  # descending
+        cumsum = np.cumsum(sku_freq_sorted)
+
+        percentages = [1, 5, 10, 20, 30, 40, 50, 75]
+        pareto_ratios = {}
+        for perc in percentages:
+            top_count = max(1, len(used_skus) * perc // 100)
+            pareto_ratios[perc] = (
+                float(cumsum[top_count - 1] / total_picks) if total_picks else 0.0
+            )
 
         # SKU overlap: average Jaccard similarity between order pairs (sample first 50 orders)
         order_keys = list(self._orders_requirements.keys())
         pairs = list(_itertools.combinations(order_keys[:50], 2))
         if pairs:
-            jaccards = []
+            jaccards_w = []
+            jaccards_unw = []
             for i, j in pairs:
-                si = set(self._orders_requirements[i])
-                sj = set(self._orders_requirements[j])
-                inter = len(si & sj)
-                union = len(si | sj)
-                jaccards.append(inter / union if union else 0)
-            avg_jaccard = sum(jaccards) / len(jaccards)
+                j_w, j_uw = compute_jaccard_weighted_and_unweighted(
+                    i, j, self._orders_requirements, rt=self.rt, rt_ret=self.rt_ret
+                )
+                jaccards_w.append(j_w)
+                jaccards_unw.append(j_uw)
+            avg_jaccard_w = sum(jaccards_w) / len(jaccards_w)
+            avg_jaccard_unw = sum(jaccards_unw) / len(jaccards_unw)
         else:
-            avg_jaccard = 0.0
+            avg_jaccard_w = 0.0
+            avg_jaccard_unw = 0.0
 
         # Supply (number of bins per SKU) and demand (number of orders per SKU)
-        supply = [n_vals[k] for k in used_skus]
-        demand = [sku_freq[k] for k in used_skus]
-        supply_demand_ratio = sum(supply) / sum(demand) if demand else 0
-        supply_demand_ratio_stdev = sum((s - d)**2 for s, d in zip(supply, demand)) / len(supply) if supply else 0
+        supply = n_vals[np.array(used_skus, dtype=int)]
+        demand = sku_freq_arr
+
+        supply_demand_ratios = supply / demand
+        supply_demand_ratio_min = float(supply_demand_ratios.min())
+        supply_demand_ratio_max = float(supply_demand_ratios.max())
+        supply_demand_ratio_median = float(np.median(supply_demand_ratios))
+        supply_demand_ratio_mean = float(supply_demand_ratios.mean())
+        supply_demand_ratio_stdev = float(np.sqrt(((supply - demand) ** 2).mean()))
+
+        # Movecap
+        movecap_norm = self.movecap / 60
+        movecap_norm_per_lane = movecap_norm / (len(self.S) * len(self.L))
 
         return {
             "num_stations": len(self.S),
@@ -108,105 +155,165 @@ class Instance:
             "num_skus": len(self.K),
             "used_skus": len(used_skus),
             "unused_skus": unused_skus,
-            "order_size_min": min(order_sizes) if order_sizes else 0,
-            "order_size_max": max(order_sizes) if order_sizes else 0,
-            "order_size_mean": sum(order_sizes) / len(order_sizes) if order_sizes else 0.0,
-            "order_size_median": sorted(order_sizes)[len(order_sizes)//2] if order_sizes else 0,
-            "order_size_stdev": sum((x - sum(order_sizes) / len(order_sizes))**2 for x in order_sizes) / len(order_sizes) if order_sizes else 0.0,
-            
-            "rt_min": min(rt_vals) if rt_vals else 0,
-            "rt_max": max(rt_vals) if rt_vals else 0,
-            "rt_mean": sum(rt_vals) / len(rt_vals) if rt_vals else 0.0,
-            "rt_stdev": sum((x - sum(rt_vals) / len(rt_vals))**2 for x in rt_vals) / len(rt_vals) if rt_vals else 0.0,
-            
-            "p_min": min(p_vals) if p_vals else 0,
-            "p_max": max(p_vals) if p_vals else 0,
-            "p_mean": sum(p_vals) / len(p_vals) if p_vals else 0.0,
-            "p_stdev": sum((x - sum(p_vals) / len(p_vals))**2 for x in p_vals) / len(p_vals) if p_vals else 0.0,
-            
-            "n_min": min(n_vals) if n_vals else 0,
-            "n_max": max(n_vals) if n_vals else 0,
-            "n_mean": sum(n_vals) / len(n_vals) if n_vals else 0.0,
-            "n_stdev": sum((x - sum(n_vals) / len(n_vals))**2 for x in n_vals) / len(n_vals) if n_vals else 0.0,
-
-            "sku_freq_min": min(sku_freq.values()) if sku_freq.values() else 0,
-            "sku_freq_max": max(sku_freq.values()) if sku_freq.values() else 0,
-            "sku_freq_mean": sum(sku_freq.values()) / len(sku_freq.values()) if sku_freq.values() else 0.0,
-            "sku_freq_stdev": sum((x - sum(sku_freq.values()) / len(sku_freq.values()))**2 for x in sku_freq.values()) / len(sku_freq.values()) if sku_freq.values() else 0.0,
-            
-            "pareto_ratio": pareto_ratio,
-            "avg_jaccard": avg_jaccard,
-            "total_pick_lines": sum(order_sizes),
-
-            "supply_demand_ratio": supply_demand_ratio,
+            "total_order_volume": float(order_sizes.sum()),
+            "order_size_min": float(order_sizes.min()) if len(order_sizes) else 0,
+            "order_size_max": float(order_sizes.max()) if len(order_sizes) else 0,
+            "order_size_mean": float(order_sizes.mean()) if len(order_sizes) else 0.0,
+            "order_size_median": float(np.median(order_sizes))
+            if len(order_sizes)
+            else 0.0,
+            "order_size_stdev": float(order_sizes.std(ddof=0))
+            if len(order_sizes)
+            else 0.0,
+            "order_times_min": float(order_times_list.min()),
+            "order_times_max": float(order_times_list.max()),
+            "order_times_mean": float(order_times_list.mean()),
+            "order_times_median": float(np.median(order_times_list)),
+            "order_times_stdev": float(order_times_list.std(ddof=0)),
+            "rt_min": float(rt_vals.min()) if len(rt_vals) else 0,
+            "rt_max": float(rt_vals.max()) if len(rt_vals) else 0,
+            "rt_mean": float(rt_vals.mean()) if len(rt_vals) else 0.0,
+            "rt_median": float(np.median(rt_vals)) if len(rt_vals) else 0.0,
+            "rt_stdev": float(rt_vals.std(ddof=0)) if len(rt_vals) else 0.0,
+            "p_min": float(p_vals.min()) if len(p_vals) else 0,
+            "p_max": float(p_vals.max()) if len(p_vals) else 0,
+            "p_mean": float(p_vals.mean()) if len(p_vals) else 0.0,
+            "p_median": float(np.median(p_vals)) if len(p_vals) else 0.0,
+            "p_stdev": float(p_vals.std(ddof=0)) if len(p_vals) else 0.0,
+            "n_min": float(n_vals.min()) if len(n_vals) else 0,
+            "n_max": float(n_vals.max()) if len(n_vals) else 0,
+            "n_mean": float(n_vals.mean()) if len(n_vals) else 0.0,
+            "n_median": float(np.median(n_vals)) if len(n_vals) else 0.0,
+            "n_stdev": float(n_vals.std(ddof=0)) if len(n_vals) else 0.0,
+            "sku_freq_min": float(sku_freq_arr.min()) if len(sku_freq_arr) else 0,
+            "sku_freq_max": float(sku_freq_arr.max()) if len(sku_freq_arr) else 0,
+            "sku_freq_mean": float(sku_freq_arr.mean()) if len(sku_freq_arr) else 0.0,
+            "sku_freq_median": float(np.median(sku_freq_arr))
+            if len(sku_freq_arr)
+            else 0.0,
+            "sku_freq_stdev": float(sku_freq_arr.std(ddof=0))
+            if len(sku_freq_arr)
+            else 0.0,
+            "pareto_ratios": pareto_ratios,
+            "avg_jaccard_weighted": avg_jaccard_w,
+            "avg_jaccard_unweighted": avg_jaccard_unw,
+            "supply_demand_ratio_min": supply_demand_ratio_min,
+            "supply_demand_ratio_max": supply_demand_ratio_max,
+            "supply_demand_ratio_mean": supply_demand_ratio_mean,
+            "supply_demand_ratio_median": supply_demand_ratio_median,
             "supply_demand_ratio_stdev": supply_demand_ratio_stdev,
+            "movecap_norm": movecap_norm,
+            "movecap_norm_per_lane": movecap_norm_per_lane,
         }
 
-    def get_features(self) -> List[float]:
+    def get_features(self) -> Dict[str, float]:
         """
-        Convert statistics dict to a list of numeric features and normalize to around 0..1.
+        Convert statistics dict to a dict of numeric features keyed by feature name, normalized to around 0..1.
         """
-        stats = self.get_statistics()
-        return [
-            stats["num_stations"] / 20,
-            stats["num_lanes"] / 20,
-            stats["num_orders"] / 1000,
-            stats["num_skus"] / 10000,
-            stats["used_skus"] / stats["num_skus"],
-            stats["order_size_min"] / 10,
-            stats["order_size_max"] / 10,
-            stats["order_size_mean"] / 10,
-            stats["order_size_median"] / 10,
-            stats["order_size_stdev"] / 10,
-            stats["rt_min"] / 100,
-            stats["rt_max"] / 100,
-            stats["rt_mean"] / 100,
-            stats["rt_stdev"] / 100,
-            stats["p_min"] / 10,
-            stats["p_max"] / 10,
-            stats["p_mean"] / 10,
-            stats["p_stdev"] / 10,
-            stats["n_min"] / 5,
-            stats["n_max"] / 5,
-            stats["n_mean"] / 5,
-            stats["n_stdev"] / 5,
-            stats["sku_freq_min"] / stats["num_orders"],
-            stats["sku_freq_max"] / stats["num_orders"],
-            stats["sku_freq_mean"] / stats["num_orders"],
-            stats["sku_freq_stdev"] / stats["num_orders"],
-            stats["pareto_ratio"],
-            stats["avg_jaccard"],
-            stats["total_pick_lines"] / 5,
-            stats["supply_demand_ratio"] / 2,
-            stats["supply_demand_ratio_stdev"] / 2,
-        ]
-
+        stats = self.stats
+        return {
+            # General instance config
+            "feat_num_stations": stats["num_stations"] / max(PARAM_LEVELS["stations"]),
+            "feat_num_lanes": stats["num_lanes"] / max(PARAM_LEVELS["lanes"]),
+            "feat_num_orders": stats["num_orders"] / max(PARAM_LEVELS["orders"]),
+            "feat_num_skus": stats["num_skus"] / (5000 * max(PARAM_LEVELS["orders"])),
+            # Order size stats
+            "feat_order_size_max": stats["order_size_max"] / 10,
+            "feat_order_size_min": stats["order_size_min"] / stats["order_size_max"],
+            "feat_order_size_mean": stats["order_size_mean"] / stats["order_size_max"],
+            "feat_order_size_median": stats["order_size_median"]
+            / stats["order_size_max"],
+            "feat_order_size_cv": stats["order_size_stdev"] / stats["order_size_mean"],
+            # Order completion times without parallelization
+            "feat_order_times_max": stats["order_times_max"]
+            / (stats["p_mean"] * 1000),  # relate to 1000 pick times
+            "feat_order_times_min": stats["order_times_min"] / stats["order_times_max"],
+            "feat_order_times_mean": stats["order_times_mean"]
+            / stats["order_times_max"],
+            "feat_order_times_median": stats["order_times_median"]
+            / stats["order_times_max"],
+            "feat_order_times_cv": stats["order_size_stdev"]
+            / stats["order_times_mean"],
+            # Retrieval times
+            "feat_rt_min": stats["rt_min"] / stats["rt_max"],
+            "feat_rt_mean": stats["rt_mean"] / stats["rt_max"],
+            "feat_rt_cv": stats["rt_stdev"] / stats["rt_mean"],
+            # Picking times
+            "feat_p_mean": stats["p_mean"] / stats["p_max"],
+            "feat_p_cv": stats["p_stdev"] / stats["p_mean"],
+            # Bin counts
+            "feat_n_mean": stats["n_mean"] / stats["n_max"],
+            "feat_n_cv": stats["n_stdev"] / stats["n_mean"],
+            "feat_retrieval_picking_ratio": stats["p_mean"] / stats["rt_mean"],
+            # SKU frequency stats
+            "feat_used_skus_ratio": stats["used_skus"] / REFERENCE_CONFIG["skus"],
+            "feat_sku_freq_min": stats["sku_freq_min"] / stats["num_orders"],
+            "feat_sku_freq_max": stats["sku_freq_max"] / stats["num_orders"],
+            "feat_sku_freq_mean": stats["sku_freq_mean"] / stats["num_orders"],
+            "feat_sku_freq_cv": stats["sku_freq_stdev"] / stats["num_orders"],
+            # SKU overlap
+            "feat_avg_jaccard_weighted": stats["avg_jaccard_weighted"],
+            "feat_avg_jaccard_unweighted": stats["avg_jaccard_unweighted"],
+            # Pareto ratios
+            **{
+                f"feat_pareto_ratio_{perc}": stats["pareto_ratios"][perc]
+                for perc in [5, 10, 20, 30, 40, 50]
+            },
+            # Supply and Demand for SKUs
+            # "feat_supply_demand_ratio_max": stats["supply_demand_ratio_max"] / 10,
+            "feat_supply_demand_ratio_min": stats["supply_demand_ratio_min"]
+            / stats["supply_demand_ratio_max"],
+            "feat_supply_demand_ratio_mean": stats["supply_demand_ratio_mean"]
+            / stats["supply_demand_ratio_max"],
+            "feat_supply_demand_ratio_median": stats["supply_demand_ratio_median"]
+            / stats["supply_demand_ratio_max"],
+            "feat_supply_demand_ratio_cv": stats["supply_demand_ratio_stdev"]
+            / (stats["supply_demand_ratio_mean"] * 2),  # halve it so it's <1.0
+            # Movecap stats
+            "feat_movecap": stats["movecap_norm"],
+            "feat_movecap_per_lane": stats["movecap_norm_per_lane"],
+            "feat_movecap_per_used_sku": stats["movecap_norm"]
+            / (stats["used_skus"] * 2),
+        }
 
     def print_summary(self) -> None:
         """Print a human-readable summary of the instance."""
-        stats = self.get_statistics()
+        stats = self.stats
         print("=" * 60)
         print("  AutoStore Instance Summary")
         print("=" * 60)
         print(f"  Stations:  {stats['num_stations']}")
         print(f"  Lanes/st:  {stats['num_lanes']}")
         print(f"  Orders:    {stats['num_orders']}")
-        print(f"  SKUs:      {stats['num_skus']}  (used: {stats['used_skus']}, unused: {stats['unused_skus']})")
+        print(
+            f"  SKUs:      {stats['num_skus']}  (used: {stats['used_skus']}, unused: {stats['unused_skus']})"
+        )
         print()
-        print(f"  Order size:  min={stats['order_size_min']}, max={stats['order_size_max']}, "
-              f"mean={stats['order_size_mean']:.2f}, "
-              f"median={stats['order_size_median']}")
-        print(f"  rt (sec):    min={stats['rt_min']}, max={stats['rt_max']}, "
-              f"mean={stats['rt_mean']:.1f}")
-        print(f"  p  (sec):    min={stats['p_min']}, max={stats['p_max']}, "
-              f"mean={stats['p_mean']:.1f}")
-        print(f"  N  (bins):   min={stats['n_min']}, max={stats['n_max']}, "
-              f"mean={stats['n_mean']:.1f}")
+        print(
+            f"  Order size:  min={stats['order_size_min']}, max={stats['order_size_max']}, "
+            f"mean={stats['order_size_mean']:.2f}, "
+            f"median={stats['order_size_median']}"
+        )
+        print(
+            f"  rt (sec):    min={stats['rt_min']}, max={stats['rt_max']}, "
+            f"mean={stats['rt_mean']:.1f}"
+        )
+        print(
+            f"  p  (sec):    min={stats['p_min']}, max={stats['p_max']}, "
+            f"mean={stats['p_mean']:.1f}"
+        )
+        print(
+            f"  N  (bins):   min={stats['n_min']}, max={stats['n_max']}, "
+            f"mean={stats['n_mean']:.1f}"
+        )
         print()
-        print(f"  Pareto check: top 20% of used SKUs account for "
-              f"{stats['pareto_ratio']:.1%} of all picks")
-        print(f"  Avg Jaccard overlap (first 50 orders): {stats['avg_jaccard']:.3f}")
-        print(f"  Total pick lines: {stats['total_pick_lines']}")
+        print(
+            f"  Pareto check: top 20% of used SKUs account for "
+            f"{stats['pareto_ratios'][20]:.1%} of all picks"
+        )
+        print(
+            f"  Avg Jaccard overlap (first 50 orders): {stats['avg_jaccard_weighted']:.3f}"
+        )
         print("=" * 60)
 
     # Support unpacking (e.g. S, L, K, orders_req, rt, p, N = instance)
@@ -220,7 +327,15 @@ class Instance:
         yield self.N
 
     def __getitem__(self, index):
-        return [self.S, self.L, self.K, self._orders_requirements, self.rt, self.p, self.N][index]
+        return [
+            self.S,
+            self.L,
+            self.K,
+            self._orders_requirements,
+            self.rt,
+            self.p,
+            self.N,
+        ][index]
 
     def __len__(self):
         return 7

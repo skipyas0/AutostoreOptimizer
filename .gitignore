@@ -10,3 +10,5 @@ results
 *.zip
 *.pt
 *.csv
+*.svg
+*.png

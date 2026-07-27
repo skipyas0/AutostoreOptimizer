@@ -8,10 +8,10 @@ and tests/test_heuristic_cfss_sgc.py.
 from datagen import generate_data as gen_v5
 from autostore_heuristic import validate_solution, init_state, run_sgc
 from heuristic_cfss_sgc import (
-    compute_demand_count, compute_weighted_jaccard, build_similarity_matrix,
     agglomerative_cluster, snapshot_state, run_cfss_sgc, OrderCluster,
     score_cluster_at_station
 )
+from jaccard_similarity import compute_demand_count, compute_jaccard_weighted_and_unweighted, build_similarity_matrix
 from cp_model import build_model, validate_warmstart
 import pytest
 import os
@@ -57,14 +57,14 @@ class TestWeightedJaccard:
         orders_req = {0: [1, 2, 3], 1: [1, 2, 3]}
         rt = {1: 10, 2: 20, 3: 30}
         rt_ret = dict(rt)
-        score = compute_weighted_jaccard(0, 1, orders_req, rt, rt_ret)
+        score, _ = compute_jaccard_weighted_and_unweighted(0, 1, orders_req, rt, rt_ret)
         assert abs(score - 1.0) < 1e-9
 
     def test_disjoint_orders_score_zero(self):
         orders_req = {0: [1, 2], 1: [3, 4]}
         rt = {1: 10, 2: 20, 3: 30, 4: 40}
         rt_ret = dict(rt)
-        score = compute_weighted_jaccard(0, 1, orders_req, rt, rt_ret)
+        score, _ = compute_jaccard_weighted_and_unweighted(0, 1, orders_req, rt, rt_ret)
         assert score == 0.0
 
     def test_partial_overlap_symmetric_rt(self):
@@ -72,7 +72,7 @@ class TestWeightedJaccard:
         orders_req = {0: [0, 1, 2], 1: [1, 2, 3]}
         rt = {0: 10, 1: 10, 2: 10, 3: 10}
         rt_ret = dict(rt)
-        score = compute_weighted_jaccard(0, 1, orders_req, rt, rt_ret)
+        score, _ = compute_jaccard_weighted_and_unweighted(0, 1, orders_req, rt, rt_ret)
         # intersection={1,2}, union={0,1,2,3} -> 2/4 = 0.5
         assert abs(score - 0.5) < 1e-9
 
@@ -81,7 +81,7 @@ class TestWeightedJaccard:
         orders_req = {0: [0, 1, 2], 1: [1, 2, 3]}
         rt = {0: 100, 1: 5, 2: 5, 3: 100}
         rt_ret = dict(rt)
-        score = compute_weighted_jaccard(0, 1, orders_req, rt, rt_ret)
+        score, _ = compute_jaccard_weighted_and_unweighted(0, 1, orders_req, rt, rt_ret)
         # intersection weight = (5+5)*2 = 20
         # union weight = (100+100) + (5+5) + (5+5) + (100+100) = 420
         expected = 20 / 420
@@ -91,20 +91,20 @@ class TestWeightedJaccard:
         orders_req = {0: [0, 1], 1: [1, 2, 3]}
         rt = {0: 10, 1: 30, 2: 50, 3: 20}
         rt_ret = {k: v // 2 for k, v in rt.items()}
-        s01 = compute_weighted_jaccard(0, 1, orders_req, rt, rt_ret)
-        s10 = compute_weighted_jaccard(1, 0, orders_req, rt, rt_ret)
+        s01,_ = compute_jaccard_weighted_and_unweighted(0, 1, orders_req, rt, rt_ret)
+        s10,_ = compute_jaccard_weighted_and_unweighted(1, 0, orders_req, rt, rt_ret)
         assert abs(s01 - s10) < 1e-9
 
     def test_empty_order(self):
         orders_req = {0: [], 1: [1, 2]}
         rt = {1: 10, 2: 20}
         rt_ret = dict(rt)
-        score = compute_weighted_jaccard(0, 1, orders_req, rt, rt_ret)
+        score, _ = compute_jaccard_weighted_and_unweighted(0, 1, orders_req, rt, rt_ret)
         assert score == 0.0
 
     def test_build_similarity_matrix_coverage(self):
         S, L, K, O, orders_req, rt, rt_ret, p, N = _small_v5_instance()
-        sim = build_similarity_matrix(O, orders_req, rt, rt_ret)
+        sim, _ = build_similarity_matrix(O, orders_req, rt, rt_ret)
         n = len(O)
         # Upper triangle: n*(n-1)/2 pairs
         assert len(sim) == n * (n - 1) // 2
@@ -123,7 +123,7 @@ class TestAgglomerativeClustering:
         orders_req = {0: [0, 1], 1: [0, 1, 2], 2: [3, 4], 3: [3, 4, 5]}
         rt = {0: 10, 1: 20, 2: 30, 3: 10, 4: 20, 5: 30}
         rt_ret = dict(rt)
-        sim = build_similarity_matrix(O, orders_req, rt, rt_ret)
+        sim, _ = build_similarity_matrix(O, orders_req, rt, rt_ret)
         clusters = agglomerative_cluster(O, orders_req, sim, rt,
                                          threshold=0.05, max_cluster_orders=8)
         # Should produce exactly 2 clusters
@@ -138,7 +138,7 @@ class TestAgglomerativeClustering:
         orders_req = {0: [0, 1], 1: [0, 1], 2: [0, 1]}
         rt = {0: 10, 1: 20}
         rt_ret = dict(rt)
-        sim = build_similarity_matrix(O, orders_req, rt, rt_ret)
+        sim, _ = build_similarity_matrix(O, orders_req, rt, rt_ret)
         clusters = agglomerative_cluster(O, orders_req, sim, rt,
                                          threshold=0.0, max_cluster_orders=2)
         max_size = max(len(c.order_ids) for c in clusters)
@@ -150,7 +150,7 @@ class TestAgglomerativeClustering:
         orders_req = {0: [0, 1], 1: [0, 1], 2: [0, 1]}
         rt = {0: 10, 1: 20}
         rt_ret = dict(rt)
-        sim = build_similarity_matrix(O, orders_req, rt, rt_ret)
+        sim, _ = build_similarity_matrix(O, orders_req, rt, rt_ret)
         clusters = agglomerative_cluster(O, orders_req, sim, rt,
                                          threshold=0.0, max_cluster_orders=100)
         # All three orders should merge into one cluster
@@ -160,7 +160,7 @@ class TestAgglomerativeClustering:
     def test_high_threshold_no_merges(self):
         """threshold=1.0 should leave all orders as singletons (only identical merge)."""
         S, L, K, O, orders_req, rt, rt_ret, p, N = _small_v5_instance()
-        sim = build_similarity_matrix(O, orders_req, rt, rt_ret)
+        sim, _ = build_similarity_matrix(O, orders_req, rt, rt_ret)
         clusters = agglomerative_cluster(O, orders_req, sim, rt,
                                          threshold=1.0, max_cluster_orders=8)
         # With threshold=1.0, only exactly identical orders can merge
@@ -171,7 +171,7 @@ class TestAgglomerativeClustering:
     def test_all_orders_covered(self):
         """Every order must appear in exactly one cluster."""
         S, L, K, O, orders_req, rt, rt_ret, p, N = _small_v5_instance(orders=12, skus=8)
-        sim = build_similarity_matrix(O, orders_req, rt, rt_ret)
+        sim, _ = build_similarity_matrix(O, orders_req, rt, rt_ret)
         clusters = agglomerative_cluster(O, orders_req, sim, rt,
                                          threshold=0.05, max_cluster_orders=6)
         assigned = []
@@ -185,7 +185,7 @@ class TestAgglomerativeClustering:
         orders_req = {0: [0, 1], 1: [1, 2]}
         rt = {0: 10, 1: 20, 2: 30}
         rt_ret = dict(rt)
-        sim = build_similarity_matrix(O, orders_req, rt, rt_ret)
+        sim, _ = build_similarity_matrix(O, orders_req, rt, rt_ret)
         clusters = agglomerative_cluster(O, orders_req, sim, rt,
                                          threshold=0.0, max_cluster_orders=8)
         merged = next(c for c in clusters if len(c.order_ids) == 2)

@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
-import os
-import pickle
-import time
 import argparse
-import sys
 import concurrent.futures
+import os
+import sys
+
 import numpy as np
 import pandas as pd
-import gymnasium as gym
-from gymnasium import spaces
-import torch
-from torch.utils.data import Dataset
 
-from datagen import generate_data
-from instance import Instance
 from autostore_heuristic import solve_heuristic_instance as base_solve
-from heuristic_ama_sgc import precompute_attributes, run_sgc_parameterised, _compute_objective
+from datagen import generate_data
+from heuristic_ama_sgc import (
+    _compute_objective,
+    precompute_attributes,
+    run_sgc_parameterised,
+)
 
 ORDER_ATTRS = [
-    "sum_rt", "order_size", "sum_cycle", "max_rt",
-    "sku_rarity", "sku_contention", "sharing_degree", "min_copies",
+    "sum_rt",
+    "order_size",
+    "sum_cycle",
+    "max_rt",
+    "sku_rarity",
+    "sku_contention",
+    "sharing_degree",
+    "min_copies",
 ]
 BIN_ATTRS = ["rt", "p", "cycle", "demand_ratio", "copies", "demand"]
 DIRECTIONS = [True, False]
@@ -32,6 +36,7 @@ for oa in ORDER_ATTRS:
             for bd in DIRECTIONS:
                 ALL_CONFIGS.append((oa, od, ba, bd))
 
+
 def _process_combo(cfg):
     instance = generate_data(
         num_stations=cfg["stations"],
@@ -39,10 +44,11 @@ def _process_combo(cfg):
         num_orders=cfg["orders"],
         num_skus=cfg["skus"],
         seed=cfg["seed"],
-        pick_touch_time=cfg["pick"]
+        pick_touch_time=cfg["pick"],
+        movecap=cfg.get("movecap", max(10, int(cfg["skus"] / 1250))),
     )
     features = instance.get_features()
-    
+
     # Baseline score
     res_base = base_solve({**cfg, "horizon": 10000}, return_raw=False)
     baseline_score = res_base.get("objective_value", float("inf"))
@@ -55,57 +61,130 @@ def _process_combo(cfg):
     for config in ALL_CONFIGS:
         oa, od, ba, bd = config
         sol = run_sgc_parameterised(
-            instance, 10000, cfg["movecap"], 1.0, 0.0,
-            order_attrs, sku_attrs, oa, od, ba, bd
+            instance,
+            10000,
+            cfg["movecap"],
+            1.0,
+            0.0,
+            order_attrs,
+            sku_attrs,
+            oa,
+            od,
+            ba,
+            bd,
         )
         obj = _compute_objective(sol, 1.0, 0.0, instance.S)
         config_scores.append(obj)
-    
+
     return {
         "features": features,
         "baseline_score": baseline_score,
         "config_scores": config_scores,
-        "config": cfg
+        "config": cfg,
     }
 
+
+def _regenerate_features(row: dict) -> dict:
+    """Regenerate all feat_* columns for a cached row by recreating the instance.
+
+    Uses the config columns (Config_Stations, Config_Lanes, etc.) to deterministically
+    rebuild the Instance and compute fresh features. Returns the updated row dict.
+    """
+    import math
+
+    def _safe_int(val, default=None):
+        if val is None or (isinstance(val, float) and math.isnan(val)):
+            return default
+        return int(val)
+
+    cfg = {
+        "stations": int(row["Config_Stations"]),
+        "lanes": int(row["Config_Lanes"]),
+        "orders": int(row["Config_Orders"]),
+        "skus": int(row["Config_SKUs"]),
+        "seed": int(row["Config_Seed"]),
+        "pick": int(row["Config_Pick"]),
+        # "movecap": _safe_int(row.get("Config_Movecap"))
+        # or max(10, int(row["Config_SKUs"] / 1250)),
+        "movecap": int(row.get("Config_Movecap")),
+    }
+    instance = generate_data(
+        num_stations=cfg["stations"],
+        lanes_per_station=cfg["lanes"],
+        num_orders=cfg["orders"],
+        num_skus=cfg["skus"],
+        seed=cfg["seed"],
+        pick_touch_time=cfg["pick"],
+        movecap=cfg["movecap"],
+    )
+    new_features = instance.get_features()
+
+    # Sanity check: verify that key features match between old and new
+    for check_key in ["feat_rt_mean", "feat_p_mean", "feat_used_skus_ratio"]:
+        old_val = row.get(check_key)
+        new_val = new_features.get(check_key)
+        if old_val is not None and new_val is not None:
+            if abs(float(old_val) - float(new_val)) > 1e-9:
+                print(
+                    f"  WARNING: {check_key} mismatch: old={old_val:.6f}, new={new_val:.6f} "
+                    f"(cfg={cfg})"
+                )
+
+    # Replace all feat_* columns
+    for col in list(row.keys()):
+        if col.startswith("feat_"):
+            del row[col]
+    row.update(new_features)
+    return row
+
+
 def generate_and_precompute_dataset(
-    num_seeds: int = 15,
-    cache_file: str = None,
-    force_regenerate: bool = False
-):
+    num_seeds: int = 15, cache_file: str = None, force_regenerate: bool = False
+) -> pd.DataFrame:
     """
     Generate dataset and precompute features & configuration makespans under the parameterized AMA heuristic.
     Uses reference + param variation logic across all paradigms.
     """
     total_samples = 32 * num_seeds
     if cache_file is None:
-        cache_file = f"ama_precomputed_data_{total_samples}.pkl"
+        cache_file = f"ama_precomputed_data_{total_samples}.csv"
 
     if not force_regenerate and os.path.exists(cache_file):
         print(f"Loading precomputed dataset from {cache_file}")
-        with open(cache_file, "rb") as f:
-            return pickle.load(f)
+        df = pd.read_csv(cache_file)
+        rows = df.to_dict(orient="records")
+        print(f"Recalculating features for {len(rows)} cached rows...")
+
+        workers = os.cpu_count() - 1 or 4
+        count = 0
+        updated_rows = [None] * len(rows)
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
+            future_to_idx = {
+                executor.submit(_regenerate_features, row): i
+                for i, row in enumerate(rows)
+            }
+            for future in concurrent.futures.as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                count += 1
+                try:
+                    updated_rows[idx] = future.result()
+                except Exception as e:
+                    print(f"\nTask failed at row {idx}: {e}")
+                    updated_rows[idx] = rows[idx]
+                sys.stdout.write(f"\r  Recalculated features {count}/{len(rows)}")
+                sys.stdout.flush()
+        print()
+
+        df = pd.DataFrame(updated_rows)
+        df.to_csv(cache_file, index=False)
+        print(f"Updated dataset saved to {cache_file}")
+        return df
 
     dataset = []
 
     # Replicate benchmark configurations
-    REFERENCE_CONFIG = {
-        "stations": 4,
-        "lanes": 4,
-        "orders": 40,
-        "pick": 4,
-    }
-    REFERENCE_CONFIG["skus"] = REFERENCE_CONFIG["stations"] * 5000
-    REFERENCE_CONFIG["movecap"] = REFERENCE_CONFIG["skus"] // 1000
+    from constants import PARAM_LEVELS, PARAM_ORDER, REFERENCE_CONFIG
 
-    PARAM_LEVELS = {
-        "stations": [1, 2, 4, 6, 8, 10],
-        "lanes": [1, 2, 4, 6, 8, 10],
-        "orders": [10, 20, 40, 60, 80, 90, 100, 120, 140, 160, 180, 200],
-        "movecap": [1, 2, 5, 10, 15, 20, 40, 60],
-    }
-    PARAM_ORDER = ["stations", "lanes", "orders", "movecap"]
-    
     # Seeds starting at 42
     SEEDS = list(range(42, 42 + num_seeds))
 
@@ -116,7 +195,7 @@ def generate_and_precompute_dataset(
             for seed in SEEDS:
                 cfg = dict(REFERENCE_CONFIG)
                 cfg["seed"] = seed
-                
+
                 if param == "stations":
                     cfg["stations"] = val
                     cfg["skus"] = val * 5000
@@ -127,18 +206,20 @@ def generate_and_precompute_dataset(
                     cfg["orders"] = val
                 elif param == "movecap":
                     cfg["movecap"] = val
-                
+
                 combos.append(cfg)
 
-    print(f"Generating and precomputing {len(combos)} samples using reference+param variation logic...")
-    
+    print(
+        f"Generating and precomputing {len(combos)} samples using reference+param variation logic..."
+    )
+
     workers = os.cpu_count() - 1 or 4
     print(f"Executing {len(combos)} tasks using {workers} workers...")
-    
+
     count = 0
     with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
         future_to_cfg = {executor.submit(_process_combo, cfg): cfg for cfg in combos}
-        
+
         for future in concurrent.futures.as_completed(future_to_cfg):
             count += 1
             try:
@@ -150,67 +231,9 @@ def generate_and_precompute_dataset(
                 print(f"\nTask failed: {e}")
     print()
 
-    with open(cache_file, "wb") as f:
-        pickle.dump(dataset, f)
-    
-    return dataset
+    df = create_dataset_table(dataset, cache_file)
+    return df
 
-class AMAConfigDataset(Dataset):
-    def __init__(self, raw_data):
-        self.X = []
-        self.y = []
-        for data in raw_data:
-            features = data["features"]
-            scores = data["config_scores"]
-            
-            # Label is the index of the best configuration (minimum makespan)
-            best_idx = int(np.argmin(scores))
-            
-            self.X.append(features)
-            self.y.append(best_idx)
-            
-        self.X = torch.tensor(np.array(self.X), dtype=torch.float32)
-        self.y = torch.tensor(np.array(self.y), dtype=torch.long)
-
-    def __len__(self):
-        return len(self.X)
-
-    def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
-
-class AMASGCEnv(gym.Env):
-    def __init__(self, dataset):
-        super().__init__()
-        self.dataset = dataset
-        self.action_space = spaces.Discrete(len(ALL_CONFIGS))
-        # 31 features from instance.get_features()
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(31,), dtype=np.float32)
-        self.current_idx = 0
-    
-    def reset(self, seed=None, options=None):
-        super().reset(seed=seed)
-        self.current_idx = np.random.randint(len(self.dataset))
-        data = self.dataset[self.current_idx]
-        return np.array(data["features"], dtype=np.float32), {}
-    
-    def step(self, action):
-        data = self.dataset[self.current_idx]
-        baseline = data["baseline_score"]
-        config_score = data["config_scores"][action]
-        
-        # Reward based on relative improvement to baseline
-        # We want to maximize this: if config_score < baseline, reward > 0
-        if baseline == float("inf") and config_score == float("inf"):
-            reward = 0.0
-        elif baseline == float("inf"):
-            reward = 1.0
-        elif config_score == float("inf"):
-            reward = -1.0
-        else:
-            reward = (baseline - config_score) / baseline
-        
-        # Terminate immediately (contextual bandit formulation)
-        return np.array(data["features"], dtype=np.float32), float(reward), True, False, {}
 
 def create_dataset_table(dataset, output_file: str = None) -> pd.DataFrame:
     """
@@ -223,16 +246,16 @@ def create_dataset_table(dataset, output_file: str = None) -> pd.DataFrame:
         # Instance Config
         cfg = data.get("config", {})
         features = data.get("features", [])
-        
-        # Fallback to reconstruct configuration from normalized features if config is missing
-        if not cfg and len(features) >= 4:
-            cfg = {
-                "stations": int(round(features[0] * 20)),
-                "lanes": int(round(features[1] * 20)),
-                "orders": int(round(features[2] * 1000)),
-                "skus": int(round(features[3] * 10000)),
-                "pick": 4, # default benchmark pick touch time
-            }
+
+        # # Fallback to reconstruct configuration from normalized features if config is missing
+        # if not cfg and len(features) >= 4:
+        #     cfg = {
+        #         "stations": int(round(features["feat_num_stations"] * 20)),
+        #         "lanes": int(round(features["feat_num_lanes"] * 20)),
+        #         "orders": int(round(features["feat_num_orders"] * 1000)),
+        #         "skus": int(round(features["feat_num_skus"] * 10000)),
+        #         "pick": 4,  # default benchmark pick touch time
+        #     }
 
         row["Sample_Index"] = i
         row["Config_Stations"] = cfg.get("stations", None)
@@ -246,18 +269,23 @@ def create_dataset_table(dataset, output_file: str = None) -> pd.DataFrame:
         # Baseline & best AMA config
         baseline = data.get("baseline_score", float("inf"))
         row["Baseline_Score"] = baseline
-        
+
         scores = data.get("config_scores", [])
         if scores:
             best_idx = int(np.argmin(scores))
             best_score = scores[best_idx]
             best_config = ALL_CONFIGS[best_idx]
             row["AMA_Best_Score"] = best_score
-            row["AMA_Config_Str"] = f"{best_config[0]} ({best_config[1]}), {best_config[2]} ({best_config[3]})"
+            row["AMA_Config_Str"] = (
+                f"{best_config[0]} ({best_config[1]}), {best_config[2]} ({best_config[3]})"
+            )
             row["AMA_Order_Attr"] = best_config[0]
             row["AMA_Order_Dir"] = best_config[1]
             row["AMA_Bin_Attr"] = best_config[2]
             row["AMA_Bin_Dir"] = best_config[3]
+            for idx, (oa, od, ba, bd) in enumerate(ALL_CONFIGS):
+                col_name = f"AMA_{oa}_{od}_{ba}_{bd}_Score"
+                row[col_name] = scores[idx] if idx < len(scores) else None
         else:
             row["AMA_Best_Score"] = None
             row["AMA_Config_Str"] = None
@@ -265,64 +293,62 @@ def create_dataset_table(dataset, output_file: str = None) -> pd.DataFrame:
             row["AMA_Order_Dir"] = None
             row["AMA_Bin_Attr"] = None
             row["AMA_Bin_Dir"] = None
+            for oa, od, ba, bd in ALL_CONFIGS:
+                col_name = f"AMA_{oa}_{od}_{ba}_{bd}_Score"
+                row[col_name] = None
 
-        # Features (normalized list of 31 floats)
-        features = data.get("features", [])
-        feature_names = [
-            "feat_num_stations", "feat_num_lanes", "feat_num_orders", "feat_num_skus",
-            "feat_used_skus_ratio", "feat_order_size_min", "feat_order_size_max",
-            "feat_order_size_mean", "feat_order_size_median", "feat_order_size_stdev",
-            "feat_rt_min", "feat_rt_max", "feat_rt_mean", "feat_rt_stdev",
-            "feat_p_min", "feat_p_max", "feat_p_mean", "feat_p_stdev",
-            "feat_n_min", "feat_n_max", "feat_n_mean", "feat_n_stdev",
-            "feat_sku_freq_min", "feat_sku_freq_max", "feat_sku_freq_mean", "feat_sku_freq_stdev",
-            "feat_pareto_ratio", "feat_avg_jaccard", "feat_total_pick_lines",
-            "feat_supply_demand_ratio", "feat_supply_demand_ratio_stdev"
-        ]
-        for f_idx, f_val in enumerate(features):
-            if f_idx < len(feature_names):
-                row[feature_names[f_idx]] = f_val
-            else:
-                row[f"feat_unmapped_{f_idx}"] = f_val
+        # Features
+        features = data.get("features", {})
+        if isinstance(features, dict):
+            for feat_name, feat_val in features.items():
+                row[feat_name] = feat_val
+        else:
+            raise ValueError
 
         rows.append(row)
 
     df = pd.DataFrame(rows)
     if output_file:
-        if output_file.endswith(".csv"):
-            df.to_csv(output_file, index=False)
-            print(f"Table saved to CSV: {output_file}")
-        elif output_file.endswith(".md"):
-            with open(output_file, "w") as f:
-                f.write(df.to_markdown(index=False))
-            print(f"Table saved to Markdown: {output_file}")
-        elif output_file.endswith(".html"):
-            df.to_html(output_file, index=False)
-            print(f"Table saved to HTML: {output_file}")
-        else:
-            with open(output_file, "w") as f:
-                f.write(df.to_string(index=False))
-            print(f"Table saved to Text: {output_file}")
+        if not output_file.endswith(".csv"):
+            output_file = output_file + ".csv"
+            print("Only supports .csv, renaming to", output_file)
+
+        df.to_csv(output_file, index=False)
+        print(f"Table saved to CSV: {output_file}")
     return df
 
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="AutoStore Trainset Generator & Data Table Creator")
-    parser.add_argument("--num-seeds", type=int, default=15, help="Number of seeds to vary configurations over")
-    parser.add_argument("--force-regenerate", action="store_true", help="Force regeneration of the dataset even if cache exists")
-    parser.add_argument("--cache-file", type=str, default=None, help="Path to cache file")
-    parser.add_argument("--output-table", type=str, default=None, help="Path to save the generated table (e.g. dataset_info.md, dataset_info.csv)")
-    
+    parser = argparse.ArgumentParser(
+        description="AutoStore Trainset Generator & Data Table Creator"
+    )
+    parser.add_argument(
+        "--num-seeds",
+        type=int,
+        default=15,
+        help="Number of seeds to vary configurations over",
+    )
+    parser.add_argument(
+        "--force-regenerate",
+        action="store_true",
+        help="Force regeneration of the dataset even if cache exists",
+    )
+    parser.add_argument(
+        "--cache-file", type=str, default=None, help="Path to cache file"
+    )
+
     args = parser.parse_args()
-    
-    dataset = generate_and_precompute_dataset(
+
+    df = generate_and_precompute_dataset(
         num_seeds=args.num_seeds,
         cache_file=args.cache_file,
-        force_regenerate=args.force_regenerate
+        force_regenerate=args.force_regenerate,
     )
-    
-    if args.output_table:
-        create_dataset_table(dataset, args.output_table)
-    else:
-        df = create_dataset_table(dataset)
-        print("\nDataset Table Preview (First 5 Rows):")
-        print(df.head().to_string())
+
+    # if args.output_table != args.cache_file:
+    #     if args.output_table.endswith(".csv"):
+    #         df.to_csv(args.output_table, index=False)
+    #     else:
+    #         with open(args.output_table, "w") as f:
+    #             f.write(df.to_string(index=False))
+    #         print(f"Table saved to {args.output_table}")
