@@ -4,6 +4,7 @@ __pycache__
 .venv
 logs
 results
+experiments
 *.html
 *.txt
 *.pkl

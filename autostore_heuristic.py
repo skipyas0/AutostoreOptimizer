@@ -7,7 +7,6 @@ Mirrors variable names from the CP model (cp_model.py).
 import heapq
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Optional
 
 from instance import Instance
 
@@ -210,7 +209,7 @@ class HeuristicState:
     lane_intervals: dict[tuple[int, int], list[tuple[int, int]]]  # s -> [(start, end)]
     first_pick: dict[int, int]  # s -> earliest pick start at s
     last_pick: dict[int, int]  # s -> latest pick end at s
-    move_cap: Optional[int]  # global MoveCap (None = no cap)
+    move_cap: int | None  # global MoveCap (None = no cap)
 
 
 # ------ [P0-6] compute_U ------
@@ -255,7 +254,7 @@ def static_priority_sort(orders_req: dict[int, list[int]], O: list[int]) -> list
 
 def find_shared_bin(
     station_bin_events: list[BinEvent], k: int, t_cursor: int, p: dict[int, int]
-) -> Optional[BinEvent]:
+) -> BinEvent | None:
     """Find an existing BinEvent at a station for SKU k whose presence covers t_cursor."""
     # We can use a bin even if it arrives AFTER t_cursor (we just wait for it).
     # We prefer the earliest-starting feasible bin that can fit us.
@@ -342,7 +341,7 @@ def plan_order_at_station(
     ALPHA: float,
     BETA: float,
     demand_count: dict[int, int],
-) -> Optional[OrderPlan]:
+) -> OrderPlan | None:
     """Tentatively schedule order o at station s. Returns OrderPlan or None if infeasible."""
     L_at_s = [ln for (ss, ln) in state.lane_free if ss == s]
     if not L_at_s:
@@ -537,7 +536,7 @@ def init_state(
     K: list[int],
     N: dict[int, int],
     horizon: int,
-    move_cap: Optional[int],
+    move_cap: int | None,
 ) -> HeuristicState:
     """Build initial HeuristicState with everything at t=0."""
     lane_free = {(s, ln): 0 for s in S for ln in L}
@@ -593,7 +592,7 @@ def run_sgc(instance, *args, **kwargs) -> Solution:
     failed_orders: list[int] = []
 
     for o in sorted_orders:
-        best_plan: Optional[OrderPlan] = None
+        best_plan: OrderPlan | None = None
 
         for s in S:
             plan = plan_order_at_station(
