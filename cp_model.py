@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 import argparse
-from collections import defaultdict
-import random
 import math
+import random
+from collections import defaultdict
 
 from docplex.cp.model import CpoModel
 from docplex.cp.solver.solver_listener import CpoSolverListener
 
-from datagen import generate_data, generate_data_legacy
+from datagen import generate_data
 from instance import Instance
 
 try:
@@ -19,14 +19,14 @@ except ImportError:
 
 
 def _old_generate_data(
-        num_stations: int,
-        lanes_per_station: int,
-        num_orders: int,
-        num_skus: int,
-        seed: int,
-        pick_touch_time: int = 4,
-        order_size_dist: str = "poisson2_to_1_6",
-        max_bins_per_sku: int = 5
+    num_stations: int,
+    lanes_per_station: int,
+    num_orders: int,
+    num_skus: int,
+    seed: int,
+    pick_touch_time: int = 4,
+    order_size_dist: str = "poisson2_to_1_6",
+    max_bins_per_sku: int = 5,
 ):
     """
     Generates synthetic data.
@@ -80,16 +80,13 @@ def _old_generate_data(
 
     return Instance(S, L, K, orders_requirements, rt, p, N, rt_ret=dict(rt))
 
+
 # --------------------------
 # Model building (v3)
 # --------------------------
 
 
-def build_model(
-        instance,
-        *args,
-        **kwargs
-):
+def build_model(instance, *args, **kwargs):
     """
     Intervals per (s,k,e):
       - F[s,k,e] : fetch (size = rt[k])
@@ -107,17 +104,21 @@ def build_model(
         orders_req = args[2]
         rt = args[3]
         p = args[4]
-        rt_return = kwargs.get('rt_return', args[5] if len(args) > 5 else None)
-        add_symmetry_breaking = kwargs.get('add_symmetry_breaking', args[6] if len(args) > 6 else True)
-        horizon = kwargs.get('horizon', args[7] if len(args) > 7 else 0)
-        move_cap = kwargs.get('move_cap', args[8] if len(args) > 8 else None)
-        N = kwargs.get('N', args[9] if len(args) > 9 else None)
+        rt_return = kwargs.get("rt_return", args[5] if len(args) > 5 else None)
+        add_symmetry_breaking = kwargs.get(
+            "add_symmetry_breaking", args[6] if len(args) > 6 else True
+        )
+        horizon = kwargs.get("horizon", args[7] if len(args) > 7 else 0)
+        move_cap = kwargs.get("move_cap", args[8] if len(args) > 8 else None)
+        N = kwargs.get("N", args[9] if len(args) > 9 else None)
         instance = Instance(S, L, K, orders_req, rt, p, N or {}, rt_ret=rt_return)
     else:
-        rt_return = kwargs.get('rt_return', args[0] if len(args) > 0 else None)
-        add_symmetry_breaking = kwargs.get('add_symmetry_breaking', args[1] if len(args) > 1 else True)
-        horizon = kwargs.get('horizon', args[2] if len(args) > 2 else 0)
-        move_cap = kwargs.get('move_cap', args[3] if len(args) > 3 else None)
+        rt_return = kwargs.get("rt_return", args[0] if len(args) > 0 else None)
+        add_symmetry_breaking = kwargs.get(
+            "add_symmetry_breaking", args[1] if len(args) > 1 else True
+        )
+        horizon = kwargs.get("horizon", args[2] if len(args) > 2 else 0)
+        move_cap = kwargs.get("move_cap", args[3] if len(args) > 3 else None)
 
     S, L, K, orders_req, rt, p, N = instance
     if rt_return is None:
@@ -128,9 +129,11 @@ def build_model(
         rt_return = rt  # symmetric round-trip by default
 
     # --- demand and candidate copy counts ---
+    orders_demanding_sku = defaultdict(set)
     need_count = defaultdict(int)
     for o in O:
         for k in orders_req[o]:
+            orders_demanding_sku[k].add(o)
             need_count[k] += 1
     active_K = [k for k in K if need_count[k] > 0]
     Lcap = max(1, len(L))
@@ -147,14 +150,18 @@ def build_model(
         for s in S:
             I_os[(o, s)] = mdl.interval_var(optional=True, name=f"I_os[{o},{s}]")
             for ln in L:
-                I_os_lane[(o, s, ln)] = mdl.interval_var(optional=True, name=f"I_os_lane[{o},{s},{ln}]")
+                I_os_lane[(o, s, ln)] = mdl.interval_var(
+                    optional=True, name=f"I_os_lane[{o},{s},{ln}]"
+                )
 
     # Consumptions: one per (order, required SKU, station)
     C = {}
     for o in O:
         for k in orders_req[o]:
             for s in S:
-                C[(o, k, s)] = mdl.interval_var(size=p[k], optional=True, name=f"C[{o},{k},{s}]")
+                C[(o, k, s)] = mdl.interval_var(
+                    size=p[k], optional=True, name=f"C[{o},{k},{s}]"
+                )
 
     # Fetch / Pick / Return / Bin-Presence, only for active SKUs
     P, F, R, B, Block = {}, {}, {}, {}, {}
@@ -164,11 +171,19 @@ def build_model(
                 all_picks_for_this_copy = []
                 for o in O:
                     if k in orders_req[o]:
-                        P[(o, s, k, e)] = mdl.interval_var(size=p[k], optional=True, name=f"P[{o},{s},{k},{e}]")
+                        P[(o, s, k, e)] = mdl.interval_var(
+                            size=p[k], optional=True, name=f"P[{o},{s},{k},{e}]"
+                        )
                         all_picks_for_this_copy.append(P[(o, s, k, e)])
-                F[(s, k, e)] = mdl.interval_var(size=rt[k], optional=True, name=f"F[{s},{k},{e}]")
-                R[(s, k, e)] = mdl.interval_var(size=rt_return[k], optional=True, name=f"R[{s},{k},{e}]")
-                B[(s, k, e)] = mdl.interval_var(optional=True, name=f"B[{s},{k},{e}]")  # free size
+                F[(s, k, e)] = mdl.interval_var(
+                    size=rt[k], optional=True, name=f"F[{s},{k},{e}]"
+                )
+                R[(s, k, e)] = mdl.interval_var(
+                    size=rt_return[k], optional=True, name=f"R[{s},{k},{e}]"
+                )
+                B[(s, k, e)] = mdl.interval_var(
+                    optional=True, name=f"B[{s},{k},{e}]"
+                )  # free size
                 # Presence coupling
                 mdl.add(mdl.presence_of(B[(s, k, e)]) == mdl.presence_of(F[(s, k, e)]))
                 mdl.add(mdl.presence_of(R[(s, k, e)]) == mdl.presence_of(B[(s, k, e)]))
@@ -177,7 +192,9 @@ def build_model(
                 # This links the presence of P[(o,s,k,e)] to B[(s,k,e)].
                 if all_picks_for_this_copy:
                     # any_P_present is a 0/1 expression that is 1 if any P is present
-                    any_P_present = mdl.max(mdl.presence_of(iv) for iv in all_picks_for_this_copy)
+                    any_P_present = mdl.max(
+                        mdl.presence_of(iv) for iv in all_picks_for_this_copy
+                    )
                     mdl.add(mdl.presence_of(B[(s, k, e)]) == any_P_present)
                 else:
                     # No orders exist, so this B should never be present
@@ -187,7 +204,9 @@ def build_model(
                 for o in O:
                     if k in orders_req[o]:
                         mdl.add(mdl.end_before_start(F[(s, k, e)], P[(o, s, k, e)]))
-                        mdl.add(mdl.end_before_start(P[(o, s, k, e)], R[(s, k, e)]))  # start(R) >= end(P)
+                        mdl.add(
+                            mdl.end_before_start(P[(o, s, k, e)], R[(s, k, e)])
+                        )  # start(R) >= end(P)
                     # mdl.add(mdl.end_before_end(P[(o, s, k, e)], B[(s, k, e)])) does not help
                     # mdl.add(mdl.start_before_start(B[(s, k, e)], P[(o, s, k, e)]))
 
@@ -196,7 +215,9 @@ def build_model(
                 mdl.add(mdl.end_at_start(B[(s, k, e)], R[(s, k, e)]))
 
                 # This Block spans from the start of Fetch to the end of Return
-                Block[(s, k, e)] = mdl.interval_var(optional=True, name=f"Block[{s},{k},{e}]")
+                Block[(s, k, e)] = mdl.interval_var(
+                    optional=True, name=f"Block[{s},{k},{e}]"
+                )
                 mdl.add(mdl.span(Block[(s, k, e)], [F[(s, k, e)], R[(s, k, e)]]))
 
     if horizon == 0:
@@ -295,8 +316,8 @@ def build_model(
         for s in S:
             for i in range(len(L) - 1):
                 mdl.add(
-                    mdl.sum(mdl.presence_of(I_os_lane[(o, s, i)]) for o in O) >=
-                    mdl.sum(mdl.presence_of(I_os_lane[(o, s, i + 1)]) for o in O)
+                    mdl.sum(mdl.presence_of(I_os_lane[(o, s, i)]) for o in O)
+                    >= mdl.sum(mdl.presence_of(I_os_lane[(o, s, i + 1)]) for o in O)
                 )
 
         # (B) Ordered pick copies: for each (s,k), present copies form a prefix and are chained
@@ -307,8 +328,12 @@ def build_model(
                     # if P_{e+1} is present => P_e must be present  (prefix)
                     # mdl.add(mdl.if_then(mdl.presence_of(P[(s, k, e + 1)]) == 1,
                     #                     mdl.presence_of(P[(s, k, e)]) == 1))
-                    mdl.add(mdl.if_then(mdl.presence_of(B[(s, k, e + 1)]) == 1,
-                                        mdl.presence_of(B[(s, k, e)]) == 1))
+                    mdl.add(
+                        mdl.if_then(
+                            mdl.presence_of(B[(s, k, e + 1)]) == 1,
+                            mdl.presence_of(B[(s, k, e)]) == 1,
+                        )
+                    )
                     # and order them in time
                     # mdl.add(mdl.end_before_start(P[(s, k, e)], P[(s, k, e + 1)]))
                     mdl.add(mdl.end_before_start(B[(s, k, e)], B[(s, k, e + 1)]))
@@ -338,10 +363,23 @@ def build_model(
     handles = {
         "I_os_lane": I_os_lane,
         "I_os": I_os,
-        "C": C, "P": P, "F": F, "R": R, "B": B, "Block": Block,
-        "U": U, "orders_req": orders_req,
-        "rt": rt, "rt_return": rt_return, "p": p,
-        "S": S, "L": L, "K": K, "O": O,
+        "C": C,
+        "P": P,
+        "F": F,
+        "R": R,
+        "B": B,
+        "Block": Block,
+        "U": U,
+        "orders_req": orders_req,
+        "rt": rt,
+        "rt_return": rt_return,
+        "p": p,
+        "S": S,
+        "L": L,
+        "K": K,
+        "active_K": active_K,
+        "orders_demanding_sku": orders_demanding_sku,
+        "O": O,
         "N": N,
         "move_cap": move_cap,
     }
@@ -351,6 +389,7 @@ def build_model(
 # --------------------------
 # Solution extraction
 # --------------------------
+
 
 def extract_and_print_solution(sol, handles):
     # CP 22.1 helpers
@@ -399,7 +438,9 @@ def extract_and_print_solution(sol, handles):
     for o in O:
         s_sel, ln_sel = assign[o]
         st, en = iv_start(I_os[(o, s_sel)]), iv_end(I_os[(o, s_sel)])
-        print(f"Order {o:>3} -> Station {s_sel}, Lane {ln_sel}, Window [{st}, {en}) | SKUs {orders_req[o]}")
+        print(
+            f"Order {o:>3} -> Station {s_sel}, Lane {ln_sel}, Window [{st}, {en}) | SKUs {orders_req[o]}"
+        )
 
     # Per-station sequences — show F, B, P, R chronologically (by start of B)
     print("\n=== Station timelines ===")
@@ -413,22 +454,35 @@ def extract_and_print_solution(sol, handles):
                         if k in orders_req[o]:
                             # Find the matching P
                             if (o, s, k, e) in P and iv_present(P[(o, s, k, e)]):
-                                ps, pe = iv_start(P[(o, s, k, e)]), iv_end(P[(o, s, k, e)])
+                                ps, pe = (
+                                    iv_start(P[(o, s, k, e)]),
+                                    iv_end(P[(o, s, k, e)]),
+                                )
                                 bs, be = iv_start(B[(s, k, e)]), iv_end(B[(s, k, e)])
                                 fs, fe = iv_start(F[(s, k, e)]), iv_end(F[(s, k, e)])
                                 rs, re = iv_start(R[(s, k, e)]), iv_end(R[(s, k, e)])
-                                events.append((bs, {
-                                    "k": k, "e": e, "o": o,
-                                    "F": (fs, fe), "B": (bs, be), "P": (ps, pe), "R": (rs, re)
-                                }))
+                                events.append(
+                                    (
+                                        bs,
+                                        {
+                                            "k": k,
+                                            "e": e,
+                                            "o": o,
+                                            "F": (fs, fe),
+                                            "B": (bs, be),
+                                            "P": (ps, pe),
+                                            "R": (rs, re),
+                                        },
+                                    )
+                                )
 
         # Group events by bin (k, e)
         bins_data = defaultdict(list)
         for bs, ev in events:
-            bins_data[(ev['k'], ev['e'])].append(ev)
+            bins_data[(ev["k"], ev["e"])].append(ev)
 
         # Sort bins by their start time
-        sorted_bins = sorted(bins_data.items(), key=lambda item: item[1][0]['B'][0])
+        sorted_bins = sorted(bins_data.items(), key=lambda item: item[1][0]["B"][0])
 
         print(f"\nStation {s}:")
         if not sorted_bins:
@@ -447,8 +501,10 @@ def extract_and_print_solution(sol, handles):
                 pick_events.append(f"P(o={ev['o']})[{ps},{pe})")
 
             picks_str = " ".join(sorted(pick_events))
-            print(f"  SKU {k} e={e}: F[{fs},{fe}) B[{bs},{be}) {picks_str} R[{rs},{re})"
-                  f" | rt={rt.get(k)}, p={p.get(k)}, rtr={rt_ret.get(k)}")
+            print(
+                f"  SKU {k} e={e}: F[{fs},{fe}) B[{bs},{be}) {picks_str} R[{rs},{re})"
+                f" | rt={rt.get(k)}, p={p.get(k)}, rtr={rt_ret.get(k)}"
+            )
 
     # Coverage
     print("\n=== Order-SKU coverage via pick events ===")
@@ -463,10 +519,16 @@ def extract_and_print_solution(sol, handles):
                 for e in range(Uk):
                     if (o, s_sel, k, e) in P:
                         Piv = P[(o, s_sel, k, e)]
-                        if iv_present(Piv) and iv_start(Piv) == st and iv_end(Piv) == en:
+                        if (
+                            iv_present(Piv)
+                            and iv_start(Piv) == st
+                            and iv_end(Piv) == en
+                        ):
                             chosen = e
                             break
-                print(f"Order {o:>3} needs SKU {k:>3} -> uses P[{o},{s_sel},{k},{chosen}] at [{st},{en})")
+                print(
+                    f"Order {o:>3} needs SKU {k:>3} -> uses P[{o},{s_sel},{k},{chosen}] at [{st},{en})"
+                )
             else:
                 print(f"Order {o:>3} needs SKU {k:>3} -> MISSING (should not happen)")
 
@@ -489,20 +551,20 @@ def solve_instance(config):
         }
     """
     # --- 1. Get parameters from config ---
-    num_stations = config.get('stations', 2)
-    lanes_per_station = config.get('lanes', 2)
-    num_orders = config.get('orders', 10)
-    num_skus = config.get('skus', 90)
-    seed = config.get('seed', 42)
-    pick_touch_time = config.get('pick', 4)
-    timelimit = config.get('timelimit', 25)
-    add_symmetry_breaking = config.get('symmetry_breaking', True)
-    horizon = config.get('horizon', 10000)
-    move_cap = config.get('movecap', 20)
+    num_stations = config.get("stations", 2)
+    lanes_per_station = config.get("lanes", 2)
+    num_orders = config.get("orders", 10)
+    num_skus = config.get("skus", 90)
+    seed = config.get("seed", 42)
+    pick_touch_time = config.get("pick", 4)
+    timelimit = config.get("timelimit", 25)
+    add_symmetry_breaking = config.get("symmetry_breaking", True)
+    horizon = config.get("horizon", 10000)
+    move_cap = config.get("movecap", 20)
 
     # "Quiet" -> no logs; anything else turns logs on
-    verbose = config.get('verbose', "Quiet")
-    collect_progress = config.get('collect_progress', True)
+    verbose = config.get("verbose", "Quiet")
+    collect_progress = config.get("collect_progress", True)
     is_verbose = verbose not in (None, False, "Quiet")
 
     if is_verbose:
@@ -536,11 +598,11 @@ def solve_instance(config):
         if is_verbose:
             print(f"Data generation failed: {e}")
         return {
-            'status': 'DataGenError',
-            'solve_time': 0.0,
-            'objective_value': None,
-            'num_vars': 0,
-            'progress': [],
+            "status": "DataGenError",
+            "solve_time": 0.0,
+            "objective_value": None,
+            "num_vars": 0,
+            "progress": [],
         }
 
     # --- 3. Build Model ---
@@ -558,7 +620,7 @@ def solve_instance(config):
             rt_return=rt_return,
             add_symmetry_breaking=add_symmetry_breaking,
             horizon=horizon,
-            move_cap=move_cap
+            move_cap=move_cap,
         )
         num_vars = len(mdl.get_all_variables())
         if is_verbose:
@@ -566,11 +628,11 @@ def solve_instance(config):
     except Exception as e:
         print(f"Model build failed: {e}")
         return {
-            'status': 'ModelBuildError',
-            'solve_time': 0.0,
-            'objective_value': None,
-            'num_vars': num_vars,
-            'progress': [],
+            "status": "ModelBuildError",
+            "solve_time": 0.0,
+            "objective_value": None,
+            "num_vars": num_vars,
+            "progress": [],
         }
 
     # --- 4. Attach progress listener (optional) ---
@@ -589,7 +651,7 @@ def solve_instance(config):
         if collect_progress:
             # Ask CP Optimizer to keep iterating with search_next()
             # so that the listener sees all incumbent improvements.
-            solve_kwargs['solve_with_search_next'] = True
+            solve_kwargs["solve_with_search_next"] = True
 
         sol = mdl.solve(**solve_kwargs)
 
@@ -609,17 +671,19 @@ def solve_instance(config):
             # CP Optimizer often returns "Unknown" on TimeLimit
             status = "TimeLimit"
             if is_verbose:
-                print(f"Solver stopped with Unknown (likely timelimit). Time={solve_time}")
+                print(
+                    f"Solver stopped with Unknown (likely timelimit). Time={solve_time}"
+                )
         else:
             if is_verbose:
                 print(f"Solve failed. Status: {status}, Time={solve_time}")
 
         return {
-            'status': status,
-            'solve_time': solve_time,
-            'objective_value': obj_val,
-            'num_vars': num_vars,
-            'progress': collector.records if collector is not None else [],
+            "status": status,
+            "solve_time": solve_time,
+            "objective_value": obj_val,
+            "num_vars": num_vars,
+            "progress": collector.records if collector is not None else [],
         }
 
     except Exception as e:
@@ -629,7 +693,7 @@ def solve_instance(config):
         # Try to recover solve_time if possible
         solve_time = 0.0
         try:
-            if 'sol' in locals() and sol is not None:
+            if "sol" in locals() and sol is not None:
                 solve_time = sol.get_solve_time()
         except Exception:
             pass
@@ -641,11 +705,11 @@ def solve_instance(config):
             status = "Crash"
 
         return {
-            'status': status,
-            'solve_time': solve_time,
-            'objective_value': None,
-            'num_vars': num_vars,
-            'progress': collector.records if collector is not None else [],
+            "status": status,
+            "solve_time": solve_time,
+            "objective_value": None,
+            "num_vars": num_vars,
+            "progress": collector.records if collector is not None else [],
         }
 
 
@@ -723,7 +787,9 @@ def inject_warmstart(solution, pick_events: dict, mdl, handles):
                 continue
 
             if is_assigned and s == s_target:
-                sp.add_interval_var_solution(iv, presence=True, start=t_start, end=t_end)
+                sp.add_interval_var_solution(
+                    iv, presence=True, start=t_start, end=t_end
+                )
             else:
                 sp.add_interval_var_solution(iv, presence=False)
 
@@ -735,7 +801,9 @@ def inject_warmstart(solution, pick_events: dict, mdl, handles):
                     continue
 
                 if is_assigned and s == s_target and ln == ln_target:
-                    sp.add_interval_var_solution(iv_lane, presence=True, start=t_start, end=t_end)
+                    sp.add_interval_var_solution(
+                        iv_lane, presence=True, start=t_start, end=t_end
+                    )
                 else:
                     sp.add_interval_var_solution(iv_lane, presence=False)
 
@@ -777,19 +845,39 @@ def inject_warmstart(solution, pick_events: dict, mdl, handles):
 
             # Set F, B, R, Block as present
             if (s, k, e) in F:
-                sp.add_interval_var_solution(F[(s, k, e)], presence=True, start=be.fetch_start, end=be.presence_start)
+                sp.add_interval_var_solution(
+                    F[(s, k, e)],
+                    presence=True,
+                    start=be.fetch_start,
+                    end=be.presence_start,
+                )
                 set_vars.add(F[(s, k, e)])
 
             if (s, k, e) in B:
-                sp.add_interval_var_solution(B[(s, k, e)], presence=True, start=be.presence_start, end=be.presence_end)
+                sp.add_interval_var_solution(
+                    B[(s, k, e)],
+                    presence=True,
+                    start=be.presence_start,
+                    end=be.presence_end,
+                )
                 set_vars.add(B[(s, k, e)])
 
             if (s, k, e) in R:
-                sp.add_interval_var_solution(R[(s, k, e)], presence=True, start=be.presence_end, end=be.return_end)
+                sp.add_interval_var_solution(
+                    R[(s, k, e)],
+                    presence=True,
+                    start=be.presence_end,
+                    end=be.return_end,
+                )
                 set_vars.add(R[(s, k, e)])
 
             if (s, k, e) in Block:
-                sp.add_interval_var_solution(Block[(s, k, e)], presence=True, start=be.fetch_start, end=be.return_end)
+                sp.add_interval_var_solution(
+                    Block[(s, k, e)],
+                    presence=True,
+                    start=be.fetch_start,
+                    end=be.return_end,
+                )
                 set_vars.add(Block[(s, k, e)])
 
     # --- 4. Picks and Consumption ---
@@ -810,12 +898,16 @@ def inject_warmstart(solution, pick_events: dict, mdl, handles):
 
             # P[(o, s, k, e)]
             if (o, s_sel, k, e) in P:
-                sp.add_interval_var_solution(P[(o, s_sel, k, e)], presence=True, start=ps, end=pe)
+                sp.add_interval_var_solution(
+                    P[(o, s_sel, k, e)], presence=True, start=ps, end=pe
+                )
                 set_vars.add(P[(o, s_sel, k, e)])
 
             # C[(o, k, s)]
             if (o, k, s_sel) in C:
-                sp.add_interval_var_solution(C[(o, k, s_sel)], presence=True, start=ps, end=pe)
+                sp.add_interval_var_solution(
+                    C[(o, k, s_sel)], presence=True, start=ps, end=pe
+                )
                 set_vars.add(C[(o, k, s_sel)])
 
     # --- 5. SWEEP: Explicitly mark absent whatever is not in set_vars ---
@@ -871,7 +963,8 @@ def validate_warmstart(solution, pick_events, handles):
         for k, count in counts.items():
             if count > U.get(k, 0):
                 violations.append(
-                    f"Station {s} SKU {k}: Heuristic used {count} trips, CP model limit U[{k}]={U.get(k,0)}")
+                    f"Station {s} SKU {k}: Heuristic used {count} trips, CP model limit U[{k}]={U.get(k, 0)}"
+                )
 
     # 2. Pick within Presence
     for (o, s_sel, k), (ps, pe) in pick_events.items():
@@ -883,7 +976,8 @@ def validate_warmstart(solution, pick_events, handles):
                 break
         if not found:
             violations.append(
-                f"Pick {o}@{s_sel} SKU {k} [{ps},{pe}] not covered by any BinEvent presence interval at station.")
+                f"Pick {o}@{s_sel} SKU {k} [{ps},{pe}] not covered by any BinEvent presence interval at station."
+            )
 
     # 3. Order window consistent with Picks
     # The CP model uses `span(I_os, [C])`.
@@ -904,9 +998,13 @@ def validate_warmstart(solution, pick_events, handles):
         max_p = max(pe for ps, pe in picks)
 
         if t_start != min_p:
-            violations.append(f"Order {o}: Heuristic Start {t_start} != Min Pick Start {min_p}")
+            violations.append(
+                f"Order {o}: Heuristic Start {t_start} != Min Pick Start {min_p}"
+            )
         if t_end != max_p:
-            violations.append(f"Order {o}: Heuristic End {t_end} != Max Pick End {max_p}")
+            violations.append(
+                f"Order {o}: Heuristic End {t_end} != Max Pick End {max_p}"
+            )
 
     # 4. Lane fill order symmetry breaking (diagnostic on raw heuristic lanes)
     S = handles["S"]
@@ -922,8 +1020,9 @@ def validate_warmstart(solution, pick_events, handles):
             if count_i < count_next:
                 violations.append(
                     f"Symmetry (A) raw lanes at station {s}: "
-                    f"lane {L[i]} has {count_i} orders < lane {L[i+1]} has {count_next} "
-                    f"(inject_warmstart will remap)")
+                    f"lane {L[i]} has {count_i} orders < lane {L[i + 1]} has {count_next} "
+                    f"(inject_warmstart will remap)"
+                )
 
     # 5. Bin copy prefix ordering (temporal check on sorted bin events)
     for s in S:
@@ -938,7 +1037,8 @@ def validate_warmstart(solution, pick_events, handles):
                     violations.append(
                         f"Symmetry (B) at station {s} SKU {k}: "
                         f"B[e={i}].presence_end={k_sorted[i].presence_end} > "
-                        f"B[e={i+1}].presence_start={k_sorted[i + 1].presence_start}")
+                        f"B[e={i + 1}].presence_start={k_sorted[i + 1].presence_start}"
+                    )
 
     # 6. Order completeness — every order in the CP model must be assigned
     O_all = handles["O"]
@@ -957,20 +1057,24 @@ def validate_warmstart(solution, pick_events, handles):
             start_j, _, o_j = intervals[i + 1]
             if end_i > start_j:
                 violations.append(
-                    f"Lane overlap at S{s} L{ln}: order {o_i} ends {end_i} > order {o_j} starts {start_j}")
+                    f"Lane overlap at S{s} L{ln}: order {o_i} ends {end_i} > order {o_j} starts {start_j}"
+                )
 
     # 8. Pickface no-overlap — mirrors validate_solution check 3
     for s in S:
         presences = sorted(
-            [(be.presence_start, be.presence_end, be.sku)
-             for be in solution.bin_events.get(s, [])]
+            [
+                (be.presence_start, be.presence_end, be.sku)
+                for be in solution.bin_events.get(s, [])
+            ]
         )
         for i in range(len(presences) - 1):
             _, end_i, k_i = presences[i]
             start_j, _, k_j = presences[i + 1]
             if end_i > start_j:
                 violations.append(
-                    f"Pickface overlap at S{s}: SKU {k_i} ends {end_i} > SKU {k_j} starts {start_j}")
+                    f"Pickface overlap at S{s}: SKU {k_i} ends {end_i} > SKU {k_j} starts {start_j}"
+                )
 
     # 9. Bin timing consistency — mirrors validate_solution check 6
     rt_dict = handles["rt"]
@@ -982,17 +1086,21 @@ def validate_warmstart(solution, pick_events, handles):
                 continue  # unknown SKU (e.g., injected in tests); skip
             if be.fetch_end - be.fetch_start != rt_dict[k]:
                 violations.append(
-                    f"S{s} SKU {k}: fetch duration {be.fetch_end - be.fetch_start} != rt[{k}]={rt_dict[k]}")
+                    f"S{s} SKU {k}: fetch duration {be.fetch_end - be.fetch_start} != rt[{k}]={rt_dict[k]}"
+                )
             if be.return_end - be.return_start != rt_return_dict[k]:
                 violations.append(
                     f"S{s} SKU {k}: return duration {be.return_end - be.return_start} "
-                    f"!= rt_return[{k}]={rt_return_dict[k]}")
+                    f"!= rt_return[{k}]={rt_return_dict[k]}"
+                )
             if be.presence_start != be.fetch_end:
                 violations.append(
-                    f"S{s} SKU {k}: presence_start {be.presence_start} != fetch_end {be.fetch_end}")
+                    f"S{s} SKU {k}: presence_start {be.presence_start} != fetch_end {be.fetch_end}"
+                )
             if be.presence_end != be.return_start:
                 violations.append(
-                    f"S{s} SKU {k}: presence_end {be.presence_end} != return_start {be.return_start}")
+                    f"S{s} SKU {k}: presence_end {be.presence_end} != return_start {be.return_start}"
+                )
 
     # 10. Block concurrency <= N[k] — mirrors validate_solution check 4
     N_map = handles.get("N")
@@ -1016,7 +1124,8 @@ def validate_warmstart(solution, pick_events, handles):
                 concurrent += delta
                 if concurrent > N_map[k]:
                     violations.append(
-                        f"Block concurrency SKU {k}: {concurrent} > N[{k}]={N_map[k]} at t={t}")
+                        f"Block concurrency SKU {k}: {concurrent} > N[{k}]={N_map[k]} at t={t}"
+                    )
                     break
 
     # 11. MoveCap — mirrors validate_solution check 5
@@ -1072,8 +1181,22 @@ class ProgressCollector(CpoSolverListener):
 
             obj = sres.get_objective_value()
             if obj is None:
-                print(f"Warning: result_found called with solution without objective: {sres}")
+                print(
+                    f"Warning: result_found called with solution without objective: {sres}"
+                )
                 return
+
+            sol_dict = {}
+            for var_sol in sres.get_all_var_solutions():
+                val = var_sol.get_value()
+                if hasattr(val, "is_present"):
+                    sol_dict[var_sol.get_name()] = {
+                        "present": val.is_present(),
+                        "start": val.get_start() if val.is_present() else None,
+                        "end": val.get_end() if val.is_present() else None,
+                    }
+                else:
+                    sol_dict[var_sol.get_name()] = val
 
             # Only keep strict improvements
             if (self.best_obj is None) or (obj < self.best_obj):
@@ -1083,25 +1206,52 @@ class ProgressCollector(CpoSolverListener):
                     "best": obj,
                     "bound": sres.get_objective_bound(),
                     "gap": sres.get_objective_gap(),
+                    "sol": sol_dict,
                 }
                 self.records.append(rec)
+
         except Exception as e:
             print("Exception in ProgressCollector.result_found:", e)
 
 
 def main():
     ap = argparse.ArgumentParser(description="CP Autostoremodel.")
-    ap.add_argument("--stations", type=int, default=1, help="Number of picking stations |S|")
-    ap.add_argument("--lanes", type=int, default=4, help="Lanes per station (max concurrent open orders)")
+    ap.add_argument(
+        "--stations", type=int, default=1, help="Number of picking stations |S|"
+    )
+    ap.add_argument(
+        "--lanes",
+        type=int,
+        default=4,
+        help="Lanes per station (max concurrent open orders)",
+    )
     ap.add_argument("--orders", type=int, default=10, help="Number of orders |O|")
     ap.add_argument("--skus", type=int, default=10, help="Number of SKUs |K|")
     ap.add_argument("--seed", type=int, default=42, help="Random seed")
-    ap.add_argument("--pick", type=int, default=4, help="Constant pick touch time for all SKUs")
-    ap.add_argument("--movecap", type=int, default=8, help="Max number of simultaneous moves (F or R)")
-    ap.add_argument("--timelimit", type=int, default=5, help="Solver time limit (seconds)")
-    ap.add_argument("--no_symmetry_breaking", action="store_true", help="Disable symmetry breaking constraints")
+    ap.add_argument(
+        "--pick", type=int, default=4, help="Constant pick touch time for all SKUs"
+    )
+    ap.add_argument(
+        "--movecap",
+        type=int,
+        default=8,
+        help="Max number of simultaneous moves (F or R)",
+    )
+    ap.add_argument(
+        "--timelimit", type=int, default=5, help="Solver time limit (seconds)"
+    )
+    ap.add_argument(
+        "--no_symmetry_breaking",
+        action="store_true",
+        help="Disable symmetry breaking constraints",
+    )
     ap.add_argument("--no_vis", action="store_true", help="Do not plot the schedule")
-    ap.add_argument("--horizon", type=int, default=10000, help="Maximal Cmax horizon (0 for unbounded)")
+    ap.add_argument(
+        "--horizon",
+        type=int,
+        default=10000,
+        help="Maximal Cmax horizon (0 for unbounded)",
+    )
     ap.add_argument("--newdatagen", action="store_true", help="Use new data generation")
 
     args = ap.parse_args()
@@ -1141,9 +1291,13 @@ def main():
     if args.horizon > 0:
         print(f"Adding maximal horizon constraint: end <= {args.horizon}")
 
-    mdl, handles = build_model(instance, rt_return=rt_return,
-                               add_symmetry_breaking=add_symmetry_breaking,
-                               horizon=args.horizon, move_cap=args.movecap)
+    mdl, handles = build_model(
+        instance,
+        rt_return=rt_return,
+        add_symmetry_breaking=add_symmetry_breaking,
+        horizon=args.horizon,
+        move_cap=args.movecap,
+    )
     print("\nSolving...")
     print(f"Number of variables: {len(mdl.get_all_variables())}")
     sol = mdl.solve(
@@ -1163,13 +1317,15 @@ def main():
             if var.get_type().name == "IntervalVar":  # filter interval variables
                 sol_vars = sol.get_var_solution(var)
                 if sol_vars.is_present():
-                    data.append({
-                        "Name": var.get_name(),
-                        "Start": sol_vars.get_start(),
-                        "End": sol_vars.get_end(),
-                        "Length": sol_vars.get_length(),
-                        "Presence": sol_vars.is_present()
-                    })
+                    data.append(
+                        {
+                            "Name": var.get_name(),
+                            "Start": sol_vars.get_start(),
+                            "End": sol_vars.get_end(),
+                            "Length": sol_vars.get_length(),
+                            "Presence": sol_vars.is_present(),
+                        }
+                    )
         # df = pd.DataFrame(data)
         # pd.set_option("display.max_columns", None)  # Show all columns
         # pd.set_option("display.max_rows", None)  # Show all rows

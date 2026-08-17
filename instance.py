@@ -1,4 +1,5 @@
-from typing import Any, Dict, List
+import pickle
+from typing import Any
 
 import numpy as np
 
@@ -11,16 +12,16 @@ class Instance:
 
     def __init__(
         self,
-        S: List[int],
-        L: List[int],
-        K: List[int],
-        orders_requirements: Dict[int, List[int]],
-        rt: Dict[int, int],
-        p: Dict[int, int],
-        N: Dict[int, int],
+        S: list[int],
+        L: list[int],
+        K: list[int],
+        orders_requirements: dict[int, list[int]],
+        rt: dict[int, int],
+        p: dict[int, int],
+        N: dict[int, int],
         movecap: int,
         seed: int,
-        rt_ret: Dict[int, int] = None,
+        rt_ret: dict[int, int] | None = None,
     ):
         self.S = S
         self.L = L
@@ -36,33 +37,33 @@ class Instance:
         self.features = self.get_features()
 
     @property
-    def orders_requirements(self) -> Dict[int, List[int]]:
+    def orders_requirements(self) -> dict[int, list[int]]:
         return self._orders_requirements
 
     @orders_requirements.setter
-    def orders_requirements(self, value: Dict[int, List[int]]):
+    def orders_requirements(self, value: dict[int, list[int]]):
         self._orders_requirements = value
 
     @property
-    def orders_req(self) -> Dict[int, List[int]]:
+    def orders_req(self) -> dict[int, list[int]]:
         return self._orders_requirements
 
     @orders_req.setter
-    def orders_req(self, value: Dict[int, List[int]]):
+    def orders_req(self, value: dict[int, list[int]]):
         self._orders_requirements = value
 
     @property
-    def O(self) -> List[int]:
+    def O(self) -> list[int]:
         """Sorted list of order IDs."""
         return sorted(self._orders_requirements.keys())
 
     @property
-    def rt_ret(self) -> Dict[int, int]:
+    def rt_ret(self) -> dict[int, int]:
         """A dictionary mapping SKU to its return time, defaulting to its retrieval time."""
         return self._rt_ret
 
     @rt_ret.setter
-    def rt_ret(self, value: Dict[int, int]):
+    def rt_ret(self, value: dict[int, int]):
         self._rt_ret = value
 
     @property
@@ -73,7 +74,7 @@ class Instance:
     def seed(self) -> int:
         return self._seed
 
-    def get_statistics(self) -> Dict[str, Any]:
+    def get_statistics(self) -> dict[str, Any]:
         """Calculate and return key statistics about the instance."""
         import itertools as _itertools
 
@@ -206,7 +207,7 @@ class Instance:
             "movecap_norm_per_lane": movecap_norm_per_lane,
         }
 
-    def get_features(self) -> Dict[str, float]:
+    def get_features(self) -> dict[str, float]:
         """
         Convert statistics dict to a dict of numeric features keyed by feature name, normalized to around 0..1.
         """
@@ -315,6 +316,17 @@ class Instance:
             f"  Avg Jaccard overlap (first 50 orders): {stats['avg_jaccard_weighted']:.3f}"
         )
         print("=" * 60)
+
+    def to_pickle(self, path: str) -> None:
+        """Serialize this Instance to a pickle file at *path*."""
+        with open(path, "wb") as f:
+            pickle.dump(self, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    @classmethod
+    def from_pickle(cls, path: str) -> "Instance":
+        """Deserialize an Instance from a pickle file at *path*."""
+        with open(path, "rb") as f:
+            return pickle.load(f)
 
     # Support unpacking (e.g. S, L, K, orders_req, rt, p, N = instance)
     def __iter__(self):

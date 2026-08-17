@@ -1,595 +1,696 @@
-import datetime
+import argparse
 import json
 import os
-import re
-import sys
-import time
-from contextlib import redirect_stdout
+import pickle
+import random
 
-import numpy as np
-from docplex.cp.solution import CpoModelSolution, CpoSolveResult
+from docplex.cp.solution import CpoSolveResult
+from loguru import logger
 
-from autostore_heuristic import build_viz_handles, validate_solution
-from cp_model import (
-    ProgressCollector,
-    build_model,
-    extract_and_print_solution,
-    inject_warmstart,
-    validate_warmstart,
+import cp_model as docplex_model
+import ortools_cp_model as ortools_model
+from autostore_heuristic import Solution, BinEvent, validate_solution
+from freezing_utils import (
+    FreezeManager,
+    create_partial_starting_point,
+    apply_partial_starting_point,
+    generate_freeze_constraints,
+    get_optimized_set,
 )
-from datagen import generate_data
-from heuristic_rdi_sgc import run_rdi_sgc
-from neighborhoods import select_timeslice_neighborhood
-from schedule_visualizer import plot_schedule, write_html
-
-
-class Tee:
-    """Write to multiple streams, flushing after each write."""
-
-    def __init__(self, *streams):
-        self.streams = streams
-
-    def write(self, data):
-        for s in self.streams:
-            s.write(data)
-            s.flush()
-
-    def flush(self):
-        for s in self.streams:
-            s.flush()
-
-
-ts = datetime.datetime.now().strftime("%d-%m-%Y_%H-%M-%S")  # noqa: DTZ005
-path = f"experiments/{ts}"
-os.mkdir(path)
-
-config = {
-    "stations": 6,
-    "lanes": 6,
-    "orders": 100,
-    "symmetry_breaking": True,
-    "skus": 30000,
-    "movecap": 80,
-    "seed": 42,
-    "verbose": True,
-    "collect_progress": True,
-    "horizon": 10000,
-    "alpha": 1.0,
-    "beta": 1.0,
-    "iters": 300,
-    "stagnation_th": 50,
-    "severity_step": 1,
-    "iter_time_limit": 2.0,
-    "baseline_ts_window": 100,
-    "baseline_rand_pct": 0.05,
-    "rrt_accept_th": 0.15,
-    "use_whole_sol": True,
-}
-
-with open(f"{path}/config.json", "w+") as f:
-    json.dump(config, f)
-
-# Open log files
-general_log = open(f"{path}/general_log.txt", "w")
-matheur_log = open(f"{path}/matheur_log.txt", "w")
-cp_log = open(f"{path}/cp_log.txt", "w")
-
-instance = generate_data(
-    num_stations=config["stations"],
-    lanes_per_station=config["lanes"],
-    num_orders=config["orders"],
-    num_skus=config["skus"],
-    seed=config["seed"],
-    movecap=config["movecap"],
+from instance import Instance
+from matheuristic_plots import LoguruStream, Status, VisualLogger
+from neighborhood_selection import (
+    combine_strategies,
+    strategy_multi_timeslice,
+    strategy_random_lanes,
+    strategy_random_orders,
+    strategy_random_skus,
+    strategy_single_timeslice,
 )
+from precalculate_instances_for_lns import check_if_precalculated, precalculate_config
+
+random.seed(42)
 
 
-def validate_print(heur_sol, instance, config):
-    violations = validate_solution(
-        heur_sol, instance, horizon=config["horizon"], move_cap=config["movecap"]
-    )
+class MockVarSol:
+    def __init__(self, name, present, start=None, end=None, val=None):
+        self.name = name
+        self.present = present
+        self._start = start
+        self._end = end
+        self._val = val
 
-    if violations:
-        print(f"VALIDATION FAILED ({len(violations)} violations)")
-        for v in violations[:10]:
-            print(f"  Violation: {v}")
-    else:
-        print("Validation PASSED")
+    def get_name(self):
+        return self.name
 
+    def get_value(self):
+        return self
+        
+    def is_present(self):
+        return self.present
+        
+    def get_start(self):
+        return self._start
 
-# ========== GENERAL LOGS (heuristic, warmstart, comparisons) ==========
-with redirect_stdout(Tee(sys.stdout, general_log)):
-    print("=" * 60)
-    print("GENERAL LOG - Heuristic & Warmstart")
-    print("=" * 60)
+    def get_end(self):
+        return self._end
 
-    print("Running RDI-SGC Heuristic...")
-    t_heur = time.perf_counter()
-    heur_sol = run_rdi_sgc(
-        instance,
-        horizon=config["horizon"],
-        move_cap=config["movecap"],
-        ALPHA=config["alpha"],
-        BETA=config["beta"],
-    )
+class ORToolsSolution:
+    def __init__(self, src, handles):
+        self.var_map = {}
+        self.handles = handles
+        
+        if hasattr(src, "Proto"): # is a mdl (initial solution hints)
+            hints = src.Proto().solution_hint
+            for idx, var_idx in enumerate(hints.vars):
+                self.var_map[var_idx] = hints.values[idx]
+        else: # is a solver (extracted active solution)
+            for var in handles["all_intervals_flat"].values():
+                self.var_map[var.pres.Index()] = src.Value(var.pres)
+                if src.Value(var.pres):
+                    self.var_map[var.start.Index()] = src.Value(var.start)
+                    self.var_map[var.end.Index()] = src.Value(var.end)
 
-    print("\n=== RDI-SGC Heuristic Result ===")
-    print(f"Feasible:    {heur_sol.feasible}")
-    print(f"Makespan:    {heur_sol.makespan}")
-    print(f"Total bin events (moves/2): {heur_sol.total_moves // 2}")
-    print(f"Time:        {time.perf_counter() - t_heur:.4f}s")
+    def Value(self, var):
+        return self.var_map.get(var.Index(), 0)
 
-    validate_print(heur_sol, instance, config)
-    try:
-        mock_sol, handles = build_viz_handles(heur_sol, instance)
-        fig = plot_schedule(mock_sol, handles)
-        html_file = f"{path}/Heur-RDI_solution.html"
-        write_html(fig, html_file)
-        print(f"\nWrote visualization to {html_file}")
-    except Exception as exc:
-        import traceback
+    def BooleanValue(self, var):
+        return bool(self.var_map.get(var.Index(), 0))
+        
+    def get_all_var_solutions(self):
+        sols = []
+        for name, var in self.handles["all_intervals_flat"].items():
+            sols.append(self.get_var_solution(var))
+        return sols
 
-        traceback.print_exc()
-        print(f"[VIS] Skipped: {exc}")
-
-
-def generate_freeze_constraints(
-    mdl, handles, solution, severity, current_makespan, use_whole_sol=True
-):
-    # generate fix/optimize split
-    if use_whole_sol:
-        sp = solution
-        if isinstance(solution, CpoSolveResult):
-            sp = sp.get_solution()
-    else:
-        sp = mdl.create_empty_solution()
-    # r = random.random()
-    # if r < 0.33:
-    #     print(" - Using: select_station_neighborhood")
-    #     to_optimize = select_station_neighborhood(
-    #         handles, solution, round(0.51 * severity)
-    #     )
-    # elif r < 0.66 or solution.get_objective_value() is None:
-    #     print(" - Using: select_order_neighborhood")
-    #     to_optimize = select_order_neighborhood(handles, 0.1 * severity)
-    # else:
-    #     print(" - Using: select_timeslice_neighborhood")
-    to_optimize = select_timeslice_neighborhood(
-        handles,
-        solution,
-        current_makespan,
-        window_size=config["baseline_ts_window"] * severity,
-        random_pct=config["baseline_rand_pct"] * severity,
-    )
-    # to_optimize = select_random_neighborhood(
-    #     handles, solution, percent_to_free=0.01 * severity
-    # )
-
-    freeze_constraints = []
-
-    for var_sol in solution.get_all_var_solutions():
-        var = var_sol.get_var()
-
-        # Check if the variable object itself is in the set
-        if var in to_optimize:
-            continue
-
-        if "Interval" in var.type.name:
-            # check if the interval is present in the current solution
-            is_present = var_sol.is_present()
-
-            if is_present:
-                if not use_whole_sol:
-                    sp.add_interval_var_solution(
-                        var,
-                        presence=True,
-                        start=var_sol.get_start(),
-                        end=var_sol.get_end(),
-                        size=var_sol.get_size(),
-                    )
-                # freeze_constraints.append(mdl.presence_of(var) == 1)
-                freeze_constraints.append(mdl.start_of(var) == var_sol.get_start())
-                # freeze_constraints.append(mdl.end_of(var) == var_sol.get_end())
-            else:
-                # must stay absent
-                if not use_whole_sol:
-                    sp.add_interval_var_solution(var, presence=False)
-                freeze_constraints.append(mdl.presence_of(var) == 0)
-
-        elif any(t in var.type.name for t in ("Int", "Bool", "Float")):
-            val = var_sol.get_value()  # record assigned numeric value
-            freeze_constraints.append(var == val)
-            if not use_whole_sol:
-                sp.add_integer_var_solution(var, var_sol.get_value())
-
-    return freeze_constraints, sp, to_optimize
-
-
-mdl, handles = build_model(
-    instance,
-    rt_return=instance.rt_ret,
-    add_symmetry_breaking=config["symmetry_breaking"],
-    horizon=config["horizon"],
-    move_cap=config["movecap"],
-)
-
-# ========== GENERAL LOGS (warmstart validation) ==========
-with redirect_stdout(Tee(sys.stdout, general_log)):
-    violations = validate_warmstart(heur_sol, heur_sol.pick_events, handles)
-    if violations:
-        print(f"Warmstart Violations Found ({len(violations)}):")
-        for v in violations[:10]:
-            print(f" - {v}")
-
-sp = inject_warmstart(heur_sol, heur_sol.pick_events, mdl, handles)
-
-curr_makespans = []
-best_makespans = []
-stagnation_increases = []
-time_ticks = []
-search_space_sizes = []
-iter_statuses = {
-    "Unknown": 0,
-    "Optimal No improve": 0,
-    "Optimal New best": 0,
-    "Optimal Degradation": 0,
-    "Feasible No improve": 0,
-    "Feasible New best": 0,
-    "Feasible Degradation": 0,
-}
-
-t_matheur = time.perf_counter()
-MAX_ITER = config["iters"]
-
-stagnation_count = 0
-best_result = heur_sol.makespan
-best_solution = sp
-
-print(f"{sp=}, {sp.get_objective_value()=}")
-
-num_vars = len(sp.get_all_var_solutions())
-severity = 1
-vns_step = config["severity_step"]
-stagnation_th = config["stagnation_th"]
-
-current_solution = best_solution
-current_result = best_result
-
-# ========== MATHEURISTIC / LNS LOOP LOGS ==========
-with redirect_stdout(Tee(sys.stdout, matheur_log)):
-    print("=" * 60)
-    print("MATHEURISTIC / LNS LOOP")
-    print("=" * 60)
-
-    for i in range(MAX_ITER):
-        curr_time = time.perf_counter() - t_matheur
-        curr_makespans.append(current_result)
-        best_makespans.append(best_result)
-        time_ticks.append(curr_time)
-
-        if stagnation_count >= stagnation_th:
-            print(
-                f"* Increasing neighborhood size: {severity} -> {vns_step + severity}\n"
-            )
-            severity += vns_step
-            stagnation_count = 0
-            stagnation_increases.append((i, curr_time))
-
-        print(
-            f"Iter {i}: Solving Partial CP Model | Best: {best_result} | Current: {current_result} | Severity: {severity}"
-        )
-        freeze_constraints, starting_point, to_optimize = generate_freeze_constraints(
-            mdl,
-            handles,
-            current_solution,
-            severity,
-            current_result,
-            use_whole_sol=config["use_whole_sol"],
-        )
-        mdl.set_starting_point(starting_point)
-        mdl.add(freeze_constraints)
-        # Solve the sub-problem
-        print(f" - Optimizing {len(to_optimize)}/{num_vars} variables")
-
-        sol = mdl.solve(
-            TimeLimit=config["iter_time_limit"],
-            LogVerbosity="Verbose",
-            log_output=matheur_log,  # CP logs go directly to the matheur log file
-            # Presolve="Off",  # Stop trying to simplify the 100k model
-            # Workers=1
-        )
-        matheur_log.flush()  # ensure CP logs are written
-
-        log_text = sol.get_solver_log()
-        match = re.search(r"Log search space\s*:\s*([\d\.]+)", log_text)
-        log_search_space = float(match.group(1)) if match else None
-        search_space_sizes.append(log_search_space)
-        print(f" - Log search space is {log_search_space}")
-
-        if isinstance(sol, CpoModelSolution):
-            print("WARN: sol is CpoModelSolution in loop")
-            status = "Feasible"
+    def get_var_solution(self, var):
+        pres = self.BooleanValue(var.pres)
+        # return a MockVarSol which has get_var() == var, but wait, MockVarSol currently expects name!
+        if pres:
+            vs = MockVarSol(var.name, True, start=self.Value(var.start), end=self.Value(var.end))
         else:
-            status = sol.get_solve_status().strip()
+            vs = MockVarSol(var.name, False)
+        # Inject the var object so get_var() works if it exists
+        vs._var = var
+        # override get_var to return the actual var
+        vs.get_var = lambda: var
+        return vs
 
-        print(f" - Partial optimization done, status: {status}")
-        # ... Remove freeze constraints ...
-        num_removed = mdl.remove(freeze_constraints)
-        assert num_removed == len(freeze_constraints)
+def cp_sol_to_solution(sol, handles):
+    def iv_present(x):
+        if x is None: return False
+        if hasattr(sol, "BooleanValue"):
+            return sol.BooleanValue(x.pres)
+        vs = sol.get_var_solution(x)
+        return (vs is not None) and vs.is_present()
 
-        improve_status = "No improve"
-        accept = False
-        if sol:
-            # 2. ITERATIVE WARM START: Feed the CP solver's best result
-            # back into the model for the next iteration.
-            # docplex accepts the 'sol' object directly!
+    def iv_start(x):
+        if hasattr(sol, "Value"):
+            return sol.Value(x.start)
+        return sol.get_var_solution(x).get_start()
 
-            if sol.get_objective_value() < current_result:
-                accept = True
-                print(
-                    f" - Incumbent updated: {current_result} -> {sol.get_objective_value()}"
-                )
-                if sol.get_objective_value() < best_result:
-                    improve_status = "New best"
-                    print(
-                        f" - New best found: {best_result} -> {sol.get_objective_value()}"
+    def iv_end(x):
+        if hasattr(sol, "Value"):
+            return sol.Value(x.end)
+        return sol.get_var_solution(x).get_end()
+
+    I_os_lane = handles["I_os_lane"]
+    I_os = handles["I_os"]
+    P = handles["P"]
+    F = handles["F"]
+    R = handles["R"]
+    B = handles["B"]
+    U = handles["U"]
+    orders_req = handles["orders_req"]
+    S, L, K, O = handles["S"], handles["L"], handles["K"], handles["O"]
+
+    makespan = 0
+    for o in O:
+        ends = [iv_end(I_os[(o, s)]) for s in S if iv_present(I_os[(o, s)])]
+        if ends:
+            makespan = max(makespan, max(ends))
+
+    order_assignments = {}
+    for o in O:
+        s_sel = next((s for s in S if iv_present(I_os[(o, s)])), None)
+        if s_sel is not None:
+            ln_sel = next(ln for ln in L if iv_present(I_os_lane[(o, s_sel, ln)]))
+            st, en = iv_start(I_os[(o, s_sel)]), iv_end(I_os[(o, s_sel)])
+            order_assignments[o] = (s_sel, ln_sel, st, en)
+
+    bin_events = {s: [] for s in S}
+    total_moves = 0
+    
+    pick_events = {}
+
+    for s in S:
+        for k in K:
+            Uk = U[k]
+            for e in range(Uk):
+                if (s, k, e) in B and iv_present(B[(s, k, e)]):
+                    total_moves += 2
+                    
+                    fs, fe = iv_start(F[(s, k, e)]), iv_end(F[(s, k, e)])
+                    bs, be = iv_start(B[(s, k, e)]), iv_end(B[(s, k, e)])
+                    rs, re = iv_start(R[(s, k, e)]), iv_end(R[(s, k, e)])
+                    
+                    orders_served = []
+                    for o in O:
+                        if k in orders_req[o]:
+                            if (o, s, k, e) in P and iv_present(P[(o, s, k, e)]):
+                                ps, pe = iv_start(P[(o, s, k, e)]), iv_end(P[(o, s, k, e)])
+                                orders_served.append(o)
+                                pick_events[(o, s, k)] = (ps, pe)
+                    
+                    be_obj = BinEvent(
+                        sku=k,
+                        copy_id=e,
+                        fetch_start=fs,
+                        fetch_end=fe,
+                        presence_start=bs,
+                        presence_end=be,
+                        return_start=rs,
+                        return_end=re,
+                        orders_served=orders_served
                     )
-                    best_result = sol.get_objective_value()
-                    best_solution = sol
-                    stagnation_count = 0
-            else:
-                stagnation_count += 1
-                if sol.get_objective_value() > current_result:
-                    improve_status = "Degradation"
+                    bin_events[s].append(be_obj)
 
-                print(
-                    f" - Incumbent stagnates: {sol.get_objective_value()}>={current_result} for {stagnation_count} iterations"
-                )
-                # Record-to-record travel with threshold of 8%
-                obj = sol.get_objective_value()
-                gap = (obj - best_result) / best_result
-                if obj and gap < config["rrt_accept_th"]:
-                    accept = True
-                    print(f" - Accepting worse with gap {100 * gap:0.2f}%")
-                else:
-                    print(f" - Rejecting worse with gap {100 * gap:0.2f}%")
-        else:
-            stagnation_count += 1
+    return Solution(
+        order_assignments=order_assignments,
+        bin_events=bin_events,
+        makespan=makespan,
+        total_moves=total_moves,
+        feasible=True,
+        pick_events=pick_events
+    )
+
+def sort_variables(mdl, sp, backend="docplex", handles=None):
+    if backend == "ortools":
+        def get_start_time(var):
+            if sp.BooleanValue(var.pres):
+                return sp.Value(var.start)
+            return float("inf")
+        interval_vars = list(handles["all_intervals_flat"].values())
+        sorted_vars = sorted(interval_vars, key=lambda v: (get_start_time(v), v.name))
+        var_to_idx = {var: idx for idx, var in enumerate(sorted_vars)}
+        return var_to_idx, len(var_to_idx)
+
+    def get_start_time(var):
+        var_sol = sp.get_var_solution(var)
+        if var_sol is not None and var_sol.is_present():
+            return var_sol.get_start()
+        # Push absent variables to the very top (or bottom) of the y-axis
+        return float("inf")
+
+    # 1. Filter only interval variables
+    interval_vars = [
+        var for var in mdl.get_all_variables() if "Interval" in var.type.name
+    ]
+
+    # 2. Sort chronologically by start time in the warmstart (sp),
+    # using the variable name as a secondary tie-breaker for stability.
+    sorted_vars = sorted(interval_vars, key=lambda v: (get_start_time(v), v.get_name()))
+
+    # 3. Create the mapping based on the sorted order
+    var_to_idx = {var: idx for idx, var in enumerate(sorted_vars)}
+    num_variables = len(var_to_idx)
+    return var_to_idx, num_variables
+
+
+def load_instance(instance_config=None, instance_folder=None):
+    if instance_folder is None and instance_config is None:
+        raise ValueError("Provide at least one non-None parameter")
+
+    if instance_folder is None:
+        instance_folder = check_if_precalculated(instance_config, with_removal=True)
+        if instance_folder is None:
             print(
-                f" - (CP NO SOLUTION) --> Incumbent stagnates at {best_result} for {stagnation_count} iterations"
+                f"Precalculating... this will take a while ({instance_config['time_limit']})"
             )
+            instance_folder = precalculate_config(instance_config)
 
-        if accept:
-            current_solution = sol
-            current_result = sol.get_objective_value()
+    elif instance_config is None:
+        with open(f"{instance_folder}/config.json", "r") as f:
+            instance_config = json.load(f)
 
-        combined_status = (
-            status if status == "Unknown" else f"{status} {improve_status}"
-        )
-        iter_statuses[combined_status] += 1
-
-    mth_time = time.perf_counter() - t_matheur
-    if best_solution:
-        print(
-            f"CP Solve Status: status: {'A solution' if isinstance(best_solution, CpoModelSolution) else best_solution.get_solve_status()}"
-        )
-        with open(f"{path}/matheur_sol.txt", "w+") as f, redirect_stdout(f):
-            extract_and_print_solution(best_solution, handles)
-
-        if plot_schedule:
-            print("Exporting visualization...")
-            fig = plot_schedule(best_solution, handles)
-            html_file = f"{path}/CP-RDI-Matheur_solution.html"
-            write_html(fig, html_file)
-            print(f"\nWrote visualization to {html_file}")
+    if "experiments" not in os.listdir(instance_folder):
+        raise ValueError("Provided instance folder is incomplete")
     else:
-        print("No solution found by Matheuristic CP.")
+        instance = Instance.from_pickle(f"{instance_folder}/instance.pkl")
 
-    print(f"Matheuristic total time: {mth_time:.4f}s")
+    with open(f"{instance_folder}/heuristic_solution.pkl", "rb") as f:
+        heur_sol = pickle.load(f)
 
-# ========== STANDALONE CP LOGS ==========
-with redirect_stdout(Tee(sys.stdout, cp_log)):
-    print("=" * 60)
-    print("STANDALONE CP SOLVER")
-    print("=" * 60)
+    with open(f"{instance_folder}/cp_intermediate_records.pkl", "rb") as f:
+        cp_records = pickle.load(f)
+    return instance, heur_sol, cp_records, instance_folder, instance_config
 
-    # Run normal warmstared CP with the same warmstart with the same time it took the matheuristic
-    mdl, handles = build_model(
+
+def prepare_model_docplex(config, instance, heur_sol):
+
+    mdl, handles = docplex_model.build_model(
         instance,
         rt_return=instance.rt_ret,
         add_symmetry_breaking=config["symmetry_breaking"],
         horizon=config["horizon"],
         move_cap=config["movecap"],
     )
-
-    # Add history collection listener
-    history_listener = ProgressCollector()
-    mdl.add_solver_listener(history_listener)
-
-    mdl.set_starting_point(sp)
-    print(f"Solving CP Model with {mth_time}s time limit...")
-    sol_cp = mdl.solve(
-        TimeLimit=mth_time,
-        LogVerbosity="Verbose",
-        log_output=cp_log,  # CP logs go directly to the CP log file
-        solve_with_search_next=True,
+    starting_point = docplex_model.inject_warmstart(
+        heur_sol, heur_sol.pick_events, mdl, handles
     )
-    cp_log.flush()
-
-    # Read the log text directly from the file on disk
-    with open(f"{path}/cp_log.txt", "r") as f:
-        log_text_file = f.read()
-
-    match = re.search(r"Log search space\s*:\s*([\d\.]+)", log_text_file)
-    log_search_space = float(match.group(1)) if match else None
-
-    if sol_cp:
-        print(f"CP Solve Status: {sol_cp.get_solve_status()}")
-        with open(f"{path}/cp_sol.txt", "w+") as f, redirect_stdout(f):
-            extract_and_print_solution(sol_cp, handles)
-        if plot_schedule:
-            print("Exporting visualization...")
-            fig = plot_schedule(sol_cp, handles)
-            html_file = f"{path}/CP-RDI_solution.html"
-            write_html(fig, html_file)
-            print(f"\nWrote visualization to {html_file}")
-    else:
-        print("No solution found by CP.")
-
-# ========== GENERAL LOGS (final comparison) ==========
-with redirect_stdout(Tee(sys.stdout, general_log)):
-    print("=" * 60)
-    print("FINAL COMPARISON")
-    print("=" * 60)
-    print(f"Matheuristic | {best_result} vs {sol_cp.get_objective_value()} | Normal CP")
-
-# Close log files
-general_log.close()
-matheur_log.close()
-cp_log.close()
-
-import matplotlib.pyplot as plt
-from matplotlib import ticker
-
-plt.figure()
-it = range(1, MAX_ITER + 1)
-cp_time_ticks = [r["time"] for r in history_listener.records] + [mth_time]
-cp_best_makespans = [r["best"] for r in history_listener.records] + [
-    sol_cp.get_objective_value()
-]
-
-plt.plot(time_ticks, curr_makespans, color="orange", label="Current solution")
-plt.plot(time_ticks, best_makespans, color="blue", label="Best solution")
-plt.plot(cp_time_ticks, cp_best_makespans, color="black")
-
-# plt.axhline(
-#     y=heur_sol.makespan, color="grey", linestyle="-.", label="Heuristic solution"
-# )
-# plt.axhline(
-# y=sol_cp.get_objective_value(), color="black", linestyle="-", label="CP solution"
-# )
-
-for s in stagnation_increases:
-    # plot time of increases , label="Severity increase"
-    plt.axvline(x=s[1], color="orchid", linestyle=":")
-
-for i, t in zip(it, time_ticks):
-    if i % 20 == 0:  # , label="LNS Iter"
-        plt.axvline(x=t, color="palegreen", linestyle=":")
-plt.title("Warmstarted Matheuristic performance vs Warmstarted CP")
-plt.xlabel("Solve time")
-plt.gca().xaxis.set_major_formatter(ticker.FormatStrFormatter("%d s"))
-plt.ylabel("Makespan")
-plt.legend(loc="upper left")
+    return mdl, handles, starting_point
 
 
-plt.savefig(
-    f"{path}/matheuristic_vs_wscp.svg",
-    format="svg",
-    bbox_inches="tight",
-)
+def prepare_model_ortools(config, instance, heur_sol):
+    mdl, handles = ortools_model.build_model(
+        instance,
+        rt_return=instance.rt_ret,
+        add_symmetry_breaking=config["symmetry_breaking"],
+        horizon=config["horizon"],
+        move_cap=config["movecap"],
+    )
+    ortools_model.inject_warmstart(
+        heur_sol, heur_sol.pick_events, mdl, handles
+    )
+    starting_point = ORToolsSolution(mdl, handles)
+    return mdl, handles, starting_point
 
 
-plt.figure()
-plt.plot(it, search_space_sizes, color="black")
-for s in stagnation_increases:
-    # plot time of increases , label="Severity increase"
-    plt.axvline(x=s[0], color="thistle", linestyle=":")
-plt.xlabel("Iteration")
-plt.ylabel("Log Search Space Size")
-plt.title(f"LNS Search Space Size, vs full {log_search_space}")
-plt.savefig(
-    f"{path}/search_space_sizes.svg",
-    format="svg",
-    bbox_inches="tight",
-)
+class Solver:
+    def __init__(self, experiment_config, instance_config=None, instance_path=None):
+        (
+            self.instance,
+            self.heur_sol,
+            self.cp_records,
+            instance_path,
+            instance_config,
+        ) = load_instance(instance_config, instance_path)
+        self.instance_config = instance_config
+        self.vlg = VisualLogger(instance_path, instance_config, experiment_config)
+        self.severity = 1
+        self.stagnation_count = 0
+        self.experiment_config = experiment_config
+
+        for run in range(self.experiment_config["runs"]):
+            self.run_solver()
+        self.vlg.save_experiment()
+
+    def eps_greedy_acceptance(self, sol_object, solve_status=None):
+        """
+        Perform eps-greedy acceptance on incumbent solution:
+            - Always update current solution if the incumbent is strictly better
+            - Otherwise update with a fixed probability: config['eps_greedy_prob']
+
+        Handles best/current solution updates, stagnation count and logging to VLG
+        """
+
+        if self.experiment_config["backend"] == "ortools":
+            from ortools.sat.python import cp_model
+            if solve_status not in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
+                self.vlg.add_stat_to_current("statuses", Status.Unknown)
+                self.vlg.add_stat_to_current("best", self.best_result)
+                self.vlg.add_stat_to_current("current", self.current_result)
+                return
+            incumbent = sol_object.ObjectiveValue()
+        else:
+            # solver didn't find any solution
+            if sol_object is None or sol_object.get_solve_status() == "Unknown":
+                self.vlg.add_stat_to_current("statuses", Status.Unknown)
+                self.vlg.add_stat_to_current("best", self.best_result)
+                self.vlg.add_stat_to_current("current", self.current_result)
+                return
+    
+            solve_status = sol_object.get_solve_status()
+            incumbent = sol_object.get_objective_value()
+
+        if incumbent < self.current_result:
+            # result is better than current: auto-accept
+            accept = True
+
+            if incumbent < self.best_result:
+                if self.experiment_config["backend"] == "ortools":
+                    status = Status.Optimal_New_Best if solve_status == cp_model.OPTIMAL else Status.Feasible_New_Best
+                    self.best_solution = ORToolsSolution(sol_object, self.handles)
+                else:
+                    status = Status.Optimal_New_Best if solve_status == "Optimal" else Status.Feasible_New_Best
+                    self.best_solution = sol_object
+
+                # update best-so-far
+                self.best_result = incumbent
+            else:
+                if self.experiment_config["backend"] == "ortools":
+                    status = Status.Optimal_Improve if solve_status == cp_model.OPTIMAL else Status.Feasible_Improve
+                else:
+                    status = Status.Optimal_Improve if solve_status == "Optimal" else Status.Feasible_Improve
+        else:
+            # result is worse or equal to current: use eps
+            accept = random.random() < self.experiment_config["eps_greedy_prob"]
+
+            if incumbent > self.current_result + 1e-6:
+                # it shouldn't be possible to get a worse result if the solver achieved optimum
+                if self.experiment_config["backend"] != "ortools":
+                    assert solve_status == "Feasible"
+                status = Status.Feasible_Degradation
+
+            elif incumbent >= self.current_result:
+                if self.experiment_config["backend"] == "ortools":
+                    status = Status.Optimal_No_Improve if solve_status == cp_model.OPTIMAL else Status.Feasible_No_Improve
+                else:
+                    status = Status.Optimal_No_Improve if solve_status == "Optimal" else Status.Feasible_No_Improve
+
+        # increase stagnation count if solver achieved optimum but stagnated
+        if status in [
+            Status.Optimal_No_Improve,
+            Status.Optimal_Improve,
+        ]:
+            self.stagnation_count += 1
+        # reset stagnation count if new best was achieved
+        elif status in [Status.Optimal_New_Best, Status.Feasible_New_Best]:
+            self.stagnation_count = 0
+
+        # eps greedy acceptance
+        if accept:
+            self.current_result = incumbent
+            if self.experiment_config["backend"] == "ortools":
+                self.current_solution = ORToolsSolution(sol_object, self.handles)
+            else:
+                self.current_solution = sol_object
+
+        # log current results and status
+        self.vlg.add_stat_to_current("statuses", status)
+        self.vlg.add_stat_to_current("best", self.best_result)
+        self.vlg.add_stat_to_current("current", self.current_result)
+
+        return status
+
+    def get_freeze_sets(self, to_optimize, old_freeze_constraints, strategy_results):
+        if self.experiment_config["delta_freezing"]:
+            to_add, to_remove = self.freeze_manager.apply_delta_freezing(
+                self.current_solution, to_optimize, self.handles.get("all_intervals_flat")
+            )
+            freeze_constraints = self.freeze_manager.active_constraints
+            logger.info(
+                f"Delta Freezing: +{len(to_add)} constraints, -{len(to_remove)} constraints. Frozen: {len(freeze_constraints)}"
+            )
+        else:
+            to_add = generate_freeze_constraints(
+                self.mdl,
+                self.current_solution,
+                self.handles,
+                strategy_results,
+            )
+            to_remove = old_freeze_constraints
+            freeze_constraints = to_add
+        return to_add, to_remove, freeze_constraints
+
+    def get_starting_point(self, to_optimize):
+        if self.experiment_config["backend"] == "ortools":
+            return None
+            
+        if self.experiment_config["starting_point_for_frozen"]:
+            starting_point = self.current_solution
+            if isinstance(self.current_solution, CpoSolveResult):
+                starting_point = starting_point.get_solution()
+        else:
+            starting_point = create_partial_starting_point(
+                self.mdl, self.current_solution, to_optimize
+            )
+        return starting_point
+
+    def run_solver(self):
+        # run reset logic
+        if self.experiment_config["backend"] == "ortools":
+            self.mdl, self.handles, sp = prepare_model_ortools(
+                self.instance_config, self.instance, self.heur_sol
+            )
+        elif self.experiment_config["backend"] == "docplex":
+            self.mdl, self.handles, sp = prepare_model_docplex(
+                self.instance_config, self.instance, self.heur_sol
+            )
+
+        if self.experiment_config["delta_freezing"]:
+            self.freeze_manager = FreezeManager(self.mdl, self.experiment_config["backend"], self.instance_config["horizon"])
+
+        strategies = [
+            lambda sev: (
+                strategy_random_orders(
+                    self.handles, self.current_solution, p=0.1 * sev
+                ),
+                "random_orders",
+            ),
+            lambda sev: (
+                strategy_random_skus(self.handles, self.current_solution, p=0.1 * sev),
+                "random_skus",
+            ),
+            lambda sev: (
+                combine_strategies(
+                    strategy_random_orders(
+                        self.handles, self.current_solution, p=0.05 * sev
+                    ),
+                    strategy_random_skus(
+                        self.handles, self.current_solution, p=0.05 * sev
+                    ),
+                ),
+                "random_orders_and_skus",
+            ),
+            lambda sev: (
+                strategy_random_lanes(self.handles, self.current_solution, 1),
+                "random_lanes",
+            ),
+            lambda sev: (
+                strategy_single_timeslice(
+                    self.handles, self.current_solution, 100 * sev
+                ),
+                "single_timeslice",
+            ),
+            lambda sev: (
+                strategy_multi_timeslice(
+                    self.handles, self.current_solution, 2, 100 * sev
+                ),
+                "double_timeslice",
+            ),
+            lambda sev: (
+                strategy_multi_timeslice(
+                    self.handles, self.current_solution, 3, 100 * sev
+                ),
+                "triple_timeslice",
+            ),
+        ]
+
+        # prepare variable index sorted look-up for unfrozen set logging
+        var_to_idx, num_variables = sort_variables(self.mdl, sp, self.experiment_config["backend"], self.handles)
+
+        self.severity = 1
+        self.stagnation_count = 0
+        self.best_result = self.heur_sol.makespan
+        self.best_solution = sp
+        self.current_solution = self.best_solution
+        self.current_result = self.best_result
+        old_freeze_constraints = []
+        lg = LoguruStream()
+        # start iterations
+        self.vlg.log_run_start(num_variables, var_to_idx, sp)
+        for i in range(self.experiment_config["iters"]):
+            self.vlg.log_iteration_start(i)
+            if self.stagnation_count >= self.experiment_config["stagnation_th"]:
+                self.severity += self.experiment_config["severity_step"]
+                self.vlg.add_stat_to_current("severity_increases", 1)
+                self.stagnation_count = 0
+
+            self.vlg.time_from_here()
+            strat_idx = random.randint(0, len(strategies) - 1)
+            strategy_results, strat_name = strategies[strat_idx](self.severity)
+            self.vlg.log_strategy(strat_name, strat_idx)
+
+            # prepare model for next solve (OR-Tools only, must happen before get_optimized_set)
+            if self.experiment_config["backend"] == "ortools":
+                # For OR-Tools, rebuild the model from scratch to avoid protobuf corruption
+                import ortools_cp_model
+                horizon_val = self.instance_config.get("horizon", 0)
+                self.mdl, self.handles = ortools_cp_model.build_model(
+                    self.instance, 
+                    rt_return=self.instance.rt_ret,
+                    add_symmetry_breaking=not self.instance_config.get("no_symmetry_breaking", False),
+                    horizon=horizon_val,
+                    move_cap=self.instance_config.get("movecap", None)
+                )
+                
+                # We need to recreate the FreezeManager because it holds a reference to the old model
+                self.freeze_manager = FreezeManager(self.mdl, backend="ortools", horizon=horizon_val)
+
+            # create to_optimize set with graph traversal
+            to_optimize = get_optimized_set(
+                self.handles, self.current_solution, strategy_results
+            )
+
+            # generate freeze constraints from the to_optimize set
+            to_add, to_remove, freeze_constraints = self.get_freeze_sets(
+                to_optimize, old_freeze_constraints, strategy_results
+            )
+
+            self.vlg.add_stat_to_current(
+                "constr_generate_time", self.vlg.time_diff_with_overwrite()
+            )
+
+            # create starting point for the next iteration
+            starting_point = self.get_starting_point(to_optimize)
+
+            if self.experiment_config["backend"] == "ortools":
+                # Apply freeze sets as constraints directly to the new model
+                self.freeze_manager.apply_delta_freezing(
+                    self.current_solution, to_optimize, self.handles["all_intervals_flat"]
+                )
+
+                apply_partial_starting_point(self.mdl, self.current_solution, to_optimize)
+                self.vlg.log_freeze_constr(to_optimize, var_to_idx, strat_idx)
+
+                self.vlg.time_from_here()
+                if not hasattr(self, 'solver'):
+                    from ortools.sat.python import cp_model
+                    self.solver = cp_model.CpSolver()
+                    self.solver.parameters.max_time_in_seconds = self.experiment_config["iter_time_limit"]
+                
+                status = self.solver.Solve(self.mdl)
+                self.vlg.log_solve_time(self.solver, status)
+                self.eps_greedy_acceptance(self.solver, status)
+            elif self.experiment_config["backend"] == "docplex":
+                # set iteration starting point
+                self.mdl.set_starting_point(starting_point)
+                # add and remove freeze constraints
+                self.mdl.remove(to_remove)
+                self.mdl.add(to_add)
+                old_freeze_constraints = freeze_constraints
+                self.vlg.log_freeze_constr(to_optimize, var_to_idx, strat_idx)
+
+                # run solve on partially frozen model
+
+                self.vlg.time_from_here()
+                sol = self.mdl.solve(
+                    TimeLimit=self.experiment_config["iter_time_limit"],
+                    LogVerbosity="Quiet",
+                    # LogVerbosity="Verbose",
+                    # log_output=lg,
+                )
+                self.vlg.log_solve_time(sol)
+
+            # run eps-greedy acceptance (already done for ortools)
+            if self.experiment_config["backend"] == "docplex":
+                self.eps_greedy_acceptance(sol)
+
+            # log iteration end in VisualLogger
+            self.vlg.log_iteration()
+
+        # End of LNS loop: Validate the best solution found
+        logger.info("Converting best solution for validation...")
+        final_solution = cp_sol_to_solution(self.best_solution, self.handles)
+        
+        logger.info("Validating final solution...")
+        try:
+            violations = validate_solution(
+                final_solution, 
+                self.instance, 
+                horizon=self.instance_config["horizon"], 
+                move_cap=self.instance_config["movecap"]
+            )
+        except KeyError:
+            logger.error("Config doesn't have horizon or movecap field.")
+
+        if violations:
+            logger.error(f"Validation FAILED! {len(violations)} violations found:")
+            for v in violations[:10]:
+                logger.error(f" - {v}")
+        else:
+            logger.info("Validation PASSED successfully.")
+
+        self.vlg.log_run_end(self.best_solution, self.handles)
 
 
-plt.figure()
-
-bars = plt.bar(iter_statuses.keys(), iter_statuses.values())
-plt.yscale("log")
-
-plt.xticks(rotation=45, ha="right")
-
-total_iters = sum(iter_statuses.values())
-for bar in bars:
-    height = bar.get_height()
-    pct = (height / total_iters) * 100
-    plt.annotate(
-        f"{pct:.1f}%",
-        xy=(bar.get_x() + bar.get_width() / 2, height),
-        xytext=(0, 3),  # 3 pt vertical offset
-        textcoords="offset points",
-        ha="center",
-        va="bottom",
-        fontsize=9,
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run matheuristic experiments.")
+    parser.add_argument(
+        "instance_name",
+        type=str,
+        help="Name of the precalculated instance folder under precalculated_instances/",
     )
 
-plt.title("Iteration Results With Logarithmic Y-Axis")
-plt.ylabel("Count (log scale)")
-plt.savefig(
-    f"{path}/iteration_results.svg",
-    format="svg",
-    bbox_inches="tight",
-)
-plt.figure()
-iter_durations = np.diff(time_ticks)
-
-# 1. Compute histogram counts and bin edges
-counts, bin_edges, patches = plt.hist(
-    iter_durations,
-    bins=12,
-    range=(0, 1.2 * config["iter_time_limit"]),
-    log=True,
-)
-
-# 2. Fix log clipping so counts >= 1 are fully visible
-plt.ylim(bottom=0.8)
-
-# 3. Annotate percentages above bars
-total_durations = len(iter_durations)
-for count, patch in zip(counts, patches):
-    if count > 0:
-        pct = (count / total_durations) * 100
-        height = patch.get_height()
-        plt.annotate(
-            f"{pct:.1f}%",
-            xy=(patch.get_x() + patch.get_width() / 2, height),
-            xytext=(0, 3),
-            textcoords="offset points",
-            ha="center",
-            va="bottom",
-            fontsize=8,
-        )
-
-# 4. Format X-axis and labels
-plt.gca().xaxis.set_major_formatter(ticker.FormatStrFormatter("%g s"))
-plt.xlabel("Duration (seconds)")
-plt.ylabel("Frequency (log scale)")
-plt.title("Iteration Durations With Logarithmic Y-Axis")
-
-plt.tight_layout()
-plt.savefig(
-    f"{path}/iteration_durations.svg",
-    format="svg",
-    bbox_inches="tight",
-)
-
-# 5. Build and save the JSON table
-histogram_data = []
-for i in range(len(counts)):
-    histogram_data.append(
-        {
-            "bin_index": i,
-            "bin_start_sec": float(bin_edges[i]),
-            "bin_end_sec": float(bin_edges[i + 1]),
-            "count": int(counts[i]),
-            "percentage": round(float((counts[i] / total_durations) * 100), 2),
-        }
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default="docplex",
+        help="Optimizer for the reparing CP model. Options: docplex, ortools",
     )
 
-with open(f"{path}/iteration_durations_bins.json", "w") as f:
-    json.dump(
-        {"histogram": histogram_data, "durations": list(iter_durations)}, f, indent=4
+    parser.add_argument(
+        "--runs",
+        type=int,
+        default=10,
+        help="Number of runs (default: 10)",
+    )
+    parser.add_argument(
+        "--iters",
+        type=int,
+        default=300,
+        help="Number of iterations per run (default: 300)",
+    )
+    parser.add_argument(
+        "--stagnation-th",
+        type=int,
+        default=50,
+        dest="stagnation_th",
+        help="Stagnation threshold (default: 50)",
+    )
+    parser.add_argument(
+        "--severity-step",
+        type=int,
+        default=1,
+        dest="severity_step",
+        help="Severity increment step (default: 1)",
+    )
+    parser.add_argument(
+        "--iter-time-limit",
+        type=float,
+        default=2.0,
+        dest="iter_time_limit",
+        help="Per-iteration time limit in seconds (default: 2.0)",
+    )
+
+    parser.add_argument(
+        "--delta-freezing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        dest="delta_freezing",
+        help="Use delta freezing for updating the freeze constraints (default: True)",
+    )
+
+    parser.add_argument(
+        "--starting-point-for-frozen",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        dest="starting_point_for_frozen",
+        help="Initialize the starting point for frozen variables too (default: True)",
+    )
+
+    parser.add_argument(
+        "--eps-greedy-prob",
+        type=float,
+        default=0.2,
+        dest="eps_greedy_prob",
+        help="Epsilon-greedy acceptance probability (default: 0.2)",
+    )
+    args = parser.parse_args()
+
+    experiment_config = {
+        "runs": args.runs,
+        "iters": args.iters,
+        "stagnation_th": args.stagnation_th,
+        "severity_step": args.severity_step,
+        "iter_time_limit": args.iter_time_limit,
+        "delta_freezing": args.delta_freezing,
+        "starting_point_for_frozen": args.starting_point_for_frozen,
+        "eps_greedy_prob": args.eps_greedy_prob,
+        "backend": args.backend,
+    }
+    solver = Solver(
+        experiment_config,
+        instance_path=f"precalculated_instances/{args.instance_name}",
     )
