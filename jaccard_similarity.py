@@ -6,8 +6,8 @@ from collections import defaultdict
 
 
 def compute_demand_count(
-        orders_req: dict[int, list[int]],
-        K: list[int],
+    orders_req: dict[int, list[int]],
+    K: list[int],
 ) -> dict[int, int]:
     """Count how many orders need each SKU."""
     count: dict[int, int] = defaultdict(int)
@@ -17,12 +17,13 @@ def compute_demand_count(
     return dict(count)
 
 
-
 def compute_jaccard_weighted_and_unweighted(
-        o1: int, o2: int,
-        orders_req: dict[int, list[int]],
-        rt: dict[int, int],
-        rt_ret: dict[int, int],
+    o1: int,
+    o2: int,
+    orders_req: dict[int, list[int]],
+    rt: dict[int, int],
+    rt_ret: dict[int, int],
+    normalize: bool = True,
 ) -> float:
     """Retrieval-time-weighted Jaccard similarity between two orders.
 
@@ -36,20 +37,32 @@ def compute_jaccard_weighted_and_unweighted(
     intersection = set1 & set2
     union = set1 | set2
 
-    unweighted_jaccard = len(intersection) / len(union) if len(union) > 0 else 0.0
+    if len(union) > 0:
+        unweighted_jaccard = (
+            len(intersection) / len(union) if normalize else len(intersection)
+        )
+    else:
+        unweighted_jaccard = 0.0
 
     union_weight = sum(rt[k] + rt_ret[k] for k in union)
-    if union_weight == 0:
-        return 0.0
     intersection_weight = sum(rt[k] + rt_ret[k] for k in intersection)
-    return intersection_weight / union_weight, unweighted_jaccard
+
+    if union_weight > 0:
+        weighted_jaccard = (
+            intersection_weight / union_weight if normalize else intersection_weight
+        )
+    else:
+        weighted_jaccard = 0.0
+
+    return weighted_jaccard, unweighted_jaccard
 
 
 def build_similarity_matrix(
-        O: list[int],
-        orders_req: dict[int, list[int]],
-        rt: dict[int, int],
-        rt_ret: dict[int, int],
+    O: list[int],
+    orders_req: dict[int, list[int]],
+    rt: dict[int, int],
+    rt_ret: dict[int, int],
+    normalize: bool = True,
 ) -> dict[tuple[int, int], float]:
     """Compute pairwise weighted Jaccard for all order pairs (upper triangle).
 
@@ -57,15 +70,19 @@ def build_similarity_matrix(
     """
     sim_weighted: dict[tuple[int, int], float] = {}
     sim_unweighted: dict[tuple[int, int], float] = {}
-    
+
     for i in range(len(O)):
         for j in range(i + 1, len(O)):
             o1, o2 = O[i], O[j]
             key = (o1, o2) if o1 < o2 else (o2, o1)
-            sim_weighted[key], sim_unweighted[key] = compute_jaccard_weighted_and_unweighted(o1, o2, orders_req, rt, rt_ret)
+            sim_weighted[key], sim_unweighted[key] = (
+                compute_jaccard_weighted_and_unweighted(
+                    o1, o2, orders_req, rt, rt_ret, normalize=normalize
+                )
+            )
     return sim_weighted, sim_unweighted
 
 
 # ============================================================
-# 
+#
 # ============================================================

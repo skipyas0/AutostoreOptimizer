@@ -6,13 +6,12 @@ This is a wrapper around heuristic_ama_sgc.py that defaults the mode
 to "two_phase" (28 runs) instead of "full_grid" (192 runs).
 """
 
-from heuristic_ama_sgc import run_ama_sgc
-import time
-from instance import Instance
-from datagen import generate_data
 import argparse
+import time
 
 from autostore_heuristic import validate_solution
+from datagen import generate_data
+from heuristic_ama_sgc import run_ama_sgc
 
 
 def solve_heuristic_instance(config: dict, return_raw: bool = False):
@@ -44,6 +43,7 @@ def solve_heuristic_instance(config: dict, return_raw: bool = False):
         num_skus=num_skus,
         seed=seed,
         pick_touch_time=pick_touch_time,
+        movecap=move_cap,
     )
     S, L, K, orders_req, rt, p, N = instance
     O = instance.O
@@ -51,14 +51,15 @@ def solve_heuristic_instance(config: dict, return_raw: bool = False):
     t0 = time.perf_counter()
     sol, best_config, all_runs = run_ama_sgc(
         instance,
-        horizon=horizon, move_cap=move_cap, ALPHA=alpha, BETA=beta,
+        horizon=horizon,
+        move_cap=move_cap,
+        ALPHA=alpha,
+        BETA=beta,
         mode=mode,
     )
     elapsed = time.perf_counter() - t0
     status = "Feasible" if sol.feasible else "Infeasible"
-    violations = validate_solution(
-        sol, instance, horizon=horizon, move_cap=move_cap
-    )
+    violations = validate_solution(sol, instance, horizon=horizon, move_cap=move_cap)
     if violations:
         print(f"VALIDATION FAILED ({len(violations)} violations)")
         status = "Invalid"
@@ -97,11 +98,17 @@ def main() -> None:
     ap.add_argument("--alpha", type=float, default=1.0)
     ap.add_argument("--beta", type=float, default=0.0)
     ap.add_argument(
-        "--mode", choices=["full_grid", "two_phase"], default="two_phase",
+        "--mode",
+        choices=["full_grid", "two_phase"],
+        default="two_phase",
         help="full_grid: 192 runs; two_phase: 28 runs (faster, may miss interactions)",
     )
-    ap.add_argument("--verbose", action="store_true", help="Print winning attribute combination")
-    ap.add_argument("--no_vis", action="store_true", help="Skip HTML schedule visualisation")
+    ap.add_argument(
+        "--verbose", action="store_true", help="Print winning attribute combination"
+    )
+    ap.add_argument(
+        "--no_vis", action="store_true", help="Skip HTML schedule visualisation"
+    )
     args = ap.parse_args()
 
     print("Generating data...")
@@ -112,25 +119,36 @@ def main() -> None:
         num_skus=args.skus,
         seed=args.seed,
         pick_touch_time=args.pick,
+        movecap=args.movecap,
     )
     S, L, K, orders_req, rt, p, N = instance
     O = instance.O
 
-    print(f"Stations={len(S)}, Lanes={len(L)}, SKUs={len(K)}, Orders={len(O)}, RobotLimit={args.movecap}\n")
+    print(
+        f"Stations={len(S)}, Lanes={len(L)}, SKUs={len(K)}, Orders={len(O)}, RobotLimit={args.movecap}\n"
+    )
 
-    print(f"\nRunning AMA-SGC heuristic (alpha={args.alpha}, beta={args.beta}, mode={args.mode})...")
+    print(
+        f"\nRunning AMA-SGC heuristic (alpha={args.alpha}, beta={args.beta}, mode={args.mode})..."
+    )
     t0 = time.perf_counter()
     sol, best_config, all_runs = run_ama_sgc(
         instance,
-        horizon=args.horizon, move_cap=args.movecap,
-        ALPHA=args.alpha, BETA=args.beta,
-        mode=args.mode, verbose=True,
+        horizon=args.horizon,
+        move_cap=args.movecap,
+        ALPHA=args.alpha,
+        BETA=args.beta,
+        mode=args.mode,
+        verbose=True,
     )
     elapsed = time.perf_counter() - t0
 
     oa, od, ba, bd = best_config
-    def dir_str(d): return "desc" if d else "asc"
-    print(f"\n=== AMA-SGC Result ===")
+
+    def dir_str(d):
+        return "desc" if d else "asc"
+
+    print("\n=== AMA-SGC Result ===")
     print(f"Feasible:    {sol.feasible}")
     print(f"Makespan:    {sol.makespan}")
     print(f"Total bin events (moves/2): {sol.total_moves // 2}")
@@ -146,14 +164,13 @@ def main() -> None:
             print(f"  Violation: {v}")
     else:
         print("Validation PASSED")
-    
+
     if not args.no_vis:
         try:
-            from schedule_visualizer import plot_schedule
             from autostore_heuristic import build_viz_handles
-            mock_sol, handles = build_viz_handles(
-                sol, instance
-            )
+            from schedule_visualizer import plot_schedule
+
+            mock_sol, handles = build_viz_handles(sol, instance)
             plot_schedule(mock_sol, handles)
         except Exception as exc:
             print(f"[VIS] Skipped: {exc}")

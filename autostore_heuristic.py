@@ -565,15 +565,15 @@ def init_state(
 def run_sgc(instance, *args, **kwargs) -> Solution:
     """Run the Simple Greedy Constructive heuristic. [P1-7]"""
     if not isinstance(instance, Instance):
-        raise ValueError
+        raise ValueError("No instance found")
     else:
         horizon = kwargs.get("horizon", args[0] if len(args) > 0 else 10000)
-        move_cap = kwargs.get("move_cap", args[1] if len(args) > 1 else None)
         ALPHA = kwargs.get("ALPHA", args[2] if len(args) > 2 else 1.0)
         BETA = kwargs.get("BETA", args[3] if len(args) > 3 else 0.0)
         rt_ret = kwargs.get("rt_ret", args[4] if len(args) > 4 else None)
 
     S, L, K, orders_req, rt, p, N = instance
+    move_cap = instance.movecap
     O = instance.O
     if "rt_ret" not in locals() or rt_ret is None:
         rt_ret = instance.rt_ret
@@ -848,28 +848,18 @@ def solve_heuristic_instance(config: dict, return_raw: bool = False):
     alpha = config.get("alpha", 1.0)
     beta = config.get("beta", 0.0)
 
-    S, L, K, orders_req, rt, p, N = generate_data(
+    instance = generate_data(
         num_stations=num_stations,
         lanes_per_station=lanes_per_station,
         num_orders=num_orders,
         num_skus=num_skus,
         seed=seed,
         pick_touch_time=pick_touch_time,
+        movecap=move_cap,
     )
-    rt_ret = dict(rt)
-    O = sorted(orders_req.keys())
-
     t0 = time.perf_counter()
     sol = run_sgc(
-        S,
-        L,
-        K,
-        O,
-        orders_req,
-        rt,
-        rt_ret,
-        p,
-        N,
+        instance,
         horizon=horizon,
         move_cap=move_cap,
         ALPHA=alpha,
@@ -898,7 +888,7 @@ def validate_solution(
 ) -> list[str]:
     """Validate a heuristic solution. Returns list of violation strings (empty = valid)."""
     if not isinstance(instance, Instance):
-        raise ValueError
+        raise ValueError("No instance found")
     else:
         horizon = kwargs.get("horizon", args[0] if len(args) > 0 else 10000)
         move_cap = kwargs.get("move_cap", args[1] if len(args) > 1 else None)
@@ -1061,7 +1051,6 @@ def main():
     args = ap.parse_args()
 
     print("Generating data...")
-    print("Generating data...")
     instance = generate_data(
         num_stations=args.stations,
         lanes_per_station=args.lanes,
@@ -1069,6 +1058,7 @@ def main():
         num_skus=args.skus,
         seed=args.seed,
         pick_touch_time=args.pick,
+        movecap=args.movecap,
     )
     S, L, K, orders_req, rt, p, N = instance
     O = instance.O

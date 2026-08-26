@@ -10,7 +10,6 @@ Mirrors variable names from the CP model (cp_model.py).
 import os
 import sys
 from collections import defaultdict
-from typing import Optional
 
 from autostore_heuristic import (
     BinEvent,
@@ -152,7 +151,7 @@ def plan_order_at_station_parameterised(
     sku_attrs: dict[int, dict],
     bin_attr_key: str,
     bin_descending: bool,
-) -> Optional[OrderPlan]:
+) -> OrderPlan | None:
     """Tentatively schedule order o at station s with parameterised bin-fetch ordering.
 
     Identical to plan_order_at_station in autostore_heuristic.py except the
@@ -325,7 +324,7 @@ def run_sgc_parameterised(instance, *args, **kwargs) -> Solution:
     failed_orders: list[int] = []
 
     for o in sorted_orders:
-        best_plan: Optional[OrderPlan] = None
+        best_plan: OrderPlan | None = None
 
         for s in S:
             plan = plan_order_at_station_parameterised(
@@ -449,7 +448,7 @@ def run_ama_sgc(
 
     order_attrs, sku_attrs = precompute_attributes(instance, rt_ret=rt_ret)
 
-    best_sol: Optional[Solution] = None
+    best_sol: Solution | None = None
     best_obj = float("inf")
     best_config: tuple[str, bool, str, bool] = ("sharing_degree", False, "demand", True)
     all_runs: list[dict] = []
@@ -621,6 +620,7 @@ def solve_heuristic_instance(config: dict, return_raw: bool = False):
         num_skus=num_skus,
         seed=seed,
         pick_touch_time=pick_touch_time,
+        movecap=move_cap,
     )
     S, L, K, orders_req, rt, p, N = instance
     O = instance.O

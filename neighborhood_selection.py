@@ -20,6 +20,7 @@ def strategy_random_orders(handles, solution, k=None, p=None) -> SelectionResult
     if k is not None:
         n_select = min(k, num_orders)
     elif p is not None:
+        p = min(1.0, p)
         n_select = max(1, int(num_orders * p))
     else:
         n_select = max(1, int(num_orders * 0.1))
@@ -34,6 +35,7 @@ def strategy_random_skus(handles, solution, k=None, p=None) -> SelectionResult:
     if k is not None:
         n_select = min(k, num_skus)
     elif p is not None:
+        p = min(1.0, p)
         n_select = max(1, int(num_skus * p))
     else:
         n_select = max(1, int(num_skus * 0.1))

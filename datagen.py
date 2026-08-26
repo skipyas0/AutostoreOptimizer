@@ -35,20 +35,20 @@ Sources:
 
 import math
 import random
-from typing import Dict, List, Optional, Tuple
-from instance import Instance
 
+from instance import Instance
 
 # ---------------------------------------------------------------------------
 # Helper: Zipf distribution weights
 # ---------------------------------------------------------------------------
 
-def _zipf_weights(num_skus: int, exponent: float) -> List[float]:
+
+def _zipf_weights(num_skus: int, exponent: float) -> list[float]:
     """Return unnormalised Zipf weights for ranks 1..num_skus."""
-    return [1.0 / (rank ** exponent) for rank in range(1, num_skus + 1)]
+    return [1.0 / (rank**exponent) for rank in range(1, num_skus + 1)]
 
 
-def _normalise(weights: List[float]) -> List[float]:
+def _normalise(weights: list[float]) -> list[float]:
     """Normalise a weight vector to sum to 1."""
     total = sum(weights)
     return [w / total for w in weights]
@@ -58,12 +58,13 @@ def _normalise(weights: List[float]) -> List[float]:
 # Helper: weighted sampling without replacement
 # ---------------------------------------------------------------------------
 
+
 def _weighted_sample_without_replacement(
-    population: List[int],
-    weights: List[float],
+    population: list[int],
+    weights: list[float],
     k: int,
     rng: random.Random,
-) -> List[int]:
+) -> list[int]:
     """Draw k distinct items from population with given weights (no replacement).
 
     Uses Efraimidis-Spirakis algorithm: assign key = u^(1/w) to each item,
@@ -86,6 +87,7 @@ def _weighted_sample_without_replacement(
 # ---------------------------------------------------------------------------
 # Order-size distributions
 # ---------------------------------------------------------------------------
+
 
 def _sample_order_size_lognormal(
     rng: random.Random,
@@ -155,6 +157,7 @@ def _sample_order_size_negative_binomial(
 # Retrieval-time model
 # ---------------------------------------------------------------------------
 
+
 def _retrieval_time_depth_based(
     popularity_rank: int,
     num_skus: int,
@@ -162,7 +165,7 @@ def _retrieval_time_depth_based(
     grid_depth: int = 16,
     base_time_sec: float = 5.0,
     dig_time_per_level_sec: float = 8.5,
-    travel_time_range: Tuple[float, float] = (2.0, 12.0),
+    travel_time_range: tuple[float, float] = (2.0, 12.0),
 ) -> int:
     """Compute retrieval time based on expected bin depth and horizontal travel.
 
@@ -187,7 +190,7 @@ def _retrieval_time_depth_based(
     frac = popularity_rank / max(num_skus, 1)
 
     # Expected depth: Pareto-shaped curve
-    expected_depth = 1.0 + (grid_depth - 1) * (frac ** 0.6)
+    expected_depth = 1.0 + (grid_depth - 1) * (frac**0.6)
 
     # Add noise: actual depth varies +/- 30% around expected
     actual_depth = expected_depth * rng.uniform(0.7, 1.3)
@@ -217,6 +220,7 @@ def _retrieval_time_triangular(
 # Pick-time model
 # ---------------------------------------------------------------------------
 
+
 def _pick_time_variable(
     rng: random.Random,
     nominal: float = 4.0,
@@ -237,6 +241,7 @@ def _pick_time_variable(
 # ---------------------------------------------------------------------------
 # Bin-count model
 # ---------------------------------------------------------------------------
+
 
 def _bin_count_popularity_correlated(
     popularity_rank: int,
@@ -269,6 +274,7 @@ def _bin_count_popularity_correlated(
 # ---------------------------------------------------------------------------
 # Main generator
 # ---------------------------------------------------------------------------
+
 
 def generate_data(
     num_stations: int,
@@ -340,7 +346,6 @@ def generate_data(
     N  : dict[int, int]     -- physical bin count per SKU
     """
     rng = random.Random(seed)
-
     S = list(range(num_stations))
     L = list(range(lanes_per_station))
     K = list(range(num_skus))
@@ -428,7 +433,7 @@ def generate_data(
     # -----------------------------------------------------------------
     # 6. SKU-to-order assignment (popularity-weighted)
     # -----------------------------------------------------------------
-    orders_requirements: Dict[int, List[int]] = {}
+    orders_requirements: dict[int, list[int]] = {}
     for o in range(num_orders):
         size = sample_order_size()
         size = min(size, len(K))  # can't exceed catalogue
@@ -442,16 +447,28 @@ def generate_data(
 
         orders_requirements[o] = sorted(req)
 
-    instance = Instance(S, L, K, orders_requirements, rt, p, N, rt_ret=dict(rt), movecap=movecap, seed=seed)
+    instance = Instance(
+        S,
+        L,
+        K,
+        orders_requirements,
+        rt,
+        p,
+        N,
+        rt_ret=dict(rt),
+        movecap=movecap,
+        seed=seed,
+    )
     if verbose:
         instance.print_summary()
 
     return instance
- 
+
 
 # ---------------------------------------------------------------------------
 # Legacy wrapper: identical interface to old generate_data
 # ---------------------------------------------------------------------------
+
 
 def generate_data_legacy(
     num_stations: int,
@@ -480,11 +497,10 @@ def generate_data_legacy(
     )
 
 
-
-
 # ---------------------------------------------------------------------------
 # CLI: generate and summarise, optionally dump to JSON
 # ---------------------------------------------------------------------------
+
 
 def main():
     """CLI entry point for standalone generation and analysis."""
@@ -506,8 +522,12 @@ def main():
         choices=["lognormal", "negbin", "poisson2_to_1_6", "uniform_1_5"],
         default="lognormal",
     )
-    ap.add_argument("--skew", type=float, default=1.0,
-                    help="Zipf exponent for SKU popularity (1.0 = classic 80/20)")
+    ap.add_argument(
+        "--skew",
+        type=float,
+        default=1.0,
+        help="Zipf exponent for SKU popularity (1.0 = classic 80/20)",
+    )
     ap.add_argument(
         "--rt-model",
         choices=["depth_based", "triangular"],
@@ -524,8 +544,9 @@ def main():
         default="popularity_correlated",
     )
     ap.add_argument("--grid-depth", type=int, default=16)
-    ap.add_argument("--json", type=str, default=None,
-                    help="Path to dump the instance as JSON")
+    ap.add_argument(
+        "--json", type=str, default=None, help="Path to dump the instance as JSON"
+    )
     args = ap.parse_args()
 
     instance = generate_data(
@@ -547,7 +568,9 @@ def main():
     instance.print_summary()
     if args.json:
         data = {
-            "S": instance.S, "L": instance.L, "K": instance.K,
+            "S": instance.S,
+            "L": instance.L,
+            "K": instance.K,
             "orders_requirements": {str(k): v for k, v in instance.orders_req.items()},
             "rt": {str(k): v for k, v in instance.rt.items()},
             "p": {str(k): v for k, v in instance.p.items()},

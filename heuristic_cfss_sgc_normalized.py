@@ -245,7 +245,7 @@ def run_cfss_sgc(instance, *args, **kwargs) -> Solution:
     O = instance.O
     if rt_ret is None:
         rt_ret = instance.rt_ret
-    sim_matrix, _ = build_similarity_matrix(O, orders_req, rt, rt_ret, normalize=False)
+    sim_matrix, _ = build_similarity_matrix(O, orders_req, rt, rt_ret, normalize=True)
 
     clusters = agglomerative_cluster(
         O,
@@ -443,7 +443,6 @@ def solve_heuristic_instance(config: dict, return_raw: bool = False):
         BETA=beta,
         sim_threshold=sim_threshold,
         max_cluster_orders=max_cluster_orders,
-        movecap=move_cap,
     )
     elapsed = time.perf_counter() - t0
     status = "Feasible" if sol.feasible else "Infeasible"

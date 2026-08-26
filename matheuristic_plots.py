@@ -121,7 +121,7 @@ class VisualLogger:
 
         for var, idx in var_to_idx.items():
             self.var_names[idx] = var.name if hasattr(var, "name") else var.get_name()
-            
+
             if hasattr(sp, "BooleanValue"):
                 is_active = sp.BooleanValue(var.pres)
             else:
@@ -255,7 +255,9 @@ class VisualLogger:
         status_name = Status(status_val).name if status_val > 0 else "Unknown"
 
         logger.info(
+            f"Run {self.current_run}/{self.experiment_config['runs']} | "
             f"Iter {self.current_iteration:03d}/{self.experiment_config['iters']} | "
+            f"Current Severity: {np.sum(self.current_run_data['severity_increases'])} | "
             f"Optimized {num_optimized:06d}/{self.num_variables:06d} ({100 * num_optimized / self.num_variables:.3f})% | "
             f"Status: {status_name:22s} | "
             f"Best: {best_res:6.1f} | "
@@ -288,6 +290,7 @@ class VisualLogger:
         # --- DECOMPOSE TIMES ---
         if hasattr(sol, "WallTime"):
             from ortools.sat.python import cp_model
+
             if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
                 engine_search = sol.WallTime()
                 python_overhead = max(0.0, wall_solve_time - engine_search)
@@ -304,7 +307,7 @@ class VisualLogger:
                 engine_extraction = sol.get_info("ExtractionTime") or (
                     engine_total - engine_search
                 )
-    
+
                 # The remaining time is pure Python API overhead (Serialization, Process Spawning, I/O)
                 python_overhead = max(0.0, wall_solve_time - engine_total)
             else:

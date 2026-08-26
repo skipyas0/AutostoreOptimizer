@@ -1,15 +1,23 @@
-from collections import defaultdict
-from autostore_heuristic import find_shared_bin, earliest_feasible_fetch, BinEvent, OrderPlan, HeuristicState, Solution
 import argparse
 import time
-from autostore_heuristic import commit_plan, validate_solution, init_state
-from typing import Literal
+from collections import defaultdict
 from dataclasses import dataclass
-from typing import Optional, Dict, Set, List
+
+from autostore_heuristic import (
+    BinEvent,
+    HeuristicState,
+    OrderPlan,
+    Solution,
+    commit_plan,
+    earliest_feasible_fetch,
+    find_shared_bin,
+    init_state,
+    validate_solution,
+)
 from instance import Instance
 
 
-def build_sku_order_index(orders_req: Dict[int, List[int]]) -> Dict[int, Set[int]]:
+def build_sku_order_index(orders_req: dict[int, list[int]]) -> dict[int, set[int]]:
     idx = {}
     for o, skus in orders_req.items():
         for k in skus:
@@ -19,10 +27,10 @@ def build_sku_order_index(orders_req: Dict[int, List[int]]) -> Dict[int, Set[int
     return idx
 
 
-def compute_regret_k(station_scores: Dict[int, float], k: int) -> float:
-    feasible = sorted(s for s in station_scores.values() if s < float('inf'))
+def compute_regret_k(station_scores: dict[int, float], k: int) -> float:
+    feasible = sorted(s for s in station_scores.values() if s < float("inf"))
     if len(feasible) <= 1:
-        return float('inf')
+        return float("inf")
     best = feasible[0]
     return sum(feasible[i] - best for i in range(1, min(k, len(feasible))))
 
@@ -30,16 +38,18 @@ def compute_regret_k(station_scores: Dict[int, float], k: int) -> float:
 @dataclass
 class InsertionScores:
     order: int
-    station_scores: Dict[int, float]
-    station_plans: Dict[int, Optional[OrderPlan]]
+    station_scores: dict[int, float]
+    station_plans: dict[int, OrderPlan | None]
     best_score: float
     second_score: float
     best_station: int
-    best_plan: Optional[OrderPlan]
+    best_plan: OrderPlan | None
     regret: float
 
 
-def find_earliest_gap(intervals: List[tuple[int, int]], ready_time: int, duration: int) -> int:
+def find_earliest_gap(
+    intervals: list[tuple[int, int]], ready_time: int, duration: int
+) -> int:
     current_time = ready_time
     for start, end in intervals:
         if current_time + duration <= start:
@@ -49,24 +59,35 @@ def find_earliest_gap(intervals: List[tuple[int, int]], ready_time: int, duratio
 
 
 def gap_filling_plan_order_at_station(
-        o: int, s: int, state: HeuristicState, orders_req: Dict[int, List[int]],
-        rt: Dict[int, int], rt_ret: Dict[int, int], p: Dict[int, int],
-        N: Dict[int, int], horizon: int, ALPHA: float, BETA: float, demand_count: Dict[int, int],
-) -> Optional[OrderPlan]:
+    o: int,
+    s: int,
+    state: HeuristicState,
+    orders_req: dict[int, list[int]],
+    rt: dict[int, int],
+    rt_ret: dict[int, int],
+    p: dict[int, int],
+    N: dict[int, int],
+    horizon: int,
+    ALPHA: float,
+    BETA: float,
+    demand_count: dict[int, int],
+) -> OrderPlan | None:
     L_at_s = [ln for (ss, ln) in state.lane_free if ss == s]
     if not L_at_s:
         return None
     best_lane = min(L_at_s, key=lambda ln: state.lane_free[(s, ln)])
     t_order_start = state.lane_free[(s, best_lane)]
 
-    skus_sorted = sorted(orders_req[o], key=lambda k: demand_count.get(k, 0), reverse=True)
+    skus_sorted = sorted(
+        orders_req[o], key=lambda k: demand_count.get(k, 0), reverse=True
+    )
     t_cursor = t_order_start
 
-    new_bin_events: List[BinEvent] = []
-    shared_picks: List[tuple[int, BinEvent, int]] = []
-    pending_moves: List[tuple[int, int]] = []
-    pending_copies: Dict[int, List[tuple[int, int]]] = defaultdict(list)
-    pick_times_dict: Dict[int, tuple[int, int]] = {}
+    new_bin_events: list[BinEvent] = []
+    shared_picks: list[tuple[int, BinEvent, int]] = []
+    pending_moves: list[tuple[int, int]] = []
+    pending_copies: dict[int, list[tuple[int, int]]] = defaultdict(list)
+    pick_times_dict: dict[int, tuple[int, int]] = {}
 
     local_intervals = list(state.pickface_intervals[s])
 
@@ -96,8 +117,15 @@ def gap_filling_plan_order_at_station(
 
             try:
                 t_fetch, copy_id = earliest_feasible_fetch(
-                    k, s, desired_fetch, state, rt, rt_ret,
-                    pending_moves, pending_copies, horizon,
+                    k,
+                    s,
+                    desired_fetch,
+                    state,
+                    rt,
+                    rt_ret,
+                    pending_moves,
+                    pending_copies,
+                    horizon,
                 )
             except ValueError:
                 return None
@@ -127,7 +155,9 @@ def gap_filling_plan_order_at_station(
                     presence_end = return_start
                     if return_end > horizon:
                         return None
-                    if gap_start != find_earliest_gap(local_intervals, presence_start, presence_end - presence_start):
+                    if gap_start != find_earliest_gap(
+                        local_intervals, presence_start, presence_end - presence_start
+                    ):
                         desired_presence = presence_start + 1
                         continue
 
@@ -139,66 +169,116 @@ def gap_filling_plan_order_at_station(
         local_intervals.sort(key=lambda x: x[0])
 
         ev = BinEvent(
-            sku=k, copy_id=copy_id, fetch_start=t_fetch, fetch_end=fetch_end,
-            presence_start=presence_start, presence_end=presence_end,
-            return_start=return_start, return_end=return_end, orders_served=[o],
+            sku=k,
+            copy_id=copy_id,
+            fetch_start=t_fetch,
+            fetch_end=fetch_end,
+            presence_start=presence_start,
+            presence_end=presence_end,
+            return_start=return_start,
+            return_end=return_end,
+            orders_served=[o],
         )
         new_bin_events.append(ev)
         pending_moves.append((t_fetch, fetch_end))
         pending_moves.append((return_start, return_end))
         pending_copies[k].append((copy_id, return_end))
 
-    order_start = min((ps for ps, pe in pick_times_dict.values()), default=t_order_start)
+    order_start = min(
+        (ps for ps, pe in pick_times_dict.values()), default=t_order_start
+    )
     order_end = max((pe for ps, pe in pick_times_dict.values()), default=t_order_start)
     score = ALPHA * order_end + BETA * (order_end - order_start)
 
     return OrderPlan(
-        order=o, station=s, lane=best_lane, start=order_start, end=order_end,
-        bin_events=new_bin_events, shared_picks=shared_picks, score=score,
+        order=o,
+        station=s,
+        lane=best_lane,
+        start=order_start,
+        end=order_end,
+        bin_events=new_bin_events,
+        shared_picks=shared_picks,
+        score=score,
         pick_times=pick_times_dict,
     )
 
 
 def score_order_insertions(
-    o: int, S: List[int], state: HeuristicState,
-    orders_req: Dict[int, List[int]], rt: Dict[int, int],
-    rt_ret: Dict[int, int], p: Dict[int, int], N: Dict[int, int],
-    horizon: int, ALPHA: float, BETA: float, demand_count: Dict[int, int],
-    regret_k: int
+    o: int,
+    S: list[int],
+    state: HeuristicState,
+    orders_req: dict[int, list[int]],
+    rt: dict[int, int],
+    rt_ret: dict[int, int],
+    p: dict[int, int],
+    N: dict[int, int],
+    horizon: int,
+    ALPHA: float,
+    BETA: float,
+    demand_count: dict[int, int],
+    regret_k: int,
 ) -> InsertionScores:
     station_scores = {}
     station_plans = {}
 
     for s in S:
         plan = gap_filling_plan_order_at_station(
-            o, s, state, orders_req, rt, rt_ret, p, N, horizon, ALPHA, BETA, demand_count
+            o,
+            s,
+            state,
+            orders_req,
+            rt,
+            rt_ret,
+            p,
+            N,
+            horizon,
+            ALPHA,
+            BETA,
+            demand_count,
         )
         if plan is not None:
             station_scores[s] = plan.score
             station_plans[s] = plan
         else:
-            station_scores[s] = float('inf')
+            station_scores[s] = float("inf")
             station_plans[s] = None
 
-    feasible = sorted((score, s) for s, score in station_scores.items() if score < float('inf'))
+    feasible = sorted(
+        (score, s) for s, score in station_scores.items() if score < float("inf")
+    )
 
     if not feasible:
-        return InsertionScores(o, station_scores, station_plans, float('inf'), float('inf'), -1, None, -1.0)
+        return InsertionScores(
+            o, station_scores, station_plans, float("inf"), float("inf"), -1, None, -1.0
+        )
 
     best_score, best_station = feasible[0]
-    second_score = feasible[1][0] if len(feasible) > 1 else float('inf')
+    second_score = feasible[1][0] if len(feasible) > 1 else float("inf")
     best_plan = station_plans[best_station]
     regret = compute_regret_k(station_scores, regret_k)
 
-    return InsertionScores(o, station_scores, station_plans, best_score, second_score, best_station, best_plan, regret)
+    return InsertionScores(
+        o,
+        station_scores,
+        station_plans,
+        best_score,
+        second_score,
+        best_station,
+        best_plan,
+        regret,
+    )
 
 
 def compute_dirty_set(
-    committed_order: int, committed_station: int,
-    orders_req: Dict[int, List[int]], sku_order_index: Dict[int, Set[int]],
-    cached_scores: Dict[int, InsertionScores], unscheduled: Set[int],
-    state: Optional[HeuristicState] = None, committed_plan: Optional[OrderPlan] = None
-) -> Set[int]:
+    committed_order: int,
+    committed_station: int,
+    orders_req: dict[int, list[int]],
+    sku_order_index: dict[int, set[int]],
+    cached_scores: dict[int, InsertionScores],
+    unscheduled: set[int],
+    state: HeuristicState | None = None,
+    committed_plan: OrderPlan | None = None,
+) -> set[int]:
     dirty = set()
     for k in orders_req[committed_order]:
         if k in sku_order_index:
@@ -240,11 +320,7 @@ def compute_dirty_set(
     return dirty & unscheduled
 
 
-def run_rdi_sgc(
-    instance,
-    *args,
-    **kwargs
-) -> Solution:
+def run_rdi_sgc(instance, *args, **kwargs) -> Solution:
     if not isinstance(instance, Instance):
         S = instance
         L = args[0]
@@ -255,23 +331,27 @@ def run_rdi_sgc(
         rt_ret = args[5]
         p = args[6]
         N = args[7]
-        horizon = kwargs.get('horizon', args[8] if len(args) > 8 else 10000)
-        move_cap = kwargs.get('move_cap', args[9] if len(args) > 9 else None)
-        ALPHA = kwargs.get('ALPHA', args[10] if len(args) > 10 else 1.0)
-        BETA = kwargs.get('BETA', args[11] if len(args) > 11 else 0.0)
-        regret_k = kwargs.get('regret_k', args[12] if len(args) > 12 else 2)
-        use_lazy = kwargs.get('use_lazy', args[13] if len(args) > 13 else True)
-        tiebreaker = kwargs.get('tiebreaker', args[14] if len(args) > 14 else "sharing_degree")
+        horizon = kwargs.get("horizon", args[8] if len(args) > 8 else 10000)
+        move_cap = kwargs.get("move_cap", args[9] if len(args) > 9 else None)
+        ALPHA = kwargs.get("ALPHA", args[10] if len(args) > 10 else 1.0)
+        BETA = kwargs.get("BETA", args[11] if len(args) > 11 else 0.0)
+        regret_k = kwargs.get("regret_k", args[12] if len(args) > 12 else 2)
+        use_lazy = kwargs.get("use_lazy", args[13] if len(args) > 13 else True)
+        tiebreaker = kwargs.get(
+            "tiebreaker", args[14] if len(args) > 14 else "sharing_degree"
+        )
         instance = Instance(S, L, K, orders_req, rt, p, N, rt_ret=rt_ret)
     else:
-        horizon = kwargs.get('horizon', args[0] if len(args) > 0 else 10000)
-        move_cap = kwargs.get('move_cap', args[1] if len(args) > 1 else None)
-        ALPHA = kwargs.get('ALPHA', args[2] if len(args) > 2 else 1.0)
-        BETA = kwargs.get('BETA', args[3] if len(args) > 3 else 0.0)
-        regret_k = kwargs.get('regret_k', args[4] if len(args) > 4 else 2)
-        use_lazy = kwargs.get('use_lazy', args[5] if len(args) > 5 else True)
-        tiebreaker = kwargs.get('tiebreaker', args[6] if len(args) > 6 else "sharing_degree")
-        rt_ret = kwargs.get('rt_ret', args[7] if len(args) > 7 else None)
+        horizon = kwargs.get("horizon", args[0] if len(args) > 0 else 10000)
+        move_cap = kwargs.get("move_cap", args[1] if len(args) > 1 else None)
+        ALPHA = kwargs.get("ALPHA", args[2] if len(args) > 2 else 1.0)
+        BETA = kwargs.get("BETA", args[3] if len(args) > 3 else 0.0)
+        regret_k = kwargs.get("regret_k", args[4] if len(args) > 4 else 2)
+        use_lazy = kwargs.get("use_lazy", args[5] if len(args) > 5 else True)
+        tiebreaker = kwargs.get(
+            "tiebreaker", args[6] if len(args) > 6 else "sharing_degree"
+        )
+        rt_ret = kwargs.get("rt_ret", args[7] if len(args) > 7 else None)
 
     S, L, K, orders_req, rt, p, N = instance
     O = instance.O
@@ -299,11 +379,23 @@ def run_rdi_sgc(
     sum_rts = {o: get_sum_rt(o) for o in O}
 
     unscheduled = set(O)
-    cached_scores: Dict[int, InsertionScores] = {}
+    cached_scores: dict[int, InsertionScores] = {}
 
     for o in O:
         cached_scores[o] = score_order_insertions(
-            o, S, state, orders_req, rt, rt_ret, p, N, horizon, ALPHA, BETA, demand_count, regret_k
+            o,
+            S,
+            state,
+            orders_req,
+            rt,
+            rt_ret,
+            p,
+            N,
+            horizon,
+            ALPHA,
+            BETA,
+            demand_count,
+            regret_k,
         )
 
     order_assignments = {}
@@ -311,7 +403,7 @@ def run_rdi_sgc(
 
     while unscheduled:
         best_o = None
-        best_regret = -float('inf')
+        best_regret = -float("inf")
 
         for o in unscheduled:
             c = cached_scores[o]
@@ -347,14 +439,34 @@ def run_rdi_sgc(
             break
 
         if use_lazy:
-            dirty = compute_dirty_set(best_o, plan.station, orders_req, sku_index,
-                                      cached_scores, unscheduled, state, plan)
+            dirty = compute_dirty_set(
+                best_o,
+                plan.station,
+                orders_req,
+                sku_index,
+                cached_scores,
+                unscheduled,
+                state,
+                plan,
+            )
         else:
             dirty = unscheduled
 
         for o in dirty:
             cached_scores[o] = score_order_insertions(
-                o, S, state, orders_req, rt, rt_ret, p, N, horizon, ALPHA, BETA, demand_count, regret_k
+                o,
+                S,
+                state,
+                orders_req,
+                rt,
+                rt_ret,
+                p,
+                N,
+                horizon,
+                ALPHA,
+                BETA,
+                demand_count,
+                regret_k,
             )
 
     # Post-process results into a Solution object
@@ -368,12 +480,13 @@ def run_rdi_sgc(
         total_moves=total_moves,
         order_assignments=order_assignments,
         bin_events=state.station_bin_events,
-        pick_events=pick_events_map
+        pick_events=pick_events_map,
     )
 
 
 def solve_heuristic_instance(config: dict, return_raw: bool = False):
     import time
+
     from datagen import generate_data
 
     num_stations = config.get("stations", 1)
@@ -394,6 +507,7 @@ def solve_heuristic_instance(config: dict, return_raw: bool = False):
         num_skus=num_skus,
         seed=seed,
         pick_touch_time=pick_touch_time,
+        movecap=move_cap,
     )
     S, L, K, orders_req, rt, p, N = instance
     O = instance.O
@@ -401,17 +515,17 @@ def solve_heuristic_instance(config: dict, return_raw: bool = False):
     t0 = time.perf_counter()
     sol = run_rdi_sgc(
         instance,
-        horizon=horizon, move_cap=move_cap,
-        ALPHA=alpha, BETA=beta,
+        horizon=horizon,
+        move_cap=move_cap,
+        ALPHA=alpha,
+        BETA=beta,
         regret_k=config.get("regret_k", 2),
         use_lazy=config.get("use_lazy", True),
-        tiebreaker=config.get("tiebreaker", "sum_rt_asc")
+        tiebreaker=config.get("tiebreaker", "sum_rt_asc"),
     )
     elapsed = time.perf_counter() - t0
     status = "Feasible" if sol.feasible else "Infeasible"
-    violations = validate_solution(
-        sol, instance, horizon=horizon, move_cap=move_cap
-    )
+    violations = validate_solution(sol, instance, horizon=horizon, move_cap=move_cap)
     if violations:
         print(f"VALIDATION FAILED ({len(violations)} violations)")
         status = "Invalid"
@@ -434,6 +548,7 @@ def solve_heuristic_instance(config: dict, return_raw: bool = False):
 def main():
     import os
     import sys
+
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from datagen import generate_data
 
@@ -450,33 +565,49 @@ def main():
     ap.add_argument("--beta", type=float, default=0.0)
     ap.add_argument("--regret_k", type=int, default=2)
     ap.add_argument("--no_lazy", action="store_true")
-    ap.add_argument("--tiebreaker", type=str, choices=["sharing_degree",
-                    "best_score", "sum_rt_asc"], default="sum_rt_asc")
+    ap.add_argument(
+        "--tiebreaker",
+        type=str,
+        choices=["sharing_degree", "best_score", "sum_rt_asc"],
+        default="sum_rt_asc",
+    )
     ap.add_argument("--no_vis", action="store_true")
     args = ap.parse_args()
 
     print("Generating data...")
     instance = generate_data(
-        num_stations=args.stations, lanes_per_station=args.lanes,
-        num_orders=args.orders, num_skus=args.skus, seed=args.seed,
-        pick_touch_time=args.pick
+        num_stations=args.stations,
+        lanes_per_station=args.lanes,
+        num_orders=args.orders,
+        num_skus=args.skus,
+        seed=args.seed,
+        pick_touch_time=args.pick,
+        movecap=args.movecap,
     )
     S, L, K, orders_req, rt, p, N = instance
     O = instance.O
 
-    print(f"Stations={len(S)}, Lanes={len(L)}, SKUs={len(K)}, Orders={len(O)}, RobotLimit={args.movecap}\n")
-    print(f"Running RDI-SGC (regret_k={args.regret_k}, tiebreaker={args.tiebreaker}, lazy={not args.no_lazy})")
+    print(
+        f"Stations={len(S)}, Lanes={len(L)}, SKUs={len(K)}, Orders={len(O)}, RobotLimit={args.movecap}\n"
+    )
+    print(
+        f"Running RDI-SGC (regret_k={args.regret_k}, tiebreaker={args.tiebreaker}, lazy={not args.no_lazy})"
+    )
 
     t0 = time.perf_counter()
     sol = run_rdi_sgc(
         instance,
-        horizon=args.horizon, move_cap=args.movecap,
-        ALPHA=args.alpha, BETA=args.beta, regret_k=args.regret_k,
-        use_lazy=not args.no_lazy, tiebreaker=args.tiebreaker
+        horizon=args.horizon,
+        move_cap=args.movecap,
+        ALPHA=args.alpha,
+        BETA=args.beta,
+        regret_k=args.regret_k,
+        use_lazy=not args.no_lazy,
+        tiebreaker=args.tiebreaker,
     )
     elapsed = time.perf_counter() - t0
 
-    print(f"\n=== RDI-SGC Result ===")
+    print("\n=== RDI-SGC Result ===")
     print(f"Feasible:    {sol.feasible}")
     print(f"Makespan:    {sol.makespan}")
     print(f"Total bin events (moves/2): {sol.total_moves // 2}")
@@ -494,14 +625,14 @@ def main():
 
     if not args.no_vis:
         try:
-            from schedule_visualizer import plot_schedule
             from autostore_heuristic import build_viz_handles
-            mock_sol, handles = build_viz_handles(
-                sol, instance
-            )
+            from schedule_visualizer import plot_schedule
+
+            mock_sol, handles = build_viz_handles(sol, instance)
             plot_schedule(mock_sol, handles)
         except Exception as exc:
             import traceback
+
             traceback.print_exc()
             print(f"[VIS] Skipped: {exc}")
 

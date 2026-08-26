@@ -9,11 +9,11 @@ from loguru import logger
 
 import cp_model as docplex_model
 import ortools_cp_model as ortools_model
-from autostore_heuristic import Solution, BinEvent, validate_solution
+from autostore_heuristic import BinEvent, Solution, validate_solution
 from freezing_utils import (
     FreezeManager,
-    create_partial_starting_point,
     apply_partial_starting_point,
+    create_partial_starting_point,
     generate_freeze_constraints,
     get_optimized_set,
 )
@@ -45,26 +45,27 @@ class MockVarSol:
 
     def get_value(self):
         return self
-        
+
     def is_present(self):
         return self.present
-        
+
     def get_start(self):
         return self._start
 
     def get_end(self):
         return self._end
 
+
 class ORToolsSolution:
     def __init__(self, src, handles):
         self.var_map = {}
         self.handles = handles
-        
-        if hasattr(src, "Proto"): # is a mdl (initial solution hints)
+
+        if hasattr(src, "Proto"):  # is a mdl (initial solution hints)
             hints = src.Proto().solution_hint
             for idx, var_idx in enumerate(hints.vars):
                 self.var_map[var_idx] = hints.values[idx]
-        else: # is a solver (extracted active solution)
+        else:  # is a solver (extracted active solution)
             for var in handles["all_intervals_flat"].values():
                 self.var_map[var.pres.Index()] = src.Value(var.pres)
                 if src.Value(var.pres):
@@ -76,7 +77,7 @@ class ORToolsSolution:
 
     def BooleanValue(self, var):
         return bool(self.var_map.get(var.Index(), 0))
-        
+
     def get_all_var_solutions(self):
         sols = []
         for name, var in self.handles["all_intervals_flat"].items():
@@ -87,7 +88,9 @@ class ORToolsSolution:
         pres = self.BooleanValue(var.pres)
         # return a MockVarSol which has get_var() == var, but wait, MockVarSol currently expects name!
         if pres:
-            vs = MockVarSol(var.name, True, start=self.Value(var.start), end=self.Value(var.end))
+            vs = MockVarSol(
+                var.name, True, start=self.Value(var.start), end=self.Value(var.end)
+            )
         else:
             vs = MockVarSol(var.name, False)
         # Inject the var object so get_var() works if it exists
@@ -96,9 +99,11 @@ class ORToolsSolution:
         vs.get_var = lambda: var
         return vs
 
+
 def cp_sol_to_solution(sol, handles):
     def iv_present(x):
-        if x is None: return False
+        if x is None:
+            return False
         if hasattr(sol, "BooleanValue"):
             return sol.BooleanValue(x.pres)
         vs = sol.get_var_solution(x)
@@ -140,7 +145,7 @@ def cp_sol_to_solution(sol, handles):
 
     bin_events = {s: [] for s in S}
     total_moves = 0
-    
+
     pick_events = {}
 
     for s in S:
@@ -149,19 +154,22 @@ def cp_sol_to_solution(sol, handles):
             for e in range(Uk):
                 if (s, k, e) in B and iv_present(B[(s, k, e)]):
                     total_moves += 2
-                    
+
                     fs, fe = iv_start(F[(s, k, e)]), iv_end(F[(s, k, e)])
                     bs, be = iv_start(B[(s, k, e)]), iv_end(B[(s, k, e)])
                     rs, re = iv_start(R[(s, k, e)]), iv_end(R[(s, k, e)])
-                    
+
                     orders_served = []
                     for o in O:
                         if k in orders_req[o]:
                             if (o, s, k, e) in P and iv_present(P[(o, s, k, e)]):
-                                ps, pe = iv_start(P[(o, s, k, e)]), iv_end(P[(o, s, k, e)])
+                                ps, pe = (
+                                    iv_start(P[(o, s, k, e)]),
+                                    iv_end(P[(o, s, k, e)]),
+                                )
                                 orders_served.append(o)
                                 pick_events[(o, s, k)] = (ps, pe)
-                    
+
                     be_obj = BinEvent(
                         sku=k,
                         copy_id=e,
@@ -171,7 +179,7 @@ def cp_sol_to_solution(sol, handles):
                         presence_end=be,
                         return_start=rs,
                         return_end=re,
-                        orders_served=orders_served
+                        orders_served=orders_served,
                     )
                     bin_events[s].append(be_obj)
 
@@ -181,15 +189,18 @@ def cp_sol_to_solution(sol, handles):
         makespan=makespan,
         total_moves=total_moves,
         feasible=True,
-        pick_events=pick_events
+        pick_events=pick_events,
     )
+
 
 def sort_variables(mdl, sp, backend="docplex", handles=None):
     if backend == "ortools":
+
         def get_start_time(var):
             if sp.BooleanValue(var.pres):
                 return sp.Value(var.start)
             return float("inf")
+
         interval_vars = list(handles["all_intervals_flat"].values())
         sorted_vars = sorted(interval_vars, key=lambda v: (get_start_time(v), v.name))
         var_to_idx = {var: idx for idx, var in enumerate(sorted_vars)}
@@ -269,9 +280,7 @@ def prepare_model_ortools(config, instance, heur_sol):
         horizon=config["horizon"],
         move_cap=config["movecap"],
     )
-    ortools_model.inject_warmstart(
-        heur_sol, heur_sol.pick_events, mdl, handles
-    )
+    ortools_model.inject_warmstart(heur_sol, heur_sol.pick_events, mdl, handles)
     starting_point = ORToolsSolution(mdl, handles)
     return mdl, handles, starting_point
 
@@ -306,7 +315,10 @@ class Solver:
 
         if self.experiment_config["backend"] == "ortools":
             from ortools.sat.python import cp_model
+
             if solve_status not in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
+                if self.experiment_config["improvement_constr"]:
+                    self.stagnation_count += 1
                 self.vlg.add_stat_to_current("statuses", Status.Unknown)
                 self.vlg.add_stat_to_current("best", self.best_result)
                 self.vlg.add_stat_to_current("current", self.current_result)
@@ -314,12 +326,16 @@ class Solver:
             incumbent = sol_object.ObjectiveValue()
         else:
             # solver didn't find any solution
-            if sol_object is None or sol_object.get_solve_status() == "Unknown":
+            if sol_object is None or sol_object.get_solve_status() in [
+                "Unknown",
+                "Infeasible",
+            ]:
+                if self.experiment_config["improvement_constr"]:
+                    self.stagnation_count += 1
                 self.vlg.add_stat_to_current("statuses", Status.Unknown)
                 self.vlg.add_stat_to_current("best", self.best_result)
                 self.vlg.add_stat_to_current("current", self.current_result)
                 return
-    
             solve_status = sol_object.get_solve_status()
             incumbent = sol_object.get_objective_value()
 
@@ -329,19 +345,35 @@ class Solver:
 
             if incumbent < self.best_result:
                 if self.experiment_config["backend"] == "ortools":
-                    status = Status.Optimal_New_Best if solve_status == cp_model.OPTIMAL else Status.Feasible_New_Best
+                    status = (
+                        Status.Optimal_New_Best
+                        if solve_status == cp_model.OPTIMAL
+                        else Status.Feasible_New_Best
+                    )
                     self.best_solution = ORToolsSolution(sol_object, self.handles)
                 else:
-                    status = Status.Optimal_New_Best if solve_status == "Optimal" else Status.Feasible_New_Best
+                    status = (
+                        Status.Optimal_New_Best
+                        if solve_status == "Optimal"
+                        else Status.Feasible_New_Best
+                    )
                     self.best_solution = sol_object
 
                 # update best-so-far
                 self.best_result = incumbent
             else:
                 if self.experiment_config["backend"] == "ortools":
-                    status = Status.Optimal_Improve if solve_status == cp_model.OPTIMAL else Status.Feasible_Improve
+                    status = (
+                        Status.Optimal_Improve
+                        if solve_status == cp_model.OPTIMAL
+                        else Status.Feasible_Improve
+                    )
                 else:
-                    status = Status.Optimal_Improve if solve_status == "Optimal" else Status.Feasible_Improve
+                    status = (
+                        Status.Optimal_Improve
+                        if solve_status == "Optimal"
+                        else Status.Feasible_Improve
+                    )
         else:
             # result is worse or equal to current: use eps
             accept = random.random() < self.experiment_config["eps_greedy_prob"]
@@ -354,9 +386,17 @@ class Solver:
 
             elif incumbent >= self.current_result:
                 if self.experiment_config["backend"] == "ortools":
-                    status = Status.Optimal_No_Improve if solve_status == cp_model.OPTIMAL else Status.Feasible_No_Improve
+                    status = (
+                        Status.Optimal_No_Improve
+                        if solve_status == cp_model.OPTIMAL
+                        else Status.Feasible_No_Improve
+                    )
                 else:
-                    status = Status.Optimal_No_Improve if solve_status == "Optimal" else Status.Feasible_No_Improve
+                    status = (
+                        Status.Optimal_No_Improve
+                        if solve_status == "Optimal"
+                        else Status.Feasible_No_Improve
+                    )
 
         # increase stagnation count if solver achieved optimum but stagnated
         if status in [
@@ -370,7 +410,7 @@ class Solver:
 
         # eps greedy acceptance
         if accept:
-            self.current_result = incumbent
+            self.current_result = int(incumbent)
             if self.experiment_config["backend"] == "ortools":
                 self.current_solution = ORToolsSolution(sol_object, self.handles)
             else:
@@ -386,7 +426,9 @@ class Solver:
     def get_freeze_sets(self, to_optimize, old_freeze_constraints, strategy_results):
         if self.experiment_config["delta_freezing"]:
             to_add, to_remove = self.freeze_manager.apply_delta_freezing(
-                self.current_solution, to_optimize, self.handles.get("all_intervals_flat")
+                self.current_solution,
+                to_optimize,
+                self.handles.get("all_intervals_flat"),
             )
             freeze_constraints = self.freeze_manager.active_constraints
             logger.info(
@@ -406,7 +448,7 @@ class Solver:
     def get_starting_point(self, to_optimize):
         if self.experiment_config["backend"] == "ortools":
             return None
-            
+
         if self.experiment_config["starting_point_for_frozen"]:
             starting_point = self.current_solution
             if isinstance(self.current_solution, CpoSolveResult):
@@ -429,7 +471,11 @@ class Solver:
             )
 
         if self.experiment_config["delta_freezing"]:
-            self.freeze_manager = FreezeManager(self.mdl, self.experiment_config["backend"], self.instance_config["horizon"])
+            self.freeze_manager = FreezeManager(
+                self.mdl,
+                self.experiment_config["backend"],
+                self.instance_config["horizon"],
+            )
 
         strategies = [
             lambda sev: (
@@ -478,7 +524,9 @@ class Solver:
         ]
 
         # prepare variable index sorted look-up for unfrozen set logging
-        var_to_idx, num_variables = sort_variables(self.mdl, sp, self.experiment_config["backend"], self.handles)
+        var_to_idx, num_variables = sort_variables(
+            self.mdl, sp, self.experiment_config["backend"], self.handles
+        )
 
         self.severity = 1
         self.stagnation_count = 0
@@ -486,13 +534,19 @@ class Solver:
         self.best_solution = sp
         self.current_solution = self.best_solution
         self.current_result = self.best_result
+
+        self.obj_constraint = None
+
         old_freeze_constraints = []
         lg = LoguruStream()
         # start iterations
         self.vlg.log_run_start(num_variables, var_to_idx, sp)
         for i in range(self.experiment_config["iters"]):
             self.vlg.log_iteration_start(i)
-            if self.stagnation_count >= self.experiment_config["stagnation_th"]:
+            if (
+                self.stagnation_count >= self.experiment_config["stagnation_th"]
+                and self.severity < self.experiment_config["max_severity"]
+            ):
                 self.severity += self.experiment_config["severity_step"]
                 self.vlg.add_stat_to_current("severity_increases", 1)
                 self.stagnation_count = 0
@@ -506,17 +560,20 @@ class Solver:
             if self.experiment_config["backend"] == "ortools":
                 # For OR-Tools, rebuild the model from scratch to avoid protobuf corruption
                 import ortools_cp_model
+
                 horizon_val = self.instance_config.get("horizon", 0)
                 self.mdl, self.handles = ortools_cp_model.build_model(
-                    self.instance, 
+                    self.instance,
                     rt_return=self.instance.rt_ret,
-                    add_symmetry_breaking=not self.instance_config.get("no_symmetry_breaking", False),
+                    add_symmetry_breaking=self.instance_config["symmetry_breaking"],
                     horizon=horizon_val,
-                    move_cap=self.instance_config.get("movecap", None)
+                    move_cap=self.instance_config.get("movecap", None),
                 )
-                
+
                 # We need to recreate the FreezeManager because it holds a reference to the old model
-                self.freeze_manager = FreezeManager(self.mdl, backend="ortools", horizon=horizon_val)
+                self.freeze_manager = FreezeManager(
+                    self.mdl, backend="ortools", horizon=horizon_val
+                )
 
             # create to_optimize set with graph traversal
             to_optimize = get_optimized_set(
@@ -538,18 +595,35 @@ class Solver:
             if self.experiment_config["backend"] == "ortools":
                 # Apply freeze sets as constraints directly to the new model
                 self.freeze_manager.apply_delta_freezing(
-                    self.current_solution, to_optimize, self.handles["all_intervals_flat"]
+                    self.current_solution,
+                    to_optimize,
+                    self.handles["all_intervals_flat"],
                 )
 
-                apply_partial_starting_point(self.mdl, self.current_solution, to_optimize)
+                apply_partial_starting_point(
+                    self.mdl, self.current_solution, to_optimize
+                )
                 self.vlg.log_freeze_constr(to_optimize, var_to_idx, strat_idx)
 
                 self.vlg.time_from_here()
-                if not hasattr(self, 'solver'):
+                if not hasattr(self, "solver"):
                     from ortools.sat.python import cp_model
+
                     self.solver = cp_model.CpSolver()
-                    self.solver.parameters.max_time_in_seconds = self.experiment_config["iter_time_limit"]
-                
+                    self.solver.parameters.max_time_in_seconds = self.experiment_config[
+                        "iter_time_limit"
+                    ]
+                    # self.solver.parameters.num_search_workers = 1
+                    # self.solver.parameters.cp_model_presolve = False
+                    # self.solver.parameters.linearization_level = 0
+                    # self.solver.parameters.search_branching = cp_model.FIXED_SEARCH
+
+                # Force improvement
+                # if self.experiment_config["improvement_constr"]:
+                #     self.mdl.add(
+                #         self.handles["makespan_var"] <= self.current_result - 1
+                #     )
+
                 status = self.solver.Solve(self.mdl)
                 self.vlg.log_solve_time(self.solver, status)
                 self.eps_greedy_acceptance(self.solver, status)
@@ -562,12 +636,22 @@ class Solver:
                 old_freeze_constraints = freeze_constraints
                 self.vlg.log_freeze_constr(to_optimize, var_to_idx, strat_idx)
 
-                # run solve on partially frozen model
+                # Force improvement
+                if self.experiment_config["improvement_constr"]:
+                    if self.obj_constraint is not None:
+                        self.mdl.remove(self.obj_constraint)
+                    self.obj_constraint = self.mdl.add(
+                        self.handles["makespan"] <= self.current_result - 1
+                    )
 
+                # run solve on partially frozen model
                 self.vlg.time_from_here()
                 sol = self.mdl.solve(
                     TimeLimit=self.experiment_config["iter_time_limit"],
                     LogVerbosity="Quiet",
+                    # Workers=1,
+                    # Presolve="Off",
+                    # SearchType="DepthFirst",
                     # LogVerbosity="Verbose",
                     # log_output=lg,
                 )
@@ -575,7 +659,7 @@ class Solver:
 
             # run eps-greedy acceptance (already done for ortools)
             if self.experiment_config["backend"] == "docplex":
-                self.eps_greedy_acceptance(sol)
+                self.eps_greedy_acceptance(sol, sol.get_solve_status())
 
             # log iteration end in VisualLogger
             self.vlg.log_iteration()
@@ -583,14 +667,14 @@ class Solver:
         # End of LNS loop: Validate the best solution found
         logger.info("Converting best solution for validation...")
         final_solution = cp_sol_to_solution(self.best_solution, self.handles)
-        
+
         logger.info("Validating final solution...")
         try:
             violations = validate_solution(
-                final_solution, 
-                self.instance, 
-                horizon=self.instance_config["horizon"], 
-                move_cap=self.instance_config["movecap"]
+                final_solution,
+                self.instance,
+                horizon=self.instance_config["horizon"],
+                move_cap=self.instance_config["movecap"],
             )
         except KeyError:
             logger.error("Config doesn't have horizon or movecap field.")
@@ -647,6 +731,13 @@ if __name__ == "__main__":
         help="Severity increment step (default: 1)",
     )
     parser.add_argument(
+        "--max-severity",
+        type=int,
+        default=5,
+        dest="max_severity",
+        help="Upper bound for severity (default: 5)",
+    )
+    parser.add_argument(
         "--iter-time-limit",
         type=float,
         default=2.0,
@@ -660,6 +751,14 @@ if __name__ == "__main__":
         default=True,
         dest="delta_freezing",
         help="Use delta freezing for updating the freeze constraints (default: True)",
+    )
+
+    parser.add_argument(
+        "--improvement-constr",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        dest="improvement_constr",
+        help="Add improvement of the makespan over current as a new constraint in each iteration (default: True)",
     )
 
     parser.add_argument(
@@ -684,11 +783,13 @@ if __name__ == "__main__":
         "iters": args.iters,
         "stagnation_th": args.stagnation_th,
         "severity_step": args.severity_step,
+        "max_severity": args.max_severity,
         "iter_time_limit": args.iter_time_limit,
         "delta_freezing": args.delta_freezing,
         "starting_point_for_frozen": args.starting_point_for_frozen,
         "eps_greedy_prob": args.eps_greedy_prob,
         "backend": args.backend,
+        "improvement_constr": args.improvement_constr,
     }
     solver = Solver(
         experiment_config,

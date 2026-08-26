@@ -358,7 +358,8 @@ def build_model(instance, *args, **kwargs):
 
     # --- objective (makespan over station windows) ---
     per_order_end = [mdl.max([mdl.end_of(I_os[(o, s)]) for s in S]) for o in O]
-    mdl.minimize(mdl.max(per_order_end))
+    makespan = mdl.max(per_order_end)
+    mdl.minimize(makespan)
 
     handles = {
         "I_os_lane": I_os_lane,
@@ -382,6 +383,7 @@ def build_model(instance, *args, **kwargs):
         "O": O,
         "N": N,
         "move_cap": move_cap,
+        "makespan": makespan,
     }
     return mdl, handles
 

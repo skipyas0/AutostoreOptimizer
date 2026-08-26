@@ -9,14 +9,14 @@ Usage:
 """
 
 import argparse
+import concurrent.futures
 import importlib
 import json
 import os
-import time
 import sys
-import concurrent.futures
+import time
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import Any
 
 # Add repository root and script directory to sys.path
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -26,10 +26,16 @@ if root_dir not in sys.path:
 if script_dir not in sys.path:
     sys.path.insert(0, script_dir)
 
-from benchmark_v4_single import PARAM_LEVELS, REFERENCE_CONFIG, SEEDS, PARAM_ORDER, build_config
+from benchmark_v4_single import (
+    PARAM_LEVELS,
+    PARAM_ORDER,
+    REFERENCE_CONFIG,
+    SEEDS,
+    build_config,
+)
 
 
-def enumerate_combinations() -> List[Dict[str, Any]]:
+def enumerate_combinations() -> list[dict[str, Any]]:
     """
     Create a flat list of all (parameter, value, seed) combos.
     Same as in benchmark_v4_single.py for consistency.
@@ -39,15 +45,17 @@ def enumerate_combinations() -> List[Dict[str, Any]]:
         levels = PARAM_LEVELS[param]
         for val in levels:
             for seed in SEEDS:
-                combos.append({
-                    "parameter": param,
-                    "value": val,
-                    "seed": seed,
-                })
+                combos.append(
+                    {
+                        "parameter": param,
+                        "value": val,
+                        "seed": seed,
+                    }
+                )
     return combos
 
 
-def run_single_instance(module_name: str, config: Dict[str, Any]) -> Dict[str, Any]:
+def run_single_instance(module_name: str, config: dict[str, Any]) -> dict[str, Any]:
     """
     Dynamically import and run a heuristic module.
     Expected interface: module.solve_heuristic_instance(config) -> result_dict
@@ -59,7 +67,7 @@ def run_single_instance(module_name: str, config: Dict[str, Any]) -> Dict[str, A
             "status": "ImportError",
             "error": str(e),
             "solve_time": 0.0,
-            "objective_value": None
+            "objective_value": None,
         }
 
     if not hasattr(mod, "solve_heuristic_instance"):
@@ -67,7 +75,7 @@ def run_single_instance(module_name: str, config: Dict[str, Any]) -> Dict[str, A
             "status": "InterfaceError",
             "error": f"Module {module_name} missing solve_heuristic_instance()",
             "solve_time": 0.0,
-            "objective_value": None
+            "objective_value": None,
         }
 
     try:
@@ -75,12 +83,14 @@ def run_single_instance(module_name: str, config: Dict[str, Any]) -> Dict[str, A
         res = mod.solve_heuristic_instance(config)
         return res
     except Exception as e:
-        return {
+        msg = {
             "status": "Crash",
             "error": str(e),
             "solve_time": 0.0,
-            "objective_value": None
+            "objective_value": None,
         }
+        print(msg)
+        return msg
 
 
 def process_task(task_args: dict) -> dict:
@@ -100,7 +110,7 @@ def process_task(task_args: dict) -> dict:
             "val": val,
             "seed": seed,
             "solve_time": 0.0,
-            "objective_value": None
+            "objective_value": None,
         }
 
     res = run_single_instance(mod_name, cfg)
@@ -113,10 +123,10 @@ def process_task(task_args: dict) -> dict:
             "value": val,
             "seed": seed,
             "generated_at": datetime.now().isoformat(),
-            "reference_config": REFERENCE_CONFIG
+            "reference_config": REFERENCE_CONFIG,
         },
         "config": cfg,
-        "result": res
+        "result": res,
     }
 
     with open(out_path, "w", encoding="utf-8") as f:
@@ -129,44 +139,47 @@ def process_task(task_args: dict) -> dict:
         "val": val,
         "seed": seed,
         "solve_time": res.get("solve_time", 0.0),
-        "objective_value": res.get("objective_value", None)
+        "objective_value": res.get("objective_value", None),
     }
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Local runner for AutoStore heuristics")
+    parser = argparse.ArgumentParser(
+        description="Local runner for AutoStore heuristics"
+    )
     parser.add_argument(
         "--modules",
         nargs="+",
         help="List of python module names to benchmark",
-        default=["ama_sgc_neural_mlp"]
+        default=[
+            "heuristic_rdi_sgc",
+            "autostore_heuristic",
+            "heuristic_cfss_sgc",
+            "heuristic_cfss_sgc_normalized",
+        ],
     )
     parser.add_argument(
         "--output-dir",
         default="results/heuristic_local/greedy_and_ama_serial",
-        help="Directory to save JSON results"
+        help="Directory to save JSON results",
     )
     parser.add_argument(
         "--test-run",
         action="store_true",
-        help="Run only one instance per parameter for testing"
+        help="Run only one instance per parameter for testing",
     )
     parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Overwrite existing result files"
+        "--overwrite", action="store_true", help="Overwrite existing result files"
     )
     parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Print detailed progress"
+        "--verbose", action="store_true", help="Print detailed progress"
     )
 
     parser.add_argument(
         "--workers",
         type=int,
         default=os.cpu_count() - 1 or 4,
-        help="Number of parallel workers"
+        help="Number of parallel workers",
     )
 
     args = parser.parse_args()
@@ -209,15 +222,17 @@ def main():
                     print(f"Skipping {fname} (exists)")
                 continue
 
-            tasks.append({
-                "mod_name": mod_name,
-                "cfg": cfg,
-                "out_path": out_path,
-                "param": param,
-                "val": val,
-                "seed": seed,
-                "overwrite": args.overwrite
-            })
+            tasks.append(
+                {
+                    "mod_name": mod_name,
+                    "cfg": cfg,
+                    "out_path": out_path,
+                    "param": param,
+                    "val": val,
+                    "seed": seed,
+                    "overwrite": args.overwrite,
+                }
+            )
 
     total_tasks = len(tasks)
     if total_tasks == 0:
@@ -235,12 +250,18 @@ def main():
             try:
                 res = future.result()
                 if args.verbose:
-                    print(f"[{count:3d}/{total_tasks}] {t['mod_name']} - {t['param']}={t['val']}, seed={t['seed']} -> {res['status']} ({res['solve_time']:.4f}s), Makespan: {res['objective_value']}")
+                    print(
+                        f"[{count:3d}/{total_tasks}] {t['mod_name']} - {t['param']}={t['val']}, seed={t['seed']} -> {res['status']} ({res['solve_time']:.4f}s), Makespan: {res['objective_value']}"
+                    )
                 else:
-                    sys.stdout.write(f"\rProgress: [{count:3d}/{total_tasks}] completed...")
+                    sys.stdout.write(
+                        f"\rProgress: [{count:3d}/{total_tasks}] completed..."
+                    )
                     sys.stdout.flush()
             except Exception as e:
-                print(f"\nTask failed for {t['mod_name']} ({t['param']}={t['val']}, seed={t['seed']}): {e}")
+                print(
+                    f"\nTask failed for {t['mod_name']} ({t['param']}={t['val']}, seed={t['seed']}): {e}"
+                )
 
     elapsed = time.perf_counter() - start_global
     print(f"\nBenchmark completed in {elapsed:.2f}s.")
