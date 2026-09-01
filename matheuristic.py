@@ -18,14 +18,11 @@ from freezing_utils import (
     get_optimized_set,
 )
 from instance import Instance
+from jaccard_similarity import build_similarity_matrix
 from matheuristic_plots import LoguruStream, Status, VisualLogger
 from neighborhood_selection import (
-    combine_strategies,
-    strategy_multi_timeslice,
-    strategy_random_lanes,
     strategy_random_orders,
-    strategy_random_skus,
-    strategy_single_timeslice,
+    strategy_similar_orders,
 )
 from precalculate_instances_for_lns import check_if_precalculated, precalculate_config
 
@@ -80,7 +77,7 @@ class ORToolsSolution:
 
     def get_all_var_solutions(self):
         sols = []
-        for name, var in self.handles["all_intervals_flat"].items():
+        for var in self.handles["all_intervals_flat"].values():
             sols.append(self.get_var_solution(var))
         return sols
 
@@ -477,6 +474,13 @@ class Solver:
                 self.instance_config["horizon"],
             )
 
+        self.weighted_jaccard_matrix, _ = build_similarity_matrix(
+            self.handles["O"],
+            self.handles["orders_req"],
+            self.handles["rt"],
+            self.handles["rt_return"],
+            normalize=False,
+        )
         strategies = [
             lambda sev: (
                 strategy_random_orders(
@@ -485,42 +489,51 @@ class Solver:
                 "random_orders",
             ),
             lambda sev: (
-                strategy_random_skus(self.handles, self.current_solution, p=0.1 * sev),
-                "random_skus",
-            ),
-            lambda sev: (
-                combine_strategies(
-                    strategy_random_orders(
-                        self.handles, self.current_solution, p=0.05 * sev
-                    ),
-                    strategy_random_skus(
-                        self.handles, self.current_solution, p=0.05 * sev
-                    ),
+                strategy_similar_orders(
+                    self.handles,
+                    self.current_solution,
+                    0.1 * sev,
+                    self.weighted_jaccard_matrix,
                 ),
-                "random_orders_and_skus",
+                "similar_orders",
             ),
-            lambda sev: (
-                strategy_random_lanes(self.handles, self.current_solution, 1),
-                "random_lanes",
-            ),
-            lambda sev: (
-                strategy_single_timeslice(
-                    self.handles, self.current_solution, 100 * sev
-                ),
-                "single_timeslice",
-            ),
-            lambda sev: (
-                strategy_multi_timeslice(
-                    self.handles, self.current_solution, 2, 100 * sev
-                ),
-                "double_timeslice",
-            ),
-            lambda sev: (
-                strategy_multi_timeslice(
-                    self.handles, self.current_solution, 3, 100 * sev
-                ),
-                "triple_timeslice",
-            ),
+            # lambda sev: (
+            #     strategy_random_skus(self.handles, self.current_solution, p=0.1 * sev),
+            #     "random_skus",
+            # ),
+            # lambda sev: (
+            #     combine_strategies(
+            #         strategy_random_orders(
+            #             self.handles, self.current_solution, p=0.05 * sev
+            #         ),
+            #         strategy_random_skus(
+            #             self.handles, self.current_solution, p=0.05 * sev
+            #         ),
+            #     ),
+            #     "random_orders_and_skus",
+            # ),
+            # lambda sev: (
+            #     strategy_random_lanes(self.handles, self.current_solution, 1),
+            #     "random_lanes",
+            # ),
+            # lambda sev: (
+            #     strategy_single_timeslice(
+            #         self.handles, self.current_solution, 100 * sev
+            #     ),
+            #     "single_timeslice",
+            # ),
+            # lambda sev: (
+            #     strategy_multi_timeslice(
+            #         self.handles, self.current_solution, 2, 100 * sev
+            #     ),
+            #     "double_timeslice",
+            # ),
+            # lambda sev: (
+            #     strategy_multi_timeslice(
+            #         self.handles, self.current_solution, 3, 100 * sev
+            #     ),
+            #     "triple_timeslice",
+            # ),
         ]
 
         # prepare variable index sorted look-up for unfrozen set logging

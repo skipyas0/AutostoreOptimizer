@@ -106,6 +106,29 @@ def strategy_random_lanes(handles, solution, k) -> SelectionResult:
     return SelectionResult(seed_orders=seed_o)
 
 
+def strategy_similar_orders(
+    handles, solution, p_most_similar, jaccard
+) -> SelectionResult:
+
+    seed_order = random.choice(handles["O"])
+    selected_orders = {seed_order}
+    sorted_orders = sorted(
+        handles["O"],
+        key=lambda o: (
+            float("inf")
+            if seed_order == o
+            else jaccard[min(seed_order, o), max(seed_order, o)]
+        ),
+    )
+
+    p = min(1.0, p_most_similar)
+    n_select = max(1, int(len(handles["O"]) * p))
+    selected_orders.update(
+        {handles["O"][order_ix] for order_ix in sorted_orders[-n_select:]}
+    )
+    return SelectionResult(seed_orders=selected_orders)
+
+
 def combine_strategies(*strategy_outputs: SelectionResult) -> SelectionResult:
     """Combines any number of selection results into a single selection."""
     combined_res = SelectionResult()

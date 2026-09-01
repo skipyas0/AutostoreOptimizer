@@ -4,7 +4,9 @@ from typing import Any
 import numpy as np
 
 from constants import PARAM_LEVELS, REFERENCE_CONFIG
-from jaccard_similarity import compute_jaccard_weighted_and_unweighted
+from jaccard_similarity import (
+    compute_jaccard_weighted_and_unweighted,
+)
 
 
 class Instance:
