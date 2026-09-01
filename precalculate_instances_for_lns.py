@@ -20,7 +20,7 @@ from schedule_visualizer import plot_schedule, write_html
 
 
 def precalculate_config(config):
-    path = f"precalculated_instances/GEN{config['gen_seed']}-CP{config['cp_seed']}-{config['stations']}-{config['lanes']}-{config['skus']}-{config['orders']}-{config['movecap']}"
+    path = f"precalculated_instances/GEN{config['gen_seed']}-{config['stations']}-{config['lanes']}-{config['skus']}-{config['orders']}-{config['movecap']}"
 
     os.mkdir(path)
 
@@ -80,44 +80,55 @@ def precalculate_config(config):
 
     sp = inject_warmstart(heur_sol, heur_sol.pick_events, mdl, handles)
 
-    history_listener = ProgressCollector()
-    mdl.add_solver_listener(history_listener)
-
-    mdl.set_starting_point(sp)
-
-    with open(f"{path}/cplog.txt", "w+") as cp_log:
-        print(f"Solving CP Model with {config['time_limit']}s time limit...")
-        sol_cp = mdl.solve(
-            TimeLimit=config["time_limit"],
-            LogVerbosity="Verbose",
-            log_output=cp_log,
-            solve_with_search_next=True,
-            RandomSeed=config["cp_seed"],
+    for seed in config["cp_seeds"]:
+        mdl, handles = build_model(
+            instance,
+            rt_return=instance.rt_ret,
+            add_symmetry_breaking=config["symmetry_breaking"],
+            horizon=config["horizon"],
+            move_cap=config["movecap"],
         )
-        cp_log.flush()
 
-    if sol_cp:
-        sol = sol_cp.get_solution()
-        if sol is not None:
-            with open(f"{path}/cp_solution.pkl", "wb") as f:
-                pickle.dump(sol, f)
+        history_listener = ProgressCollector()
+        mdl.add_solver_listener(history_listener)
+
+        mdl.set_starting_point(sp)
+
+        with open(f"{path}/cplog_{seed}.txt", "w+") as cp_log:
+            print(
+                f"Solving CP Model with {config['time_limit']}s time limit and seed {seed}..."
+            )
+            sol_cp = mdl.solve(
+                TimeLimit=config["time_limit"],
+                LogVerbosity="Verbose",
+                log_output=cp_log,
+                solve_with_search_next=True,
+                RandomSeed=seed,
+            )
+            cp_log.flush()
+
+        if sol_cp:
+            sol = sol_cp.get_solution()
+            if sol is not None:
+                with open(f"{path}/cp_solution_{seed}.pkl", "wb") as f:
+                    pickle.dump(sol, f)
+            else:
+                print("CP sol is None")
+
+            with open(f"{path}/cp_intermediate_records_{seed}.pkl", "wb") as f:
+                pickle.dump(history_listener.records, f)
+
+            print(f"CP Solve Status: {sol_cp.get_solve_status()}")
+            with open(f"{path}/cp_sol_{seed}.txt", "w+") as f, redirect_stdout(f):
+                extract_and_print_solution(sol_cp, handles)
+            if plot_schedule:
+                print("Exporting visualization...")
+                fig = plot_schedule(sol_cp, handles)
+                html_file = f"{path}/CP-RDI_solution_{seed}.html"
+                write_html(fig, html_file)
+                print(f"\nWrote visualization to {html_file}")
         else:
-            print("CP sol is None")
-
-        with open(f"{path}/cp_intermediate_records.pkl", "wb") as f:
-            pickle.dump(history_listener.records, f)
-
-        print(f"CP Solve Status: {sol_cp.get_solve_status()}")
-        with open(f"{path}/cp_sol.txt", "w+") as f, redirect_stdout(f):
-            extract_and_print_solution(sol_cp, handles)
-        if plot_schedule:
-            print("Exporting visualization...")
-            fig = plot_schedule(sol_cp, handles)
-            html_file = f"{path}/CP-RDI_solution.html"
-            write_html(fig, html_file)
-            print(f"\nWrote visualization to {html_file}")
-    else:
-        print("No solution found by CP.")
+            print("No solution found by CP.")
 
     os.mkdir(f"{path}/experiments")
     return path
@@ -159,8 +170,13 @@ def main():
         "--gen-seed", type=int, default=42, help="Random seed for data generation"
     )
     parser.add_argument(
-        "--cp-seed", type=int, default=42, help="Random seed for CP solver"
+        "--cp-seeds",
+        type=int,
+        nargs="+",
+        default=[42],
+        help="List of CP seeds to try",
     )
+
     parser.add_argument(
         "--stations",
         type=int,
@@ -196,11 +212,12 @@ def main():
         default=[20, 35],
         help="List of move capacities to iterate over",
     )
+
     args = parser.parse_args()
 
     TIME_LIMIT = args.time_limit
     GEN_SEED = args.gen_seed
-    CP_SEED = args.cp_seed
+    CP_SEEDS = args.cp_seeds
     STATIONS = args.stations
     LANES = args.lanes
     SKUS = args.skus
@@ -208,7 +225,7 @@ def main():
     MOVECAPS = args.movecaps
 
     print(
-        f"Precalculating configs: {TIME_LIMIT=} {GEN_SEED=} {CP_SEED=} {STATIONS=} {LANES=} {SKUS=} {ORDERS=} {MOVECAPS=}"
+        f"Precalculating configs: {TIME_LIMIT=} {GEN_SEED=} {CP_SEEDS=} {STATIONS=} {LANES=} {SKUS=} {ORDERS=} {MOVECAPS=}"
     )
 
     for s, l, k, o, m in product(STATIONS, LANES, SKUS, ORDERS, MOVECAPS):
@@ -220,7 +237,7 @@ def main():
             "skus": k,
             "movecap": m,
             "gen_seed": GEN_SEED,
-            "cp_seed": CP_SEED,
+            "cp_seeds": CP_SEEDS,
             "horizon": 10000,
             "alpha": 1.0,
             "beta": 1.0,
