@@ -133,7 +133,6 @@ class FreezeManager:
         self.active_constraints = {}
         self.active_frozen_vars = set()
 
-
     def apply_delta_freezing(self, solution, to_optimize, all_intervals_flat):
         if self.backend == "ortools":
             # For OR-Tools, we rebuild the model every iteration to avoid SWIG protobuf bugs.
@@ -149,7 +148,7 @@ class FreezeManager:
 
                     end_val = solution.Value(var.end)
                     self.mdl.Add(var.end == end_val)
-            
+
             return target_frozen_vars, []
 
         # 1. Identify the target state
@@ -272,15 +271,16 @@ def create_partial_starting_point(mdl, solution, to_optimize):
 
 def apply_partial_starting_point(mdl, solver, to_optimize):
     """
+    For ORTOOLS
     Creates a warm start containing ONLY the variables in the active neighborhood.
     Frozen variables do not need hints as their domains are restricted.
     """
     mdl.ClearHints()
-    
+
     for var in to_optimize:
         pres_val = solver.Value(var.pres)
         mdl.AddHint(var.pres, pres_val)
-        
+
         if pres_val:
             mdl.AddHint(var.start, solver.Value(var.start))
             mdl.AddHint(var.end, solver.Value(var.end))

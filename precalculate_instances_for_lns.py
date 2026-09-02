@@ -6,13 +6,12 @@ import time
 from contextlib import redirect_stdout
 from itertools import product
 
-from autostore_heuristic import build_viz_handles, validate_solution
+from autostore_heuristic import build_viz_handles, validate_solution, validate_warmstart
 from cp_model import (
     ProgressCollector,
     build_model,
     extract_and_print_solution,
     inject_warmstart,
-    validate_warmstart,
 )
 from datagen import generate_data
 from heuristic_rdi_sgc import run_rdi_sgc
@@ -43,10 +42,8 @@ def precalculate_config(config):
 
     mdl, handles = build_model(
         instance,
-        rt_return=instance.rt_ret,
         add_symmetry_breaking=config["symmetry_breaking"],
         horizon=config["horizon"],
-        move_cap=config["movecap"],
     )
 
     t0 = time.perf_counter()
@@ -83,10 +80,8 @@ def precalculate_config(config):
     for seed in config["cp_seeds"]:
         mdl, handles = build_model(
             instance,
-            rt_return=instance.rt_ret,
             add_symmetry_breaking=config["symmetry_breaking"],
             horizon=config["horizon"],
-            move_cap=config["movecap"],
         )
 
         history_listener = ProgressCollector()

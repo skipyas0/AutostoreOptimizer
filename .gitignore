@@ -15,3 +15,5 @@ precalculated_instances
 *.csv
 *.svg
 *.png
+*.so
+*.o

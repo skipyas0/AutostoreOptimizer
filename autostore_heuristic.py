@@ -1131,5 +1131,209 @@ def main():
             print("\nschedule_visualizer2 not found. Skipping visualisation.")
 
 
+def validate_warmstart(solution, pick_events, handles):
+    """
+    Checks the heuristic solution for consistency with CP model constraints.
+    Returns a list of violation messages.
+    """
+    violations = []
+
+    # 1. Copy count check
+    U = handles["U"]
+    S = handles["S"]
+    for s in S:
+        evts = solution.bin_events.get(s, [])
+        counts = defaultdict(int)
+        for be in evts:
+            counts[be.sku] += 1
+        for k, count in counts.items():
+            if count > U.get(k, 0):
+                violations.append(
+                    f"Station {s} SKU {k}: Heuristic used {count} trips, CP model limit U[{k}]={U.get(k, 0)}"
+                )
+
+    # 2. Pick within Presence
+    for (o, s_sel, k), (ps, pe) in pick_events.items():
+        found = False
+        candidates = [be for be in solution.bin_events.get(s_sel, []) if be.sku == k]
+        for be in candidates:
+            if be.presence_start <= ps and pe <= be.presence_end:
+                found = True
+                break
+        if not found:
+            violations.append(
+                f"Pick {o}@{s_sel} SKU {k} [{ps},{pe}] not covered by any BinEvent presence interval at station."
+            )
+
+    # 3. Order window consistent with Picks
+    # The CP model uses `span(I_os, [C])`.
+    # This implies start(I_os) == min(start(C)) and end(I_os) == max(end(C)).
+    for o in solution.order_assignments:
+        s_sel, ln_sel, t_start, t_end = solution.order_assignments[o]
+
+        # Collect all picks for this order
+        picks = []
+        for (oo, ss, kk), (ps, pe) in pick_events.items():
+            if oo == o:
+                picks.append((ps, pe))
+
+        if not picks:
+            continue
+
+        min_p = min(ps for ps, pe in picks)
+        max_p = max(pe for ps, pe in picks)
+
+        if t_start != min_p:
+            violations.append(
+                f"Order {o}: Heuristic Start {t_start} != Min Pick Start {min_p}"
+            )
+        if t_end != max_p:
+            violations.append(
+                f"Order {o}: Heuristic End {t_end} != Max Pick End {max_p}"
+            )
+
+    # 4. Lane fill order symmetry breaking (diagnostic on raw heuristic lanes)
+    S = handles["S"]
+    L = handles["L"]
+    for s in S:
+        lane_counts = defaultdict(int)
+        for o, (s_a, ln_a, _, _) in solution.order_assignments.items():
+            if s_a == s:
+                lane_counts[ln_a] += 1
+        for i in range(len(L) - 1):
+            count_i = lane_counts.get(L[i], 0)
+            count_next = lane_counts.get(L[i + 1], 0)
+            if count_i < count_next:
+                violations.append(
+                    f"Symmetry (A) raw lanes at station {s}: "
+                    f"lane {L[i]} has {count_i} orders < lane {L[i + 1]} has {count_next} "
+                    f"(inject_warmstart will remap)"
+                )
+
+    # 5. Bin copy prefix ordering (temporal check on sorted bin events)
+    for s in S:
+        evts = solution.bin_events.get(s, [])
+        by_sku = defaultdict(list)
+        for be in evts:
+            by_sku[be.sku].append(be)
+        for k, k_evts in by_sku.items():
+            k_sorted = sorted(k_evts, key=lambda x: x.fetch_start)
+            for i in range(len(k_sorted) - 1):
+                if k_sorted[i].presence_end > k_sorted[i + 1].presence_start:
+                    violations.append(
+                        f"Symmetry (B) at station {s} SKU {k}: "
+                        f"B[e={i}].presence_end={k_sorted[i].presence_end} > "
+                        f"B[e={i + 1}].presence_start={k_sorted[i + 1].presence_start}"
+                    )
+
+    # 6. Order completeness — every order in the CP model must be assigned
+    O_all = handles["O"]
+    for o in O_all:
+        if o not in solution.order_assignments:
+            violations.append(f"Order {o} not assigned in solution")
+
+    # 7. Lane no-overlap — mirrors validate_solution check 2
+    lane_usage: dict = defaultdict(list)
+    for o, (s_a, ln_a, t_s, t_e) in solution.order_assignments.items():
+        lane_usage[(s_a, ln_a)].append((t_s, t_e, o))
+    for (s, ln), intervals in lane_usage.items():
+        intervals.sort()
+        for i in range(len(intervals) - 1):
+            _, end_i, o_i = intervals[i]
+            start_j, _, o_j = intervals[i + 1]
+            if end_i > start_j:
+                violations.append(
+                    f"Lane overlap at S{s} L{ln}: order {o_i} ends {end_i} > order {o_j} starts {start_j}"
+                )
+
+    # 8. Pickface no-overlap — mirrors validate_solution check 3
+    for s in S:
+        presences = sorted(
+            [
+                (be.presence_start, be.presence_end, be.sku)
+                for be in solution.bin_events.get(s, [])
+            ]
+        )
+        for i in range(len(presences) - 1):
+            _, end_i, k_i = presences[i]
+            start_j, _, k_j = presences[i + 1]
+            if end_i > start_j:
+                violations.append(
+                    f"Pickface overlap at S{s}: SKU {k_i} ends {end_i} > SKU {k_j} starts {start_j}"
+                )
+
+    # 9. Bin timing consistency — mirrors validate_solution check 6
+    rt_dict = handles["rt"]
+    rt_return_dict = handles["rt_return"]
+    for s in S:
+        for be in solution.bin_events.get(s, []):
+            k = be.sku
+            if k not in rt_dict:
+                continue  # unknown SKU (e.g., injected in tests); skip
+            if be.fetch_end - be.fetch_start != rt_dict[k]:
+                violations.append(
+                    f"S{s} SKU {k}: fetch duration {be.fetch_end - be.fetch_start} != rt[{k}]={rt_dict[k]}"
+                )
+            if be.return_end - be.return_start != rt_return_dict[k]:
+                violations.append(
+                    f"S{s} SKU {k}: return duration {be.return_end - be.return_start} "
+                    f"!= rt_return[{k}]={rt_return_dict[k]}"
+                )
+            if be.presence_start != be.fetch_end:
+                violations.append(
+                    f"S{s} SKU {k}: presence_start {be.presence_start} != fetch_end {be.fetch_end}"
+                )
+            if be.presence_end != be.return_start:
+                violations.append(
+                    f"S{s} SKU {k}: presence_end {be.presence_end} != return_start {be.return_start}"
+                )
+
+    # 10. Block concurrency <= N[k] — mirrors validate_solution check 4
+    N_map = handles.get("N")
+    if N_map is not None:
+        for k in handles["K"]:
+            all_blocks = [
+                (be.fetch_start, be.return_end)
+                for s in S
+                for be in solution.bin_events.get(s, [])
+                if be.sku == k
+            ]
+            if len(all_blocks) <= N_map.get(k, 1):
+                continue
+            sweep = []
+            for bs, be_end in all_blocks:
+                sweep.append((bs, +1))
+                sweep.append((be_end, -1))
+            sweep.sort(key=lambda x: (x[0], x[1]))
+            concurrent = 0
+            for t, delta in sweep:
+                concurrent += delta
+                if concurrent > N_map[k]:
+                    violations.append(
+                        f"Block concurrency SKU {k}: {concurrent} > N[{k}]={N_map[k]} at t={t}"
+                    )
+                    break
+
+    # 11. MoveCap — mirrors validate_solution check 5
+    mc = handles.get("move_cap")
+    if mc is not None:
+        sweep = []
+        for s in S:
+            for be in solution.bin_events.get(s, []):
+                sweep.append((be.fetch_start, +1))
+                sweep.append((be.fetch_end, -1))
+                sweep.append((be.return_start, +1))
+                sweep.append((be.return_end, -1))
+        sweep.sort(key=lambda x: (x[0], x[1]))
+        concurrent = 0
+        for t, delta in sweep:
+            concurrent += delta
+            if concurrent > mc:
+                violations.append(f"MoveCap violation: {concurrent} > {mc} at t={t}")
+                break
+
+    return violations
+
+
 if __name__ == "__main__":
     main()
