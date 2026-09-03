@@ -850,7 +850,8 @@ class Solver:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run matheuristic experiments.")
     parser.add_argument(
-        "instance_name",
+        "instances",
+        nargs="+",
         type=str,
         help="Name of the precalculated instance folder under precalculated_instances/",
     )
@@ -911,7 +912,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--presolve",
         type=str,
-        default="Auto",
+        default="On",
         choices=["Auto", "On", "Off"],
         help="Presolve setting for CP Optimizer",
     )
@@ -956,23 +957,27 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    experiment_config = {
-        "runs": args.runs,
-        "iters": args.iters,
-        "stagnation_th": args.stagnation_th,
-        "severity_step": args.severity_step,
-        "max_severity": args.max_severity,
-        "iter_time_limit": args.iter_time_limit,
-        "delta_freezing": args.delta_freezing,
-        "starting_point_for_frozen": args.starting_point_for_frozen,
-        "eps_greedy_prob": args.eps_greedy_prob,
-        "backend": args.backend,
-        "improvement_constr": args.improvement_constr,
-        "presolve": args.presolve,
-        "workers": args.workers,
-        "search_type": args.search_type,
-    }
-    solver = Solver(
-        experiment_config,
-        instance_path=f"precalculated_instances/{args.instance_name}",
-    )
+    for instance in args.instances:
+        if "precalculated_instances/" in instance:
+            instance = instance.split('/')[1]
+            
+        experiment_config = {
+            "runs": args.runs,
+            "iters": args.iters,
+            "stagnation_th": args.stagnation_th,
+            "severity_step": args.severity_step,
+            "max_severity": args.max_severity,
+            "iter_time_limit": args.iter_time_limit,
+            "delta_freezing": args.delta_freezing,
+            "starting_point_for_frozen": args.starting_point_for_frozen,
+            "eps_greedy_prob": args.eps_greedy_prob,
+            "backend": args.backend,
+            "improvement_constr": args.improvement_constr,
+            "presolve": args.presolve,
+            "workers": args.workers,
+            "search_type": args.search_type,
+        }
+        solver = Solver(
+            experiment_config,
+            instance_path=f"precalculated_instances/{instance}",
+        )
