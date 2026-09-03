@@ -183,13 +183,24 @@ class VisualLogger:
         with open(f"{self.path}/run{self.current_run}-solution.pkl", "wb") as f:
             pickle.dump(sol_dict, f)
 
-        # Attempt CP lookup
-        try:
-            with open(f"{self.instance_folder}/cp_intermediate_records.pkl", "rb") as f:
-                cp_records = pickle.load(f)
-                cp_1hour_best = cp_records[-1]["best"]
-        except (FileNotFoundError, IndexError):
-            cp_1hour_best = 0
+        # Attempt CP lookup — load all seeds and compute mean final best
+        import glob
+
+        cp_pattern = os.path.join(self.instance_folder, "cp_intermediate_records_*.pkl")
+        cp_files = sorted(glob.glob(cp_pattern))
+        cp_final_bests = []
+        for fpath in cp_files:
+            try:
+                with open(fpath, "rb") as f:
+                    records = pickle.load(f)
+                    cp_final_bests.append(records[-1]["best"])
+            except (FileNotFoundError, IndexError, pickle.UnpicklingError):
+                continue
+
+        if cp_final_bests:
+            cp_1hour_best = float(np.mean(cp_final_bests))
+        else:
+            cp_1hour_best = 0.0
 
         gap_to_cp = (
             ((best_makespan - cp_1hour_best) / cp_1hour_best) * 100
@@ -205,7 +216,8 @@ class VisualLogger:
             f"=================================================\n"
             f"Total Run Time : {run_time:.2f}s\n"
             f"Best Makespan  : {best_makespan:.1f}\n"
-            f"1-Hour CP Best : {cp_1hour_best:.1f}\n"
+            f"CP Seeds Found : {len(cp_final_bests)}\n"
+            f"Mean CP Best   : {cp_1hour_best:.1f}\n"
             f"Gap to CP      : {gap_to_cp:+.2f}%\n"
             f"=================================================\n"
         )
@@ -331,27 +343,59 @@ class VisualLogger:
         self.current_run_data[stat_name][self.current_iteration] = value
 
     def get_cp_performance(self, mth_mean_ticks):
-        try:
-            with open(f"{self.instance_folder}/cp_intermediate_records.pkl", "rb") as f:
-                cp_records = pickle.load(f)
+        """Load all cp_intermediate_records_{seed}.pkl files and compute
+        mean ± std CP trajectory (time-aligned) and mean ± std 1-hour best."""
+        import glob
 
-            cp_result_at_tick = np.zeros_like(mth_mean_ticks)
-            last_record = 0
+        pattern = os.path.join(self.instance_folder, "cp_intermediate_records_*.pkl")
+        cp_files = sorted(glob.glob(pattern))
 
-            for i, tick in enumerate(mth_mean_ticks):
-                while (
-                    last_record < len(cp_records) - 1
-                    and cp_records[last_record + 1]["time"] < tick
-                ):
-                    last_record += 1
-                cp_result_at_tick[i] = cp_records[last_record]["best"]
+        if not cp_files:
+            logger.warning("No CP records found. Skipping CP performance mapping.")
+            return None, None, None, None
 
-            return cp_result_at_tick, cp_records[-1]["best"]
-        except (FileNotFoundError, IndexError):
+        # Load all seed records
+        all_records = []
+        for fpath in cp_files:
+            try:
+                with open(fpath, "rb") as f:
+                    all_records.append(pickle.load(f))
+            except (FileNotFoundError, pickle.UnpicklingError, IndexError) as e:
+                logger.warning(f"Could not load {fpath}: {e}")
+                continue
+
+        if not all_records:
             logger.warning(
-                "CP records not found or malformed. Skipping CP performance mapping."
+                "No valid CP records loaded. Skipping CP performance mapping."
             )
-            return np.zeros_like(mth_mean_ticks), 0
+            return None, None, None, None
+
+        # For each seed, interpolate the best value at each matheuristic time tick
+        n_seeds = len(all_records)
+        n_ticks = len(mth_mean_ticks)
+        trajectory = np.full((n_seeds, n_ticks), np.nan, dtype=np.float64)
+        final_bests = np.zeros(n_seeds, dtype=np.float64)
+
+        for s, records in enumerate(all_records):
+            bests = np.array([r["best"] for r in records], dtype=np.float64)
+            final_bests[s] = bests[-1]
+
+            # Interpolate: for each tick, find the last record whose time <= tick
+            last_idx = 0
+            for t_idx, tick in enumerate(mth_mean_ticks):
+                while (
+                    last_idx < len(records) - 1 and records[last_idx + 1]["time"] < tick
+                ):
+                    last_idx += 1
+                trajectory[s, t_idx] = records[last_idx]["best"]
+
+        # Compute mean and std across seeds
+        mean_traj = np.nanmean(trajectory, axis=0)
+        std_traj = np.nanstd(trajectory, axis=0, ddof=1)  # sample std
+        mean_final = np.mean(final_bests)
+        std_final = np.std(final_bests, ddof=1)
+
+        return mean_traj, std_traj, mean_final, std_final
 
     def save_experiment(self):
         # 1. Save Configs and Data
@@ -403,18 +447,47 @@ class VisualLogger:
         )
 
         # CP Performance Comparison mapped to Mean Time ticks
-        cp_performance, cp_1hour_best = self.get_cp_performance(mean_time.values)
-        if cp_1hour_best > 0:
+        cp_mean, cp_std, cp_final_mean, cp_final_std = self.get_cp_performance(
+            mean_time.values
+        )
+
+        if cp_mean is not None:
+            # Time-aligned CP trajectory with std envelope
             plt.plot(
                 iters,
-                cp_performance,
+                cp_mean,
                 color="green",
                 linestyle="--",
-                label="CP Trajectory (Time-Aligned)",
+                label="CP Trajectory (Time-Aligned, Mean ± 1σ)",
             )
-            plt.axhline(
-                y=cp_1hour_best, color="red", linestyle=":", label="CP 1-Hour Best"
+            plt.fill_between(
+                iters,
+                cp_mean - cp_std,
+                cp_mean + cp_std,
+                color="green",
+                alpha=0.15,
             )
+
+            # 1-hour baseline with std envelope
+            if cp_final_mean > 0:
+                plt.axhline(
+                    y=cp_final_mean,
+                    color="red",
+                    linestyle=":",
+                    label="CP 1-Hour Best (Mean ± 1σ)",
+                )
+                plt.axhline(
+                    y=cp_final_mean - cp_final_std,
+                    color="red",
+                    linestyle=":",
+                    alpha=0.3,
+                )
+                plt.axhline(
+                    y=cp_final_mean + cp_final_std,
+                    color="red",
+                    linestyle=":",
+                    alpha=0.3,
+                )
 
         # Overlay Severity Lines
         self._plot_severity_lines()
