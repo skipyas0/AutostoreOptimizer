@@ -21,6 +21,55 @@ MATHEURISTIC_SCRIPT = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "matheuristic.py"
 )
 
+# Default CPLEX installation path on the server
+DEFAULT_CPLEX_DIR = "/home/kloudvoj/ibm/ILOG/CPLEX_Studio222"
+
+
+def build_cplex_env(cplex_dir):
+    """Build an environment dict with CPLEX library paths set for subprocesses."""
+    env = os.environ.copy()
+
+    # Set CPLEX_DIR so docplex can find the installation
+    env["CPLEX_DIR"] = cplex_dir
+
+    # Determine architecture subdirectory
+    if sys.platform == "darwin":
+        cplex_lib_base = os.path.join(cplex_dir, "cplex", "lib")
+        if os.path.exists(os.path.join(cplex_lib_base, "arm64_osx")):
+            arch_dir = "arm64_osx"
+        else:
+            arch_dir = "x86-64_osx"
+        lib_path_var = "DYLD_LIBRARY_PATH"
+    else:
+        arch_dir = "x86-64_linux"
+        lib_path_var = "LD_LIBRARY_PATH"
+
+    fmt_dir = "static_pic"
+
+    # Collect all CPLEX library directories
+    lib_dirs = []
+    for sub in ("cplex", "cpoptimizer", "concert"):
+        base = os.path.join(cplex_dir, sub, "lib")
+        candidate = os.path.join(base, arch_dir, fmt_dir)
+        if os.path.exists(candidate):
+            lib_dirs.append(candidate)
+        else:
+            candidate = os.path.join(base, arch_dir)
+            if os.path.exists(candidate):
+                lib_dirs.append(candidate)
+            else:
+                lib_dirs.append(base)
+
+    # Prepend to the library path variable
+    existing = env.get(lib_path_var, "")
+    new_path = ":".join(lib_dirs)
+    if existing:
+        env[lib_path_var] = f"{new_path}:{existing}"
+    else:
+        env[lib_path_var] = new_path
+
+    return env
+
 
 def get_instance_folders():
     """Return sorted list of instance folder names under precalculated_instances/."""
@@ -132,6 +181,12 @@ def main():
 
     # Batch-specific arguments
     parser.add_argument(
+        "--cplex-dir",
+        type=str,
+        default=DEFAULT_CPLEX_DIR,
+        help=f"CPLEX installation directory (default: {DEFAULT_CPLEX_DIR})",
+    )
+    parser.add_argument(
         "--skip",
         type=str,
         nargs="*",
@@ -218,6 +273,9 @@ def main():
             print(f"  $ {' '.join(cmd)}")
         sys.exit(0)
 
+    # Build CPLEX environment for subprocesses
+    cplex_env = build_cplex_env(args.cplex_dir)
+
     # Run instances
     if args.sequential:
         for folder in instance_folders:
@@ -225,7 +283,9 @@ def main():
             print(f"\n{'─' * 72}")
             print(f"Running: {folder}")
             print(f"{'─' * 72}")
-            result = subprocess.run(cmd, cwd=os.path.dirname(MATHEURISTIC_SCRIPT))
+            result = subprocess.run(
+                cmd, cwd=os.path.dirname(MATHEURISTIC_SCRIPT), env=cplex_env
+            )
             if result.returncode != 0:
                 print(
                     f"ERROR: {folder} failed with exit code {result.returncode}",
@@ -247,6 +307,7 @@ def main():
                 cwd=os.path.dirname(MATHEURISTIC_SCRIPT),
                 capture_output=True,
                 text=True,
+                env=cplex_env,
             )
             return folder, result.returncode, result.stdout, result.stderr
 
