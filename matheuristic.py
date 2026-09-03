@@ -1,4 +1,3 @@
-from time import sleep
 import argparse
 import json
 import os
@@ -9,8 +8,8 @@ from docplex.cp.solution import CpoSolveResult
 from loguru import logger
 
 import cp_model as docplex_model
-import ortools_cp_model as ortools_model
 import cpp_cp_model
+import ortools_cp_model as ortools_model
 from autostore_heuristic import BinEvent, Solution, validate_solution
 from freezing_utils import (
     FreezeManager,
@@ -207,8 +206,9 @@ def sort_variables(mdl, sp, backend="docplex", handles=None):
         sorted_vars = sorted(interval_vars, key=lambda v: (get_start_time(v), v.name))
         var_to_idx = {var: idx for idx, var in enumerate(sorted_vars)}
         return var_to_idx, len(var_to_idx)
-        
+
     if backend == "cpp":
+
         def get_start_time(var):
             var_sol = sp.get_var_solution(var)
             if var_sol is not None and var_sol.is_present():
@@ -216,7 +216,9 @@ def sort_variables(mdl, sp, backend="docplex", handles=None):
             return float("inf")
 
         interval_vars = list(handles["all_intervals_flat"].values())
-        sorted_vars = sorted(interval_vars, key=lambda v: (get_start_time(v), v.get_name()))
+        sorted_vars = sorted(
+            interval_vars, key=lambda v: (get_start_time(v), v.get_name())
+        )
         var_to_idx = {var: idx for idx, var in enumerate(sorted_vars)}
         return var_to_idx, len(var_to_idx)
 
@@ -266,9 +268,9 @@ def load_instance(instance_config=None, instance_folder=None):
     with open(f"{instance_folder}/heuristic_solution.pkl", "rb") as f:
         heur_sol = pickle.load(f)
 
-    with open(f"{instance_folder}/cp_intermediate_records.pkl", "rb") as f:
-        cp_records = pickle.load(f)
-    return instance, heur_sol, cp_records, instance_folder, instance_config
+    # with open(f"{instance_folder}/cp_intermediate_records.pkl", "rb") as f:
+    # cp_records = pickle.load(f)
+    return instance, heur_sol, instance_folder, instance_config
 
 
 def prepare_model_docplex(config, instance, heur_sol):
@@ -302,7 +304,9 @@ class MockCpoStartingPoint:
     def __init__(self):
         self.state_dict = {}
 
-    def add_interval_var_solution(self, var, presence=False, start=None, end=None, size=None):
+    def add_interval_var_solution(
+        self, var, presence=False, start=None, end=None, size=None
+    ):
         name = var.get_name()
         d = {"present": 1 if presence else 0}
         if start is not None:
@@ -312,7 +316,7 @@ class MockCpoStartingPoint:
         if size is not None:
             d["size"] = size
         self.state_dict[name] = d
-        
+
     def add_integer_var_solution(self, var, value):
         pass
 
@@ -332,20 +336,26 @@ def prepare_model_cpp(config, instance, heur_sol):
     mock_sp = docplex_model.inject_warmstart(
         heur_sol, heur_sol.pick_events, mock_mdl, handles
     )
-    
+
     warm_names, warm_p, warm_s, warm_e = [], [], [], []
     for name, state in mock_sp.state_dict.items():
         warm_names.append(name)
         warm_p.append(state.get("present", 0))
         warm_s.append(state.get("start", 0))
         warm_e.append(state.get("end", 0))
-        
+
     mdl.apply_warm_start(warm_names, warm_p, warm_s, warm_e)
-    return mdl, handles, cpp_cp_model.CppSolveResult({
-        "status": "Feasible", 
-        "objective": heur_sol.makespan, 
-        "var_solutions": mock_sp.state_dict
-    })
+    return (
+        mdl,
+        handles,
+        cpp_cp_model.CppSolveResult(
+            {
+                "status": "Feasible",
+                "objective": heur_sol.makespan,
+                "var_solutions": mock_sp.state_dict,
+            }
+        ),
+    )
 
 
 class Solver:
@@ -353,7 +363,7 @@ class Solver:
         (
             self.instance,
             self.heur_sol,
-            self.cp_records,
+            # self.cp_records,
             instance_path,
             instance_config,
         ) = load_instance(instance_config, instance_path)
@@ -444,7 +454,7 @@ class Solver:
             if incumbent > self.current_result + 1e-6:
                 # it shouldn't be possible to get a worse result if the solver achieved optimum
                 # if self.experiment_config["backend"] != "ortools":
-                    # assert solve_status == "Feasible"
+                # assert solve_status == "Feasible"
                 status = Status.Feasible_Degradation
 
             elif incumbent >= self.current_result:
@@ -533,12 +543,14 @@ class Solver:
                 self.instance_config, self.instance, self.heur_sol
             )
         elif self.experiment_config["backend"] == "cpp":
-            
             self.mdl, self.handles, sp = prepare_model_cpp(
                 self.instance_config, self.instance, self.heur_sol
             )
-        
-        if self.experiment_config["delta_freezing"] and self.experiment_config["backend"] != "cpp":
+
+        if (
+            self.experiment_config["delta_freezing"]
+            and self.experiment_config["backend"] != "cpp"
+        ):
             self.freeze_manager = FreezeManager(
                 self.mdl,
                 self.experiment_config["backend"],
@@ -627,7 +639,6 @@ class Solver:
         # start iterations
         self.vlg.log_run_start(num_variables, var_to_idx, sp)
         for i in range(self.experiment_config["iters"]):
-            
             self.vlg.log_iteration_start(i)
             if (
                 self.stagnation_count >= self.experiment_config["stagnation_th"]
@@ -669,23 +680,23 @@ class Solver:
             # generate freeze constraints from the to_optimize set
             if self.experiment_config["backend"] == "cpp":
                 to_optimize_names = {v.get_name() for v in to_optimize}
-                
+
                 frozen_names, frozen_p, frozen_s, frozen_e = [], [], [], []
                 warm_names, warm_p, warm_s, warm_e = [], [], [], []
                 unfrozen_names = []
                 new_frozen_vars = set()
-                
+
                 for name, vs in self.current_solution.var_sols.items():
                     p = 1 if vs.get("present") else 0
                     s = vs.get("start", 0) if p else 0
                     e = vs.get("end", 0) if p else 0
-                    
+
                     if name in to_optimize_names:
                         warm_names.append(name)
                         warm_p.append(p)
                         warm_s.append(s)
                         warm_e.append(e)
-                    
+
                     if name not in to_optimize_names:
                         new_frozen_vars.add(name)
                         if name not in self.cpp_frozen_vars:
@@ -697,16 +708,18 @@ class Solver:
                 for name in self.cpp_frozen_vars:
                     if name not in new_frozen_vars:
                         unfrozen_names.append(name)
-                        
+
                 self.cpp_frozen_vars = new_frozen_vars
 
                 self.vlg.add_stat_to_current(
-                "constr_generate_time", self.vlg.time_diff_with_overwrite()
+                    "constr_generate_time", self.vlg.time_diff_with_overwrite()
                 )
 
-                self.mdl.apply_delta_freezing(frozen_names, frozen_p, frozen_s, frozen_e, unfrozen_names)
+                self.mdl.apply_delta_freezing(
+                    frozen_names, frozen_p, frozen_s, frozen_e, unfrozen_names
+                )
                 self.mdl.apply_warm_start(warm_names, warm_p, warm_s, warm_e)
-                
+
                 to_add, to_remove, freeze_constraints = [], [], []
             else:
                 to_add, to_remove, freeze_constraints = self.get_freeze_sets(
@@ -785,18 +798,18 @@ class Solver:
                 self.vlg.log_solve_time(sol)
             elif self.experiment_config["backend"] == "cpp":
                 self.vlg.log_freeze_constr(to_optimize, var_to_idx, strat_idx)
-                
+
                 impr_makespan = -1
                 if self.experiment_config["improvement_constr"]:
                     impr_makespan = self.current_result - 1
-                    
+
                 self.vlg.time_from_here()
                 result_dict = self.mdl.solve(
                     self.experiment_config["iter_time_limit"],
                     impr_makespan,
                     self.experiment_config["workers"],
                     self.experiment_config["presolve"],
-                    self.experiment_config["search_type"]
+                    self.experiment_config["search_type"],
                 )
                 sol = cpp_cp_model.CppSolveResult(result_dict)
                 self.vlg.log_solve_time(sol)
@@ -957,7 +970,7 @@ if __name__ == "__main__":
         "improvement_constr": args.improvement_constr,
         "presolve": args.presolve,
         "workers": args.workers,
-        "search_type": args.search_type
+        "search_type": args.search_type,
     }
     solver = Solver(
         experiment_config,
