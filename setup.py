@@ -126,6 +126,40 @@ def get_distrobox_container(requested=None):
     return "ubuntu"
 
 
+def ensure_python_dev():
+    import sysconfig
+    include_dir = sysconfig.get_path("include")
+    py_ver = f"{sys.version_info.major}.{sys.version_info.minor}"
+    candidates = [
+        os.path.join(include_dir, "Python.h"),
+        os.path.join(sys.prefix, "include", "Python.h"),
+        os.path.join(sys.prefix, "include", f"python{py_ver}", "Python.h"),
+        f"/usr/include/python{py_ver}/Python.h",
+        f"/usr/local/include/python{py_ver}/Python.h",
+    ]
+    if any(os.path.exists(p) for p in candidates):
+        return True
+
+    print(f"\n[!] Python.h was not found in: {include_dir}")
+    print(f"[!] Ubuntu requires the 'python3-dev' (or 'python{py_ver}-dev') package for compiling C/C++ extensions.")
+
+    # In distrobox, users typically have passwordless sudo by default; attempt auto-installation
+    if os.path.exists("/usr/bin/apt-get"):
+        print("[*] Attempting to install 'python3-dev' automatically via sudo apt-get...")
+        try:
+            subprocess.run(["sudo", "apt-get", "update", "-qq"], check=True)
+            subprocess.run(["sudo", "apt-get", "install", "-y", f"python{py_ver}-dev", "build-essential"], check=True)
+            if any(os.path.exists(p) for p in candidates):
+                print("[+] Successfully installed python development headers!\n")
+                return True
+        except Exception as e:
+            print(f"[-] Auto-installation failed: {e}")
+
+    print("\nPlease install the missing headers manually in your Ubuntu container:")
+    print(f"    sudo apt update && sudo apt install -y python{py_ver}-dev build-essential\n")
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Custom Setuptools Commands: 'mac' and 'ubuntu'
 # ---------------------------------------------------------------------------
@@ -167,6 +201,7 @@ class UbuntuCommand(Command):
     def run(self):
         if is_running_in_container() or self.direct:
             print(">>> Building C++ extension for Ubuntu (x86-64 Linux)...")
+            ensure_python_dev()
             build_ext_cmd = self.reinitialize_command("build_ext")
             build_ext_cmd.inplace = 1
             self.run_command("build_ext")
