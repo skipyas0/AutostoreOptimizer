@@ -28,7 +28,7 @@ if target_arch == "ubuntu":
     format_dir = "static_pic"
     extra_compile_args = ["-std=c++17", "-O3", "-fPIC", "-Wall", "-DIL_STD"]
     extra_link_args = ["-pthread", "-ldl"]
-    libraries = ["cp", "ilocplex", "concert", "m", "pthread", "dl"]
+    libraries = ["cp", "ilocplex", "cplex", "concert", "m", "pthread", "dl"]
 else:  # mac
     CPLEX_DIR = os.environ.get("CPLEX_DIR", "/Users/vojtech/Applications/CPLEX_Studio222")
     cplex_lib_base = os.path.join(CPLEX_DIR, "cplex", "lib")
@@ -36,7 +36,7 @@ else:  # mac
     format_dir = "static_pic"
     extra_compile_args = ["-std=c++17", "-O3", "-fPIC", "-Wall", "-DIL_STD"]
     extra_link_args = ["-framework", "CoreFoundation", "-framework", "IOKit"]
-    libraries = ["cp", "ilocplex", "concert", "m", "pthread"]
+    libraries = ["cp", "ilocplex", "cplex", "concert", "m", "pthread"]
 
 include_dirs = [
     os.path.join(CPLEX_DIR, "cplex", "include"),
