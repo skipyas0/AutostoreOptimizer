@@ -8,6 +8,7 @@ logs
 results
 experiments
 precalculated_instances
+cpo_verification_results
 *.html
 *.txt
 *.pkl
