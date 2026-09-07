@@ -399,7 +399,10 @@ class VisualLogger:
         self.plot_neighborhood_barcode()
         self.plot_chronological_durations()
         self.plot_binned_durations_composition()
+        self.plot_status_time_histogram()
+
         self.plot_strategy_footprints()
+        self.plot_status_time_distributions()
         logger.info(f"Experiment saved successfully to {self.path}")
 
     def _plot_severity_lines(self):
@@ -410,6 +413,67 @@ class VisualLogger:
         for i, siter in enumerate(severity_iters):
             label = "Severity Increase" if i == 0 else ""
             plt.axvline(x=siter, color="gray", linestyle=":", alpha=0.3, label=label)
+
+    def plot_status_time_distributions(self):
+        # Filter valid statuses
+        valid_df = self.df[self.df["statuses"] > 0].copy()
+
+        if valid_df.empty:
+            return
+
+        # Group the total_iter_time arrays by their status enum values
+        groups = valid_df.groupby("statuses")
+
+        data_to_plot = []
+        labels = []
+
+        for status_val, group in sorted(groups):
+            data_to_plot.append(group["total_iter_time"].values)
+            labels.append(Status(status_val).name)
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+
+        # Create the boxplot
+        bplot = ax.boxplot(
+            data_to_plot,
+            labels=labels,
+            patch_artist=True,
+            medianprops={"color": "black", "linewidth": 2},
+            boxprops={"edgecolor": "black"},
+            whiskerprops={"linestyle": "--", "color": "black"},
+            flierprops={
+                "marker": "o",
+                "markeredgecolor": "black",
+                "markerfacecolor": "none",
+            },
+        )
+
+        # Apply a distinct color map to the boxes
+        colors = plt.cm.tab10.colors[: len(labels)]
+        for patch, color in zip(bplot["boxes"], colors):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.8)
+
+        ax.set_title(
+            "Distribution of Total Iteration Times by Resulting Status", fontsize=14
+        )
+        ax.set_xlabel("Iteration Status", fontsize=12)
+        ax.set_ylabel("Total Iteration Time (seconds)", fontsize=12)
+
+        ax.yaxis.set_major_formatter(ticker.FormatStrFormatter("%g s"))
+
+        # Rotate x-labels to prevent overlapping long enum names
+        plt.xticks(rotation=45, ha="right")
+        plt.grid(True, alpha=0.3, axis="y", linestyle=":")
+
+        fig.set_layout_engine("constrained")
+
+        plt.savefig(
+            f"{self.path}/status_time_distributions.svg",
+            format="svg",
+            bbox_inches="tight",
+        )
+        plt.close()
 
     def plot_solver_progress(self):
         plt.figure(figsize=(10, 6))
@@ -846,6 +910,60 @@ class VisualLogger:
         plt.tight_layout()
         plt.savefig(
             f"{self.path}/binned_durations_composition.svg",
+            format="svg",
+            bbox_inches="tight",
+        )
+        plt.close()
+
+    def plot_status_time_histogram(self):
+        # Filter valid statuses to ignore uninitialized (-1) rows
+        valid_df = self.df[self.df["statuses"] > 0].copy()
+
+        if valid_df.empty:
+            return
+
+        # Group the data by status
+        groups = valid_df.groupby("statuses")
+
+        data_to_plot = []
+        labels = []
+
+        # Extract the total_iter_time arrays for each status and their enum names
+        for status_val, group in sorted(groups):
+            data_to_plot.append(group["total_iter_time"].values)
+            # Map the integer value back to the Status enum name
+            labels.append(Status(status_val).name)
+
+        plt.figure(figsize=(12, 7))
+
+        # Dynamically grab enough colors for the present statuses
+        colors = plt.cm.tab10.colors[: len(labels)]
+
+        # Plot the stacked histogram
+        plt.hist(
+            data_to_plot,
+            bins=20,
+            stacked=True,
+            label=labels,
+            color=colors,
+            edgecolor="black",
+            linewidth=0.5,
+        )
+
+        plt.gca().xaxis.set_major_formatter(ticker.FormatStrFormatter("%g s"))
+        plt.xlabel("Total Iteration Duration (seconds)")
+        plt.ylabel("Frequency (Count)")
+        plt.title("Distribution of Total Iteration Times by Resulting Status")
+
+        # Move legend outside the plot
+        plt.legend(title="Iteration Status", bbox_to_anchor=(1.05, 1), loc="upper left")
+        plt.grid(True, alpha=0.3, axis="y")
+
+        # Use layout engine instead of tight_layout for safer bounding
+        plt.gcf().set_layout_engine("constrained")
+
+        plt.savefig(
+            f"{self.path}/status_time_histogram.svg",
             format="svg",
             bbox_inches="tight",
         )
