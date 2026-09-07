@@ -1,7 +1,11 @@
 import random
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from loguru import logger
+
 from freezing_utils import get_assigned_station
+from matheuristic_plots import Status
 
 random.seed(42)
 
@@ -137,3 +141,129 @@ def combine_strategies(*strategy_outputs: SelectionResult) -> SelectionResult:
         combined_res.seed_skus.update(sel_results.seed_skus)
         combined_res.seed_stations.update(sel_results.seed_stations)
     return combined_res
+
+
+class StrategyManager:
+    def __init__(
+        self,
+        handles,
+        solution,
+        weighted_jaccard_matrix,
+        strategy_preset: str = "all",
+        strat_choice: str = "uniform",
+    ):
+        self.strategy_preset = strategy_preset
+        self.strat_choice = strat_choice
+
+        self.handles = handles
+        self.current_solution = solution
+        self.weighted_jaccard_matrix = weighted_jaccard_matrix
+
+        self.strategies = {
+            "random_orders": lambda sev: strategy_random_orders(
+                self.handles, self.current_solution, p=0.1 * sev
+            ),
+            "similar_orders": lambda sev: strategy_similar_orders(
+                self.handles,
+                self.current_solution,
+                0.1 * sev,
+                self.weighted_jaccard_matrix,
+            ),
+            "random_skus": lambda sev: strategy_random_skus(
+                self.handles, self.current_solution, p=0.1 * sev
+            ),
+            "random_orders_and_skus": lambda sev: combine_strategies(
+                strategy_random_orders(
+                    self.handles, self.current_solution, p=0.05 * sev
+                ),
+                strategy_random_skus(self.handles, self.current_solution, p=0.05 * sev),
+            ),
+            "random_lanes": lambda sev: strategy_random_lanes(
+                self.handles, self.current_solution, 1
+            ),
+            "single_timeslice": lambda sev: strategy_single_timeslice(
+                self.handles, self.current_solution, 100 * sev
+            ),
+            "double_timeslice": lambda sev: strategy_multi_timeslice(
+                self.handles, self.current_solution, 2, 100 * sev
+            ),
+            "triple_timeslice": lambda sev: strategy_multi_timeslice(
+                self.handles, self.current_solution, 3, 100 * sev
+            ),
+        }
+
+        self.presets = {"all": None, "shaw_random": ["similar_orders", "random_orders"]}
+
+        active_preset = self.presets[self.strategy_preset]
+        if active_preset == None:
+            self.active_strats = dict(self.strategies)
+        else:
+            self.active_strats = {
+                name: strat
+                for name, strat in self.strategies.items()
+                if name in active_preset
+            }
+        self.active_strat_names = list(self.active_strats.keys())
+
+        self.strat_statistics = {
+            name: {"num_uses": 0, "status": {s.value: 0 for s in Status}}
+            for name, strat in self.active_strats.items()
+        }
+
+        self.A, self.B, self.C, self.D = (
+            5,
+            10,
+            1,
+            0,
+        )  # const term, new best, feasible (something was found), unknown/optimal no improve)
+
+        self.scores = {name: self.A for name, strat in self.active_strats.items()}
+
+    def update_score(self, strat: str):
+        A, B, C, D = (
+            5,
+            10,
+            1,
+            0,
+        )  # const term, new best, some searching happened but no improvement, gridlocked or too large
+
+        score = A
+
+        score += (
+            len(self.strat_statistics[strat]["status"][Status.Optimal_New_Best]) * B
+        )
+        score += (
+            len(self.strat_statistics[strat]["status"][Status.Feasible_New_Best]) * B
+        )
+
+        score += len(self.strat_statistics[strat]["status"][Status.Optimal_Improve]) * C
+        score += (
+            len(self.strat_statistics[strat]["status"][Status.Feasible_Improve]) * C
+        )
+        score += (
+            len(self.strat_statistics[strat]["status"][Status.Feasible_No_Improve]) * C
+        )
+        score += len(self.strat_statistics[strat]["status"][Status.Unknown]) * C
+
+        score += (
+            len(self.strat_statistics[strat]["status"][Status.Optimal_No_Improve]) * D
+        )
+        score += (
+            len(self.strat_statistics[strat]["status"][Status.Feasible_Degradation]) * D
+        )
+        score += len(self.strat_statistics[strat]["status"][Status.Infeasible]) * D
+
+        self.scores[strat] = score / (1 + self.strat_statistics[strat]["num_uses"])
+
+    def choose_strat(self) -> Callable:
+        if self.strat_choice == "uniform":
+            strat_idx = random.randint(0, len(self.active_strat_names) - 1)
+        elif self.strat_choice == "adaptive":
+            strat_idx = random.choices(
+                range(len(self.active_strat_names)), weights=self.scores.values(), k=1
+            )[0]
+
+        strat_name = self.active_strat_names[strat_idx]
+        strat = self.active_strats[strat_name]
+        logger.debug(f"{strat_idx=}, {strat_name=}")
+        return strat_idx, strat_name, strat

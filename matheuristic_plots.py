@@ -24,6 +24,7 @@ class Status(IntEnum):
     Feasible_New_Best = 6
     Feasible_Improve = 7
     Feasible_Degradation = 8
+    Infeasible = 9
 
 
 class LoguruStream:

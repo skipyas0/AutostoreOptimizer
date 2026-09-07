@@ -21,13 +21,7 @@ from instance import Instance
 from jaccard_similarity import build_similarity_matrix
 from matheuristic_plots import Status, VisualLogger
 from neighborhood_selection import (
-    combine_strategies,
-    strategy_multi_timeslice,
-    strategy_random_lanes,
-    strategy_random_orders,
-    strategy_random_skus,
-    strategy_similar_orders,
-    strategy_single_timeslice,
+    StrategyManager,
 )
 from precalculate_instances_for_lns import check_if_precalculated, precalculate_config
 
@@ -164,16 +158,20 @@ class Solver:
         """
 
         # solver didn't find any solution
-        if sol_object is None or sol_object.get_solve_status() in [
-            "Unknown",
-            "Infeasible",
-        ]:
+        if sol_object.get_solve_status() == "Infeasible":
             if self.experiment_config["improvement_constr"]:
                 self.stagnation_count += 1
+            self.vlg.add_stat_to_current("statuses", Status.Infeasible)
+            self.vlg.add_stat_to_current("best", self.best_result)
+            self.vlg.add_stat_to_current("current", self.current_result)
+            return Status.Infeasible
+
+        if sol_object is None or sol_object.get_solve_status() == "Unknown":
             self.vlg.add_stat_to_current("statuses", Status.Unknown)
             self.vlg.add_stat_to_current("best", self.best_result)
             self.vlg.add_stat_to_current("current", self.current_result)
-            return
+            return Status.Unknown
+
         solve_status = sol_object.get_solve_status()
         incumbent = sol_object.get_objective_value()
 
@@ -299,60 +297,14 @@ class Solver:
             self.handles["rt_return"],
             normalize=False,
         )
-        strategies = [
-            lambda sev: (
-                strategy_random_orders(
-                    self.handles, self.current_solution, p=0.1 * sev
-                ),
-                "random_orders",
-            ),
-            lambda sev: (
-                strategy_similar_orders(
-                    self.handles,
-                    self.current_solution,
-                    0.1 * sev,
-                    self.weighted_jaccard_matrix,
-                ),
-                "similar_orders",
-            ),
-            lambda sev: (
-                strategy_random_skus(self.handles, self.current_solution, p=0.1 * sev),
-                "random_skus",
-            ),
-            lambda sev: (
-                combine_strategies(
-                    strategy_random_orders(
-                        self.handles, self.current_solution, p=0.05 * sev
-                    ),
-                    strategy_random_skus(
-                        self.handles, self.current_solution, p=0.05 * sev
-                    ),
-                ),
-                "random_orders_and_skus",
-            ),
-            lambda sev: (
-                strategy_random_lanes(self.handles, self.current_solution, 1),
-                "random_lanes",
-            ),
-            lambda sev: (
-                strategy_single_timeslice(
-                    self.handles, self.current_solution, 100 * sev
-                ),
-                "single_timeslice",
-            ),
-            lambda sev: (
-                strategy_multi_timeslice(
-                    self.handles, self.current_solution, 2, 100 * sev
-                ),
-                "double_timeslice",
-            ),
-            lambda sev: (
-                strategy_multi_timeslice(
-                    self.handles, self.current_solution, 3, 100 * sev
-                ),
-                "triple_timeslice",
-            ),
-        ]
+
+        strategy_manager = StrategyManager(
+            self.handles,
+            sp,
+            self.weighted_jaccard_matrix,
+            self.experiment_config["strat_preset"],
+            self.experiment_config["strat_choice"],
+        )
 
         # prepare variable index sorted look-up for unfrozen set logging
         var_to_idx, num_variables = sort_variables(
@@ -384,8 +336,8 @@ class Solver:
                 self.stagnation_count = 0
 
             self.vlg.time_from_here()
-            strat_idx = random.randint(0, len(strategies) - 1)
-            strategy_results, strat_name = strategies[strat_idx](self.severity)
+            strat_idx, strat_name, strat_lambda = strategy_manager.choose_strat()
+            strategy_results = strat_lambda(self.severity)
             self.vlg.log_strategy(strat_name, strat_idx)
 
             # create to_optimize set with graph traversal
@@ -474,9 +426,7 @@ class Solver:
                     Workers=self.experiment_config["workers"],
                     Presolve=self.experiment_config["presolve"],
                     SearchType=self.experiment_config["search_type"],
-                    # log_output=lg,
                 )
-                self.vlg.log_solve_time(sol)
             elif self.experiment_config["backend"] == "cpp":
                 self.vlg.log_freeze_constr(to_optimize, var_to_idx, strat_idx)
 
@@ -493,12 +443,17 @@ class Solver:
                     self.experiment_config["search_type"],
                 )
                 sol = CppSolveResult(result_dict)
-                self.vlg.log_solve_time(sol)
-                self.eps_greedy_acceptance(sol, sol.get_solve_status())
+            else:
+                raise ValueError(self.experiment_config["backend"])
 
-            # run eps-greedy acceptance (already done for cpp)
-            if self.experiment_config["backend"] == "docplex":
-                self.eps_greedy_acceptance(sol, sol.get_solve_status())
+            # log solution and run eps-greedy
+            self.vlg.log_solve_time(sol)
+            status = self.eps_greedy_acceptance(sol, sol.get_solve_status())
+
+            # log to strategy manager
+            strategy_manager.strat_statistics[strat_name]["num_uses"] += 1
+            strategy_manager.strat_statistics[strat_name]["status"][status] += 1
+            strategy_manager.current_solution = self.current_solution
 
             # log iteration end in VisualLogger
             self.vlg.log_iteration()
@@ -570,6 +525,15 @@ if __name__ == "__main__":
         dest="severity_step",
         help="Severity increment step (default: 1)",
     )
+
+    parser.add_argument(
+        "--severity-backup",
+        type=str,
+        default="none",
+        choices=["none", "new_best", "status"],
+        help="Presolve setting for CP Optimizer",
+    )
+
     parser.add_argument(
         "--max-severity",
         type=int,
@@ -603,6 +567,22 @@ if __name__ == "__main__":
         default="Auto",
         choices=["Auto", "DepthFirst", "Restart", "MultiPoint"],
         help="Search type for CP Optimizer",
+    )
+
+    parser.add_argument(
+        "--strat-preset",
+        type=str,
+        default="all",
+        choices=["all", "shaw_random"],
+        help="Which strategies are used during optimization (presets defined in neighborhood_selection.py)",
+    )
+
+    parser.add_argument(
+        "--strat-choice",
+        type=str,
+        default="uniform",
+        choices=["uniform", "adaptive"],
+        help="How strategies are chosen in each iteration.",
     )
 
     parser.add_argument(
@@ -647,6 +627,7 @@ if __name__ == "__main__":
             "iters": args.iters,
             "stagnation_th": args.stagnation_th,
             "severity_step": args.severity_step,
+            "severity_backup": args.severity_backup,
             "max_severity": args.max_severity,
             "iter_time_limit": args.iter_time_limit,
             "delta_freezing": args.delta_freezing,
@@ -657,6 +638,8 @@ if __name__ == "__main__":
             "presolve": args.presolve,
             "workers": args.workers,
             "search_type": args.search_type,
+            "strat_choice": args.strat_choice,
+            "strat_preset": args.strat_preset,
         }
         solver = Solver(
             experiment_config,

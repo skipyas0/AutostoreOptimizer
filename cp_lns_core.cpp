@@ -437,7 +437,12 @@ public:
         
         py::dict result;
         if (found) {
-            result["status"] = (cp.getInfo(IloCP::FailStatus) == IloCP::SearchStopped) ? "Feasible" : "Optimal";
+            if (cp.getInfo(IloCP::SearchStatus) == IloCP::SearchCompleted) {
+                result["status"] = "Optimal";
+            } else {
+                // SearchStopped due to time limit, or other interrupt
+                result["status"] = "Feasible";
+            }
             result["objective"] = cp.getObjValue();
             
             double total_time = cp.getInfo(IloCP::SolveTime);
@@ -466,7 +471,12 @@ public:
             }
             result["var_solutions"] = var_sols;
         } else {
-            result["status"] = "Unknown";
+            if (cp.getInfo(IloCP::SearchStatus) == IloCP::SearchCompleted) {
+                result["status"] = "Infeasible";
+            } else {
+                result["status"] = "Unknown"; // Timed out before finding any valid solution
+            }
+            
             result["objective"] = py::none();
             result["var_solutions"] = py::dict();
             
