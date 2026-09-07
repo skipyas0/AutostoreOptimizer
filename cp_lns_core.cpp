@@ -494,6 +494,10 @@ public:
         
         return result;
     }
+
+    void export_model(const std::string& filename) {
+        cp.dumpModel(filename.c_str());
+    }
 };
 
 PYBIND11_MODULE(cp_lns_core, m) {
@@ -501,5 +505,9 @@ PYBIND11_MODULE(cp_lns_core, m) {
         .def(py::init<std::vector<int>, std::vector<int>, std::vector<int>, std::map<int, std::vector<int>>, std::map<int, int>, std::map<int, int>, std::map<int, int>, std::optional<int>, std::map<int, int>, std::vector<int>, std::map<int, int>, int, bool>())
         .def("apply_warm_start", &CpLnsModel::apply_warm_start)
         .def("apply_delta_freezing", &CpLnsModel::apply_delta_freezing)
-        .def("solve", &CpLnsModel::solve, py::arg("time_limit"), py::arg("improvement_makespan") = -1, py::arg("workers") = 1, py::arg("presolve") = "Auto", py::arg("search_type") = "Auto");
+        .def("solve", &CpLnsModel::solve, py::arg("time_limit"), py::arg("improvement_makespan") = -1, py::arg("workers") = 1, py::arg("presolve") = "Auto", py::arg("search_type") = "Auto")
+        .def("export_model", &CpLnsModel::export_model, py::arg("filename"));
 }
+
+
+

@@ -265,3 +265,253 @@ class CppSolveResult:
                 )
             )
         return sols
+
+
+def canonicalize_cpo(cpo_path: str, output_path: str | None = None) -> str:
+    """Parses a .cpo file (produced either by docplex CpoModel.export_model()
+
+    or CP Optimizer C++ cp.dumpModel()), normalizes variables, expressions,
+    intermediate Concert aliases, and constraints into a canonical, sorted
+    CPO text format.
+
+    If output_path is provided, writes the canonical CPO model to that file.
+    Returns the canonical CPO string.
+    """
+    import difflib
+    import re
+    from docplex.cp.cpo.cpo_parser import CpoParser
+    from docplex.cp.expression import CpoIntervalVar, CpoSequenceVar, CpoValue
+
+    p = CpoParser().parse(cpo_path)
+
+    # 1. Clear intermediate alias names on expressions (e.g. from Concert dumpModel)
+    def clear_names(expr):
+        if hasattr(expr, "name") and expr.name and re.match(
+            r"^(IntervalPresence|IntervalExpr|VarCumulAtom)_\d+$", str(expr.name)
+        ):
+            expr.name = None
+        if hasattr(expr, "children"):
+            for c in expr.children:
+                clear_names(c)
+
+    for e, loc in p.get_all_expressions():
+        clear_names(e)
+
+    # 2. Extract and canonicalize variable declarations
+    var_decls = []
+    for v in p.get_all_variables():
+        if not isinstance(v, CpoIntervalVar):
+            continue
+        vname = v.get_name()
+        v_str = f'"{vname}" = intervalVar(optional'
+        if hasattr(v, "get_size") and v.get_size() is not None:
+            sz = v.get_size()
+            if isinstance(sz, int) or (isinstance(sz, tuple) and sz[0] == sz[1]):
+                val = sz if isinstance(sz, int) else sz[0]
+                v_str += f", size={val}"
+        v_str += ");"
+        var_decls.append(v_str)
+    var_decls.sort()
+
+    # 3. Canonical expression formatter
+    def unwrap_list(val):
+        if isinstance(val, (list, tuple)):
+            res = []
+            for x in val:
+                res.extend(unwrap_list(x))
+            return res
+        if isinstance(val, CpoValue) and isinstance(val.value, (list, tuple)):
+            return unwrap_list(val.value)
+        if isinstance(val, CpoSequenceVar):
+            return unwrap_list(val.children)
+        return [val]
+
+    def canonical_expr_str(e):
+        if isinstance(e, CpoIntervalVar):
+            return f'"{e.get_name()}"'
+        if isinstance(e, CpoValue):
+            if isinstance(e.value, (list, tuple)):
+                items = sorted(canonical_expr_str(x) for x in e.value)
+                return "[" + ", ".join(items) + "]"
+            return str(e.value)
+
+        op = getattr(e, "operation", None)
+        op_name = op.cpo_name if op else None
+
+        # Unwrap sequenceVar in noOverlap
+        if op_name == "noOverlap":
+            child = e.children[0]
+            raw_items = unwrap_list(child)
+            items = sorted(canonical_expr_str(x) for x in raw_items)
+            return "noOverlap([" + ", ".join(items) + "])"
+
+        # Unwrap alternatives / span
+        if op_name in ("alternative", "span"):
+            head = canonical_expr_str(e.children[0])
+            cand_list = unwrap_list(e.children[1])
+            items = sorted(canonical_expr_str(x) for x in cand_list)
+            return f"{op_name}({head}, [" + ", ".join(items) + "])"
+
+        # Filter pulse(..., 0) in alwaysIn
+        if op_name == "alwaysIn":
+            cumul = e.children[0]
+            start_val = canonical_expr_str(e.children[1])
+            end_val = canonical_expr_str(e.children[2])
+            min_val = canonical_expr_str(e.children[3])
+            max_val = canonical_expr_str(e.children[4])
+
+            pulses = []
+
+            def collect_pulses(node):
+                nop = getattr(node, "operation", None)
+                if nop and nop.cpo_name in ("sum", "plus"):
+                    for ch in node.children:
+                        for x in unwrap_list(ch):
+                            collect_pulses(x)
+                elif nop and nop.cpo_name == "pulse":
+                    if len(node.children) >= 2:
+                        h_node = node.children[1]
+                        h_val = h_node.value if isinstance(h_node, CpoValue) else str(h_node)
+                        first_arg = canonical_expr_str(node.children[0])
+                        if (
+                            str(h_val) != "0"
+                            and "-4503599" not in first_arg
+                            and "intervalmin" not in first_arg
+                        ):
+                            pulses.append(f"pulse({first_arg}, {h_val})")
+                else:
+                    s = str(node)
+                    if "pulse(intervalmin, intervalmax, 0)" not in s and "-4503599" not in s and s != "0":
+                        pulses.append(canonical_expr_str(node))
+
+            collect_pulses(cumul)
+            pulses.sort()
+            return f"alwaysIn(sum([" + ", ".join(pulses) + f"]), {start_val}, {end_val}, {min_val}, {max_val})"
+
+        # Commutative equal
+        if op_name == "equal":
+            left = canonical_expr_str(e.children[0])
+            right = canonical_expr_str(e.children[1])
+            if left.isdigit() and not right.isdigit():
+                left, right = right, left
+            elif not (right.isdigit() and not left.isdigit()) and left > right:
+                left, right = right, left
+            return f"{left} == {right}"
+
+        # Commutative sum / plus in linear expressions
+        if op_name in ("sum", "plus"):
+            parts = []
+
+            def collect_sum(node):
+                nop = getattr(node, "operation", None)
+                if nop and nop.cpo_name in ("sum", "plus"):
+                    for ch in node.children:
+                        for x in unwrap_list(ch):
+                            collect_sum(x)
+                else:
+                    parts.append(canonical_expr_str(node))
+
+            collect_sum(e)
+            parts.sort()
+            return " + ".join(parts)
+
+        # Objective or nested max
+        if op_name in ("minimize", "maximize"):
+            leaves = []
+
+            def collect_max(node):
+                nop = getattr(node, "operation", None)
+                if nop and nop.cpo_name == "max":
+                    for ch in node.children:
+                        for x in unwrap_list(ch):
+                            collect_max(x)
+                else:
+                    leaves.append(canonical_expr_str(node))
+
+            collect_max(e.children[0])
+            leaves.sort()
+            return f"{op_name}(max([" + ", ".join(leaves) + "]))"
+
+        if op_name == "max":
+            leaves = []
+
+            def collect_max(node):
+                nop = getattr(node, "operation", None)
+                if nop and nop.cpo_name == "max":
+                    for ch in node.children:
+                        for x in unwrap_list(ch):
+                            collect_max(x)
+                else:
+                    leaves.append(canonical_expr_str(node))
+
+            collect_max(e)
+            leaves.sort()
+            if len(leaves) == 1:
+                return leaves[0]
+            return "max([" + ", ".join(leaves) + "])"
+
+        # If-then
+        if op_name == "ifThen":
+            cond = canonical_expr_str(e.children[0])
+            then_expr = canonical_expr_str(e.children[1])
+            return f"ifThen({cond}, {then_expr})"
+
+        # Default recursive
+        if hasattr(e, "children") and e.children:
+            args = [canonical_expr_str(c) for c in e.children]
+            op_sym = getattr(op, "keyword", None)
+            if op_sym and len(args) == 2 and op_sym not in ("==",):
+                return f"{args[0]} {op_sym} {args[1]}"
+            cpo_fn = getattr(op, "cpo_name", str(op))
+            return f"{cpo_fn}(" + ", ".join(args) + ")"
+        return str(e)
+
+    constraints = []
+    objective = None
+    for e, loc in p.get_all_expressions():
+        if e.__class__.__name__ == "CpoFunctionCall":
+            op = getattr(e, "operation", None)
+            if op and op.cpo_name in ("minimize", "maximize"):
+                objective = canonical_expr_str(e) + ";"
+            else:
+                constraints.append(canonical_expr_str(e) + ";")
+    constraints.sort()
+
+    lines = ["//--- Variables ---"] + var_decls
+    if objective:
+        lines += ["", "//--- Objective ---", objective]
+    lines += ["", "//--- Constraints ---"] + constraints
+    content = "\n".join(lines) + "\n"
+
+    if output_path:
+        with open(output_path, "w") as f:
+            f.write(content)
+
+    return content
+
+
+def compare_cpo_files(
+    py_cpo_path: str,
+    cpp_cpo_path: str,
+    py_canonical_path: str | None = None,
+    cpp_canonical_path: str | None = None,
+) -> tuple[bool, list[str]]:
+    """Canonicalizes both .cpo files and performs a line-by-line unified diff.
+
+    Returns (is_identical, diff_lines).
+    """
+    import difflib
+
+    c_py = canonicalize_cpo(py_cpo_path, py_canonical_path)
+    c_cpp = canonicalize_cpo(cpp_cpo_path, cpp_canonical_path)
+
+    diff = list(
+        difflib.unified_diff(
+            c_py.splitlines(keepends=True),
+            c_cpp.splitlines(keepends=True),
+            fromfile="py_canonical.cpo",
+            tofile="cpp_canonical.cpo",
+        )
+    )
+    return len(diff) == 0, diff
+

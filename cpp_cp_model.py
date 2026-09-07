@@ -97,3 +97,9 @@ def build_model(instance, add_symmetry_breaking: bool, horizon: int):
     }
 
     return cpp_model, handles
+
+
+def export_model(model, filename: str):
+    """Exports the C++ CP model to a .cpo file."""
+    model.export_model(filename)
+

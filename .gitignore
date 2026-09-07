@@ -18,3 +18,4 @@ precalculated_instances
 *.png
 *.so
 *.o
+*.cpo
