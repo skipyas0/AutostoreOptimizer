@@ -299,34 +299,14 @@ class VisualLogger:
     def log_solve_time(self, sol, status=None):
         wall_solve_time = self.time_diff_with_overwrite()
 
-        # --- DECOMPOSE TIMES ---
-        if hasattr(sol, "WallTime"):
-            from ortools.sat.python import cp_model
+        engine_total = sol.get_info("TotalTime") or sol.get_solve_time() or 0.0
+        engine_search = sol.get_solve_time() or 0.0
+        engine_extraction = sol.get_info("ExtractionTime") or max(
+            0.0, engine_total - engine_search
+        )
 
-            if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
-                engine_search = sol.WallTime()
-                python_overhead = max(0.0, wall_solve_time - engine_search)
-                engine_extraction = 0.0
-            else:
-                python_overhead = wall_solve_time
-                engine_extraction = 0.0
-                engine_search = 0.0
-        else:
-            if sol and sol.get_solve_status() != "Unknown":
-                # Get internal C++ metrics (fallback to 0.0 if not found)
-                engine_total = sol.get_info("TotalTime") or sol.get_solve_time()
-                engine_search = sol.get_solve_time()
-                engine_extraction = sol.get_info("ExtractionTime") or (
-                    engine_total - engine_search
-                )
-
-                # The remaining time is pure Python API overhead (Serialization, Process Spawning, I/O)
-                python_overhead = max(0.0, wall_solve_time - engine_total)
-            else:
-                # If the solver hard-crashed or returned no info
-                python_overhead = wall_solve_time
-                engine_extraction = 0.0
-                engine_search = 0.0
+        # 2. API overhead is whatever time the C++ engine wasn't running
+        python_overhead = max(0.0, wall_solve_time - engine_total)
 
         self.add_stat_to_current("solve_api_overhead", python_overhead)
         self.add_stat_to_current("solve_cpp_presolve", engine_extraction)

@@ -10,7 +10,7 @@ from loguru import logger
 import cp_model as docplex_model
 import cpp_cp_model
 from autostore_heuristic import validate_solution
-from cp_model_utils import cp_sol_to_solution, sort_variables
+from cp_model_utils import CppSolveResult, cp_sol_to_solution, sort_variables
 from freezing_utils import (
     FreezeManager,
     create_partial_starting_point,
@@ -125,7 +125,7 @@ def prepare_model_cpp(config, instance, heur_sol):
     return (
         mdl,
         handles,
-        cpp_cp_model.CppSolveResult(
+        CppSolveResult(
             {
                 "status": "Feasible",
                 "objective": heur_sol.makespan,
@@ -492,7 +492,7 @@ class Solver:
                     self.experiment_config["presolve"],
                     self.experiment_config["search_type"],
                 )
-                sol = cpp_cp_model.CppSolveResult(result_dict)
+                sol = CppSolveResult(result_dict)
                 self.vlg.log_solve_time(sol)
                 self.eps_greedy_acceptance(sol, sol.get_solve_status())
 
