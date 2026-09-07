@@ -2,8 +2,9 @@ import random
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from loguru import logger
+import numpy as np
 
+from cp_model_utils import get_fleet_utilization_timeseries
 from freezing_utils import get_assigned_station
 from matheuristic_plots import Status
 
@@ -15,6 +16,20 @@ class SelectionResult:
     seed_orders: set = field(default_factory=set)
     seed_skus: set = field(default_factory=set)
     seed_stations: set = field(default_factory=set)
+
+
+# Strategy ideas
+#
+# Dynamic strategies (change with the solution)
+# Longest scheduled orders/bin events
+# SKUs with the most fetches
+# Time slice where movecap is least saturated + slice where it is most
+# Orders from most used stations + orders from least used station
+# Orders from most used lanes + orders from least used lanes of the same station
+# Dynamic similarity scores (mix jaccard and being in the same station etc.)
+#
+# Static strategies (defined by the instance)
+# Similar orders (already done Shaw) or SKUs
 
 
 def strategy_random_orders(handles, solution, k=None, p=None) -> SelectionResult:
@@ -48,43 +63,72 @@ def strategy_random_skus(handles, solution, k=None, p=None) -> SelectionResult:
     return SelectionResult(seed_skus=seed_k)
 
 
-def strategy_single_timeslice(handles, solution, length) -> SelectionResult:
-    makespan = 0
+def get_order_intervals(handles, solution):
     order_intervals = {}
-
+    makespan = 0
     for o in handles["O"]:
         s_assigned = get_assigned_station(handles, solution, o)
         if s_assigned is not None:
             var = handles["I_os"].get((o, s_assigned))
             if var is not None:
-                if hasattr(solution, "BooleanValue"):
-                    if solution.BooleanValue(var.pres):
-                        start, end = solution.Value(var.start), solution.Value(var.end)
-                        order_intervals[o] = (start, end)
-                        makespan = max(makespan, end)
-                else:
-                    var_sol = solution.get_var_solution(var)
-                    if var_sol and var_sol.is_present():
-                        start, end = var_sol.get_start(), var_sol.get_end()
-                        order_intervals[o] = (start, end)
-                        makespan = max(makespan, end)
+                var_sol = solution.get_var_solution(var)
+                if var_sol and var_sol.is_present():
+                    start, end = var_sol.get_start(), var_sol.get_end()
+                    order_intervals[o] = (start, end)
+                    makespan = max(makespan, end)
+    return order_intervals, makespan
 
-    if makespan <= length:
-        t_start, t_end = 0, makespan
-    else:
-        t_start = random.randint(0, max(0, makespan - length))
-        t_end = t_start + length
 
+def orders_in_timeslice(order_intervals, t_start, t_end) -> SelectionResult:
     seed_o = {o for o, (s, e) in order_intervals.items() if s < t_end and e > t_start}
     return SelectionResult(seed_orders=seed_o)
 
 
-def strategy_multi_timeslice(handles, solution, n, total_length) -> SelectionResult:
+def strategy_multi_random_timeslice(
+    handles, solution, n, total_length
+) -> SelectionResult:
+    order_intervals, makespan = get_order_intervals(handles, solution)
+
+    length = total_length // n
+    timeslices = []
+    for i in range(n):
+        if makespan <= length:
+            t_start, t_end = 0, makespan
+        else:
+            t_start = random.randint(0, max(0, makespan - length))
+            t_end = t_start + length
+        timeslices.append((t_start, t_end))
+
     return combine_strategies(
         *[
-            strategy_single_timeslice(handles, solution, total_length // n)
-            for _ in range(n)
+            orders_in_timeslice(order_intervals, t_start, t_end)
+            for (t_start, t_end) in timeslices
         ]
+    )
+
+
+def strategy_movecap_balancing_slices(handles, solution, total_length):
+    slice_length = total_length // 2
+    order_intervals, makespan = get_order_intervals(handles, solution)
+
+    if makespan <= slice_length:
+        t_start, t_end = 0, makespan
+        return orders_in_timeslice(order_intervals, t_start, t_end)
+
+    fleet_util = get_fleet_utilization_timeseries(solution, handles, makespan)
+    rolling_sums = np.convolve(
+        fleet_util, np.ones(slice_length, dtype=int), mode="valid"
+    )
+
+    noisy_sums = rolling_sums + np.random.normal(
+        0, np.std(rolling_sums) / 10, len(rolling_sums)
+    )
+
+    t_start_min = np.argmin(noisy_sums)
+    t_start_max = np.argmax(noisy_sums)
+    return combine_strategies(
+        orders_in_timeslice(order_intervals, t_start_min, t_start_min + slice_length),
+        orders_in_timeslice(order_intervals, t_start_max, t_start_max + slice_length),
     )
 
 
@@ -181,18 +225,25 @@ class StrategyManager:
             "random_lanes": lambda sev: strategy_random_lanes(
                 self.handles, self.current_solution, 1
             ),
-            "single_timeslice": lambda sev: strategy_single_timeslice(
-                self.handles, self.current_solution, 100 * sev
+            "single_timeslice": lambda sev: strategy_multi_random_timeslice(
+                self.handles, self.current_solution, 1, 100 * sev
             ),
-            "double_timeslice": lambda sev: strategy_multi_timeslice(
+            "double_timeslice": lambda sev: strategy_multi_random_timeslice(
                 self.handles, self.current_solution, 2, 100 * sev
             ),
-            "triple_timeslice": lambda sev: strategy_multi_timeslice(
+            "triple_timeslice": lambda sev: strategy_multi_random_timeslice(
                 self.handles, self.current_solution, 3, 100 * sev
+            ),
+            "balancing_timeslice": lambda sev: strategy_movecap_balancing_slices(
+                self.handles, self.current_solution, 100 * sev
             ),
         }
 
-        self.presets = {"all": None, "shaw_random": ["similar_orders", "random_orders"]}
+        self.presets = {
+            "all": None,
+            "shaw_random": ["similar_orders", "random_orders"],
+            "random_balance": ["random_orders_and_skus", "balancing_timeslice"],
+        }
 
         active_preset = self.presets[self.strategy_preset]
         if active_preset == None:
@@ -265,5 +316,5 @@ class StrategyManager:
 
         strat_name = self.active_strat_names[strat_idx]
         strat = self.active_strats[strat_name]
-        logger.debug(f"{strat_idx=}, {strat_name=}")
+
         return strat_idx, strat_name, strat

@@ -135,6 +135,48 @@ def sort_variables(mdl, sp, backend="docplex", handles=None):
     return var_to_idx, num_variables
 
 
+def get_fleet_utilization_timeseries(solution, handles, makespan):
+    """Returns a dense list of length `makespan + 1` where index `t`
+
+    corresponds to the number of active fleet moves during time step `t`.
+    """
+    # Array of size makespan + 2 to safely record differences at `makespan`
+    diff = [0] * (int(makespan) + 2)
+
+    def register_interval(iv):
+        if iv is None:
+            return
+        if hasattr(solution, "get_var_solution"):
+            sol = solution.get_var_solution(iv)
+        else:
+            sol = solution.get(iv)
+
+        if sol and sol.is_present():
+            st = sol.get_start()
+            en = sol.get_end()
+            # Only record if the interval starts within the tracked horizon
+            if st <= makespan:
+                diff[st] += 1
+                if en <= makespan:
+                    diff[en] -= 1
+
+    # Record +1 at start and -1 at end for all active F and R intervals[cite: 1]
+    for f_var in handles["F"].values():
+        register_interval(f_var)
+
+    for r_var in handles["R"].values():
+        register_interval(r_var)
+
+    # Compute prefix sums to get dense utilization per discrete time unit
+    utilization = [0] * (int(makespan) + 1)
+    current_moves = 0
+    for t in range(int(makespan) + 1):
+        current_moves += diff[t]
+        utilization[t] = current_moves
+
+    return utilization
+
+
 class MockIntervalVar:
     def __init__(self, name, present=False, start=None, end=None, size=None):
         self.name = name

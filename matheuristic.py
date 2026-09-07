@@ -573,7 +573,7 @@ if __name__ == "__main__":
         "--strat-preset",
         type=str,
         default="all",
-        choices=["all", "shaw_random"],
+        choices=["all", "shaw_random", "random_balance"],
         help="Which strategies are used during optimization (presets defined in neighborhood_selection.py)",
     )
 
