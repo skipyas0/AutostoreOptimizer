@@ -27,6 +27,7 @@ class SelectionResult:
 # Orders from most used stations + orders from least used station
 # Orders from most used lanes + orders from least used lanes of the same station
 # Dynamic similarity scores (mix jaccard and being in the same station etc.)
+# Least/most utilized timeslice from each station
 #
 # Static strategies (defined by the instance)
 # Similar orders (already done Shaw) or SKUs
@@ -243,6 +244,7 @@ class StrategyManager:
             "all": None,
             "shaw_random": ["similar_orders", "random_orders"],
             "random_balance": ["random_orders_and_skus", "balancing_timeslice"],
+            "random_orders": ["random_orders"],
         }
 
         active_preset = self.presets[self.strategy_preset]

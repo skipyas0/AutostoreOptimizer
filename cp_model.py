@@ -4,6 +4,7 @@ from collections import defaultdict
 from docplex.cp.model import CpoModel
 from docplex.cp.solver.solver_listener import CpoSolverListener
 
+from cp_model_utils import build_solve_dict
 from instance import Instance
 
 
@@ -702,17 +703,7 @@ class ProgressCollector(CpoSolverListener):
                 )
                 return
 
-            sol_dict = {}
-            for var_sol in sres.get_all_var_solutions():
-                val = var_sol.get_value()
-                if hasattr(val, "is_present"):
-                    sol_dict[var_sol.get_name()] = {
-                        "present": val.is_present(),
-                        "start": val.get_start() if val.is_present() else None,
-                        "end": val.get_end() if val.is_present() else None,
-                    }
-                else:
-                    sol_dict[var_sol.get_name()] = val
+            sol_dict = build_solve_dict(sres)
 
             # Only keep strict improvements
             if (self.best_obj is None) or (obj < self.best_obj):

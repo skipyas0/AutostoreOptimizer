@@ -57,6 +57,7 @@ class VisualLogger:
         self.current_run = 0
         self.active_run_start = None
         self.active_iteration_start = None
+        self.all_run_solutions = []
 
         # Data storage
         self.df = pd.DataFrame()
@@ -82,6 +83,7 @@ class VisualLogger:
 
     def log_run_start(self, num_variables, var_to_idx, sp):
         self.current_run += 1
+        self.all_run_solutions.append([])
         self.num_variables = num_variables
         self.open_log = logger.add(
             f"{self.path}/run_{self.current_run}.log",
@@ -383,6 +385,8 @@ class VisualLogger:
         with open(f"{self.path}/experiment_config.json", "w+") as f:
             json.dump(self.experiment_config, f, indent=4)
 
+        solutions_df = self.get_solution_history_df(self.all_run_solutions)
+        solutions_df.to_pickle(f"{self.path}/solutions_dataframe.pkl")
         self.df.to_pickle(f"{self.path}/experiment_dataframe.pkl")
 
         with open(f"{self.path}/barcodes.pkl", "wb") as f:
@@ -400,10 +404,62 @@ class VisualLogger:
         self.plot_chronological_durations()
         self.plot_binned_durations_composition()
         self.plot_status_time_histogram()
-
+        self.plot_solution_stability(self.all_run_solutions)
         self.plot_strategy_footprints()
         self.plot_status_time_distributions()
         logger.info(f"Experiment saved successfully to {self.path}")
+
+    def get_solution_history_df(self, solution_history):
+        """
+        Converts the nested list[list[dict]] of solution states into a long-format DataFrame.
+        """
+        records = []
+        for r_idx, run_sols in enumerate(solution_history):
+            run_id = r_idx + 1
+            for iter_idx, sol_dict in enumerate(run_sols):
+                for var_name, state in sol_dict.items():
+                    if isinstance(state, dict):
+                        records.append(
+                            (
+                                run_id,
+                                iter_idx,
+                                var_name,
+                                state.get("present"),
+                                state.get("start"),
+                                state.get("end"),
+                                None,
+                            )
+                        )
+                    else:
+                        records.append(
+                            (run_id, iter_idx, var_name, None, None, None, state)
+                        )
+
+        df = pd.DataFrame(
+            records,
+            columns=[
+                "run_id",
+                "iteration",
+                "var_name",
+                "present",
+                "start",
+                "end",
+                "value",
+            ],
+        )
+
+        # Optimize memory footprint
+        df["run_id"] = df["run_id"].astype("int32")
+        df["iteration"] = df["iteration"].astype("int32")
+
+        # Robustly handle the float NaN to nullable Boolean conversion
+        df["present"] = (
+            df["present"]
+            .apply(lambda x: pd.NA if pd.isna(x) else bool(x))
+            .astype("boolean")
+        )
+
+        return df
 
     def _plot_severity_lines(self):
         """Helper to plot vertical lines wherever severity increased across any run."""
@@ -566,6 +622,11 @@ class VisualLogger:
             color="purple",
             alpha=0.2,
         )
+
+        # 50-iteration simple moving average (min_periods=1 so the line
+        # starts at iteration 0 with the partial window)
+        sma_50 = mean_ratio.rolling(window=50, min_periods=1).mean()
+        plt.plot(iters, sma_50, color="green", label="50-Iteration Moving Average")
 
         # Overlay Severity Lines
         self._plot_severity_lines()
@@ -1182,6 +1243,80 @@ class VisualLogger:
 
             plt.savefig(
                 f"{self.path}/strategy_footprints_run{r + 1}.svg",
+                format="svg",
+                bbox_inches="tight",
+            )
+            plt.close()
+
+    def plot_solution_stability(self, solution_history):
+        """
+        Calculates raw inter-iteration variable changes and plots them,
+        marking iterations where a new best objective was found.
+        """
+        diff_records = []
+
+        # 1. Fast Dictionary Comparison for Raw Diffs
+        for r_idx, run_sols in enumerate(solution_history):
+            run_id = r_idx + 1
+            for iter_idx, curr_sol in enumerate(run_sols):
+                if iter_idx == 0:
+                    changed_count = 0
+                else:
+                    prev_sol = run_sols[iter_idx - 1]
+                    # Count variables whose state dictionary or value does not perfectly match the previous iteration
+                    changed_count = sum(
+                        1 for k, v in curr_sol.items() if prev_sol.get(k) != v
+                    )
+
+                diff_records.append(
+                    {
+                        "run_id": run_id,
+                        "iteration": iter_idx,
+                        "changed_vars": changed_count,
+                    }
+                )
+
+        diff_df = pd.DataFrame(diff_records)
+
+        # 2. Merge with VisualLogger's internal tracking dataframe
+        merged_df = pd.merge(self.df, diff_df, on=["run_id", "iteration"], how="inner")
+
+        # 3. Plot per Run
+        for run_id in merged_df["run_id"].unique():
+            run_data = merged_df[merged_df["run_id"] == run_id].copy()
+
+            fig, ax = plt.subplots(figsize=(12, 6))
+
+            # Plot Raw Changed Variables
+            ax.plot(
+                run_data["iteration"],
+                run_data["changed_vars"],
+                color="#1f77b4",
+                label="Changed Variables",
+                linewidth=2,
+            )
+            ax.set_xlabel("Iteration")
+            ax.set_ylabel("Number of Changed Variables")
+
+            # Add vertical lines for New Best solutions
+            new_best_mask = run_data["statuses"].isin(
+                [Status.Optimal_New_Best.value, Status.Feasible_New_Best.value]
+            )
+            new_best_iters = run_data[new_best_mask]["iteration"]
+
+            for i, iter_val in enumerate(new_best_iters):
+                label = "New Best Found" if i == 0 else ""
+                ax.axvline(
+                    x=iter_val, color="#2ca02c", linestyle="--", alpha=0.7, label=label
+                )
+
+            ax.legend(loc="upper right")
+            plt.title(f"Solution Stability and Improvements (Run {run_id})")
+            plt.grid(True, alpha=0.3)
+            fig.set_layout_engine("constrained")
+
+            plt.savefig(
+                f"{self.path}/solution_stability_run{run_id}.svg",
                 format="svg",
                 bbox_inches="tight",
             )

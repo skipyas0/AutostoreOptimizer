@@ -10,7 +10,12 @@ from loguru import logger
 import cp_model as docplex_model
 import cpp_cp_model
 from autostore_heuristic import validate_solution
-from cp_model_utils import CppSolveResult, cp_sol_to_solution, sort_variables
+from cp_model_utils import (
+    CppSolveResult,
+    build_solve_dict,
+    cp_sol_to_solution,
+    sort_variables,
+)
 from freezing_utils import (
     FreezeManager,
     create_partial_starting_point,
@@ -456,6 +461,9 @@ class Solver:
             strategy_manager.current_solution = self.current_solution
 
             # log iteration end in VisualLogger
+            self.vlg.all_run_solutions[-1].append(
+                build_solve_dict(self.current_solution)
+            )
             self.vlg.log_iteration()
 
         # End of LNS loop: Validate the best solution found
@@ -573,7 +581,7 @@ if __name__ == "__main__":
         "--strat-preset",
         type=str,
         default="all",
-        choices=["all", "shaw_random", "random_balance"],
+        choices=["all", "shaw_random", "random_balance", "random_orders"],
         help="Which strategies are used during optimization (presets defined in neighborhood_selection.py)",
     )
 

@@ -135,6 +135,21 @@ def sort_variables(mdl, sp, backend="docplex", handles=None):
     return var_to_idx, num_variables
 
 
+def build_solve_dict(sres):
+    sol_dict = {}
+    for var_sol in sres.get_all_var_solutions():
+        val = var_sol.get_value()
+        if hasattr(val, "is_present"):
+            sol_dict[var_sol.get_name()] = {
+                "present": val.is_present(),
+                "start": val.get_start() if val.is_present() else None,
+                "end": val.get_end() if val.is_present() else None,
+            }
+        else:
+            sol_dict[var_sol.get_name()] = val
+    return sol_dict
+
+
 def get_fleet_utilization_timeseries(solution, handles, makespan):
     """Returns a dense list of length `makespan + 1` where index `t`
 
@@ -277,8 +292,8 @@ def canonicalize_cpo(cpo_path: str, output_path: str | None = None) -> str:
     If output_path is provided, writes the canonical CPO model to that file.
     Returns the canonical CPO string.
     """
-    import difflib
     import re
+
     from docplex.cp.cpo.cpo_parser import CpoParser
     from docplex.cp.expression import CpoIntervalVar, CpoSequenceVar, CpoValue
 
@@ -286,8 +301,12 @@ def canonicalize_cpo(cpo_path: str, output_path: str | None = None) -> str:
 
     # 1. Clear intermediate alias names on expressions (e.g. from Concert dumpModel)
     def clear_names(expr):
-        if hasattr(expr, "name") and expr.name and re.match(
-            r"^(IntervalPresence|IntervalExpr|VarCumulAtom)_\d+$", str(expr.name)
+        if (
+            hasattr(expr, "name")
+            and expr.name
+            and re.match(
+                r"^(IntervalPresence|IntervalExpr|VarCumulAtom)_\d+$", str(expr.name)
+            )
         ):
             expr.name = None
         if hasattr(expr, "children"):
@@ -371,7 +390,11 @@ def canonicalize_cpo(cpo_path: str, output_path: str | None = None) -> str:
                 elif nop and nop.cpo_name == "pulse":
                     if len(node.children) >= 2:
                         h_node = node.children[1]
-                        h_val = h_node.value if isinstance(h_node, CpoValue) else str(h_node)
+                        h_val = (
+                            h_node.value
+                            if isinstance(h_node, CpoValue)
+                            else str(h_node)
+                        )
                         first_arg = canonical_expr_str(node.children[0])
                         if (
                             str(h_val) != "0"
@@ -381,20 +404,31 @@ def canonicalize_cpo(cpo_path: str, output_path: str | None = None) -> str:
                             pulses.append(f"pulse({first_arg}, {h_val})")
                 else:
                     s = str(node)
-                    if "pulse(intervalmin, intervalmax, 0)" not in s and "-4503599" not in s and s != "0":
+                    if (
+                        "pulse(intervalmin, intervalmax, 0)" not in s
+                        and "-4503599" not in s
+                        and s != "0"
+                    ):
                         pulses.append(canonical_expr_str(node))
 
             collect_pulses(cumul)
             pulses.sort()
-            return f"alwaysIn(sum([" + ", ".join(pulses) + f"]), {start_val}, {end_val}, {min_val}, {max_val})"
+            return (
+                "alwaysIn(sum(["
+                + ", ".join(pulses)
+                + f"]), {start_val}, {end_val}, {min_val}, {max_val})"
+            )
 
         # Commutative equal
         if op_name == "equal":
             left = canonical_expr_str(e.children[0])
             right = canonical_expr_str(e.children[1])
-            if left.isdigit() and not right.isdigit():
-                left, right = right, left
-            elif not (right.isdigit() and not left.isdigit()) and left > right:
+            if (
+                left.isdigit()
+                and not right.isdigit()
+                or not (right.isdigit() and not left.isdigit())
+                and left > right
+            ):
                 left, right = right, left
             return f"{left} == {right}"
 
@@ -514,4 +548,3 @@ def compare_cpo_files(
         )
     )
     return len(diff) == 0, diff
-
