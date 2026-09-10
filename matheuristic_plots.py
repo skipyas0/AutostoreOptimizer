@@ -12,6 +12,7 @@ from loguru import logger
 from matplotlib import ticker
 from matplotlib.colors import BoundaryNorm, ListedColormap
 
+from cp_model_utils import build_solve_dict
 from schedule_visualizer import plot_schedule, write_html
 
 
@@ -384,6 +385,12 @@ class VisualLogger:
         # 1. Save Configs and Data
         with open(f"{self.path}/experiment_config.json", "w+") as f:
             json.dump(self.experiment_config, f, indent=4)
+
+        # convert to simple dictionaries
+        self.all_run_solutions = [
+            [build_solve_dict(sol) for sol in run_sols]
+            for run_sols in self.all_run_solutions
+        ]
 
         solutions_df = self.get_solution_history_df(self.all_run_solutions)
         solutions_df.to_pickle(f"{self.path}/solutions_dataframe.pkl")
