@@ -1,3 +1,4 @@
+import datetime as dt
 import json
 import os
 import pickle
@@ -273,6 +274,19 @@ def main():
     ORDERS = args.orders
     MOVECAPS = args.movecaps
 
+    total = (
+        len(CP_SEEDS)
+        * len(STATIONS)
+        * len(LANES)
+        * len(SKUS)
+        * len(ORDERS)
+        * len(MOVECAPS)
+    )
+    print(f"Will run {total} CP runs with {TIME_LIMIT}s each")
+    print(f"Total duration = {total * TIME_LIMIT / 3600:.01f} h")
+    print(
+        f"Will be done at: {(dt.datetime.now() + dt.timedelta(seconds=total * TIME_LIMIT)).strftime('%d.%m.%Y %H:%M:%S')}"
+    )
     print(
         f"Precalculating configs: {TIME_LIMIT=} {GEN_SEED=} {CP_SEEDS=} {STATIONS=} {LANES=} {SKUS=} {ORDERS=} {MOVECAPS=}"
     )
