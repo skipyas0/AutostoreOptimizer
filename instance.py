@@ -105,9 +105,8 @@ class Instance:
         unused_skus = len(self.K) - len(used_skus)
 
         # Pareto checks for top x% of SKUs
-        sku_freq_arr = sku_freq_vals  # already sorted by unique_skus order
-        total_picks = sku_freq_arr.sum()
-        sku_freq_sorted = np.sort(sku_freq_arr)[::-1]  # descending
+        total_picks = sku_freq_vals.sum()
+        sku_freq_sorted = np.sort(sku_freq_vals)[::-1]  # descending
         cumsum = np.cumsum(sku_freq_sorted)
 
         percentages = [1, 5, 10, 20, 30, 40, 50, 75]
@@ -138,7 +137,7 @@ class Instance:
 
         # Supply (number of bins per SKU) and demand (number of orders per SKU)
         supply = n_vals[np.array(used_skus, dtype=int)]
-        demand = sku_freq_arr
+        demand = sku_freq_vals
 
         supply_demand_ratios = supply / demand
         supply_demand_ratio_min = float(supply_demand_ratios.min())
@@ -188,14 +187,14 @@ class Instance:
             "n_mean": float(n_vals.mean()) if len(n_vals) else 0.0,
             "n_median": float(np.median(n_vals)) if len(n_vals) else 0.0,
             "n_stdev": float(n_vals.std(ddof=0)) if len(n_vals) else 0.0,
-            "sku_freq_min": float(sku_freq_arr.min()) if len(sku_freq_arr) else 0,
-            "sku_freq_max": float(sku_freq_arr.max()) if len(sku_freq_arr) else 0,
-            "sku_freq_mean": float(sku_freq_arr.mean()) if len(sku_freq_arr) else 0.0,
-            "sku_freq_median": float(np.median(sku_freq_arr))
-            if len(sku_freq_arr)
+            "sku_freq_min": float(sku_freq_vals.min()) if len(sku_freq_vals) else 0,
+            "sku_freq_max": float(sku_freq_vals.max()) if len(sku_freq_vals) else 0,
+            "sku_freq_mean": float(sku_freq_vals.mean()) if len(sku_freq_vals) else 0.0,
+            "sku_freq_median": float(np.median(sku_freq_vals))
+            if len(sku_freq_vals)
             else 0.0,
-            "sku_freq_stdev": float(sku_freq_arr.std(ddof=0))
-            if len(sku_freq_arr)
+            "sku_freq_stdev": float(sku_freq_vals.std(ddof=0))
+            if len(sku_freq_vals)
             else 0.0,
             "pareto_ratios": pareto_ratios,
             "avg_jaccard_weighted": avg_jaccard_w,

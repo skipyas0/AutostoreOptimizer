@@ -35,6 +35,23 @@ def precalculate_config(config):
         movecap=config["movecap"],
     )
 
+    instance = generate_data(
+        num_stations=config["stations"],
+        lanes_per_station=config["lanes"],
+        num_orders=config["orders"],
+        num_skus=config["skus"],
+        seed=config["gen_seed"],
+        movecap=config["movecap"],
+        pick_touch_time=config["pick_touch_time"],
+        return_model=config["return_model"],
+        max_bins_per_sku=config["max_bins"],
+        sku_popularity_skew=config["skew"],
+        retrieval_time_model=config["rt_model"],
+        pick_time_model=config["pick_model"],
+        bin_count_model=config["bin_model"],
+        grid_depth=config["grid_depth"],
+    )
+
     instance.to_pickle(f"{path}/instance.pkl")
 
     with open(f"{path}/instance_summary.txt", "w+") as f, redirect_stdout(f):
@@ -208,6 +225,43 @@ def main():
         help="List of move capacities to iterate over",
     )
 
+    parser.add_argument(
+        "--order-dist",
+        choices=["lognormal", "negbin", "poisson2_to_1_6", "uniform_1_5"],
+        default="lognormal",
+    )
+    parser.add_argument(
+        "--skew",
+        type=float,
+        default=1.0,
+        help="Zipf exponent for SKU popularity (1.0 = classic 80/20)",
+    )
+    parser.add_argument(
+        "--rt-model",
+        choices=["depth_based", "triangular"],
+        default="depth_based",
+    )
+    parser.add_argument(
+        "--pick-model",
+        choices=["variable", "constant"],
+        default="variable",
+    )
+    parser.add_argument(
+        "--return-model",
+        choices=["state_preserving", "balancing"],
+        default="balancing",
+    )
+    parser.add_argument(
+        "--bin-model",
+        choices=["popularity_correlated", "uniform"],
+        default="popularity_correlated",
+    )
+
+    parser.add_argument("--pick", type=int, default=4)
+    parser.add_argument("--max-bins", type=int, default=8)
+
+    parser.add_argument("--grid-depth", type=int, default=16)
+
     args = parser.parse_args()
 
     TIME_LIMIT = args.time_limit
@@ -231,6 +285,15 @@ def main():
             "symmetry_breaking": True,
             "skus": k,
             "movecap": m,
+            "order_dist": args.order_dist,
+            "skew": args.skew,
+            "rt_model": args.rt_model,
+            "pick_model": args.pick_model,
+            "pick_touch_time": args.pick,
+            "return_model": args.return_model,
+            "bin_model": args.bin_model,
+            "max_bins": args.max_bins,
+            "grid_depth": args.grid_depth,
             "gen_seed": GEN_SEED,
             "cp_seeds": CP_SEEDS,
             "horizon": 10000,
@@ -238,6 +301,7 @@ def main():
             "beta": 1.0,
             "time_limit": TIME_LIMIT,
         }
+
         print("This config:", config)
 
         if check_if_precalculated(config, with_removal=True) is not None:

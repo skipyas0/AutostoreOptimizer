@@ -288,6 +288,7 @@ def generate_data(
     # --- New realistic knobs ---
     sku_popularity_skew: float = 1.0,
     retrieval_time_model: str = "depth_based",
+    return_model: str = "balancing",
     pick_time_model: str = "variable",
     bin_count_model: str = "popularity_correlated",
     grid_depth: int = 16,
@@ -328,6 +329,9 @@ def generate_data(
     pick_time_model : str
         "variable" -- log-normal around pick_touch_time (per-SKU heterogeneity).
         "constant" -- every SKU gets exactly pick_touch_time.
+    return_model : str
+        "state_preserving" -- Make fetch and return time equal to model returning all bins to original configuration
+        "balancing" -- Place the bin on top, eliminating the dig time, but do not update the fetch time
     bin_count_model : str
         "popularity_correlated" -- fast-movers get more copies.
         "uniform"               -- legacy uniform(1, max_bins_per_sku).
@@ -382,8 +386,25 @@ def generate_data(
             )
             for k in K
         }
+        if return_model == "balancing":
+            rt_ret = {
+                k: _retrieval_time_depth_based(
+                    popularity_rank=sku_rank[k],
+                    num_skus=num_skus,
+                    rng=rng,
+                    grid_depth=grid_depth,
+                    dig_time_per_level_sec=0,
+                )
+                for k in K
+            }
+        elif return_model == "state_preserving":
+            rt_ret = dict(rt)
+        else:
+            raise ValueError(f"Unknown return_time_mode: {return_model}")
+
     elif retrieval_time_model == "triangular":
         rt = {k: _retrieval_time_triangular(rng) for k in K}
+        rt_ret = dict(rt)
     else:
         raise ValueError(f"Unknown retrieval_time_model: {retrieval_time_model}")
 
@@ -455,7 +476,7 @@ def generate_data(
         rt,
         p,
         N,
-        rt_ret=dict(rt),
+        rt_ret=rt_ret,
         movecap=movecap,
         seed=seed,
     )
@@ -538,6 +559,12 @@ def main():
         choices=["variable", "constant"],
         default="variable",
     )
+    ap.add_argument(
+        "--return-model",
+        choices=["state_preserving", "balancing"],
+        default="balancing",
+    )
+
     ap.add_argument(
         "--bin-model",
         choices=["popularity_correlated", "uniform"],
