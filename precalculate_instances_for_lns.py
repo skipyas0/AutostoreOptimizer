@@ -34,15 +34,6 @@ def precalculate_config(config):
         num_skus=config["skus"],
         seed=config["gen_seed"],
         movecap=config["movecap"],
-    )
-
-    instance = generate_data(
-        num_stations=config["stations"],
-        lanes_per_station=config["lanes"],
-        num_orders=config["orders"],
-        num_skus=config["skus"],
-        seed=config["gen_seed"],
-        movecap=config["movecap"],
         pick_touch_time=config["pick_touch_time"],
         return_model=config["return_model"],
         max_bins_per_sku=config["max_bins"],

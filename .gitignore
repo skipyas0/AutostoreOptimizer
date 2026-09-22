@@ -21,3 +21,5 @@ olist_analysis.ipynb
 *.so
 *.o
 *.cpo
+*.log
+decomposition_experiments

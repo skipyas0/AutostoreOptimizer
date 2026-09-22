@@ -386,11 +386,43 @@ class VisualLogger:
         with open(f"{self.path}/experiment_config.json", "w+") as f:
             json.dump(self.experiment_config, f, indent=4)
 
-        # convert to simple dictionaries
-        self.all_run_solutions = [
-            [build_solve_dict(sol) for sol in run_sols]
-            for run_sols in self.all_run_solutions
+        # convert only iterations where the solution changed (a new best was encountered)
+        new_best_statuses = [
+            Status.Optimal_New_Best.value,
+            Status.Feasible_New_Best.value,
         ]
+        filtered_run_solutions = []
+        for r_idx, run_sols in enumerate(self.all_run_solutions):
+            run_id = r_idx + 1
+            if (
+                not self.df.empty
+                and "run_id" in self.df.columns
+                and "statuses" in self.df.columns
+                and run_id in self.df["run_id"].values
+            ):
+                run_df = self.df[self.df["run_id"] == run_id]
+                new_best_mask = run_df["statuses"].isin(new_best_statuses)
+                new_best_iters = set(run_df[new_best_mask]["iteration"].tolist())
+            else:
+                new_best_iters = set(range(len(run_sols)))
+
+            run_records = []
+            for default_idx, item in enumerate(run_sols):
+                if isinstance(item, tuple) and len(item) == 2:
+                    iter_idx, sol = item
+                else:
+                    iter_idx, sol = default_idx, item
+
+                if iter_idx in new_best_iters:
+                    sol_dict = (
+                        build_solve_dict(sol)
+                        if not isinstance(sol, dict)
+                        else sol
+                    )
+                    run_records.append((iter_idx, sol_dict))
+            filtered_run_solutions.append(run_records)
+
+        self.all_run_solutions = filtered_run_solutions
 
         solutions_df = self.get_solution_history_df(self.all_run_solutions)
         solutions_df.to_pickle(f"{self.path}/solutions_dataframe.pkl")
@@ -418,12 +450,18 @@ class VisualLogger:
 
     def get_solution_history_df(self, solution_history):
         """
-        Converts the nested list[list[dict]] of solution states into a long-format DataFrame.
+        Converts the nested list[list[dict]] or list[list[tuple[int, dict]]] of solution states into a long-format DataFrame.
         """
         records = []
         for r_idx, run_sols in enumerate(solution_history):
             run_id = r_idx + 1
-            for iter_idx, sol_dict in enumerate(run_sols):
+            for default_idx, item in enumerate(run_sols):
+                if isinstance(item, tuple) and len(item) == 2:
+                    iter_idx, sol_dict = item
+                else:
+                    iter_idx = default_idx
+                    sol_dict = item
+
                 for var_name, state in sol_dict.items():
                     if isinstance(state, dict):
                         records.append(
@@ -441,6 +479,23 @@ class VisualLogger:
                         records.append(
                             (run_id, iter_idx, var_name, None, None, None, state)
                         )
+
+        if not records:
+            df = pd.DataFrame(
+                columns=[
+                    "run_id",
+                    "iteration",
+                    "var_name",
+                    "present",
+                    "start",
+                    "end",
+                    "value",
+                ]
+            )
+            df["run_id"] = df["run_id"].astype("int32")
+            df["iteration"] = df["iteration"].astype("int32")
+            df["present"] = df["present"].astype("boolean")
+            return df
 
         df = pd.DataFrame(
             records,
@@ -1265,11 +1320,18 @@ class VisualLogger:
         # 1. Fast Dictionary Comparison for Raw Diffs
         for r_idx, run_sols in enumerate(solution_history):
             run_id = r_idx + 1
-            for iter_idx, curr_sol in enumerate(run_sols):
-                if iter_idx == 0:
+            for idx, item in enumerate(run_sols):
+                if isinstance(item, tuple) and len(item) == 2:
+                    iter_idx, curr_sol = item
+                    prev_sol = run_sols[idx - 1][1] if idx > 0 else None
+                else:
+                    iter_idx = idx
+                    curr_sol = item
+                    prev_sol = run_sols[idx - 1] if idx > 0 else None
+
+                if idx == 0 or prev_sol is None:
                     changed_count = 0
                 else:
-                    prev_sol = run_sols[iter_idx - 1]
                     # Count variables whose state dictionary or value does not perfectly match the previous iteration
                     changed_count = sum(
                         1 for k, v in curr_sol.items() if prev_sol.get(k) != v
@@ -1286,7 +1348,14 @@ class VisualLogger:
         diff_df = pd.DataFrame(diff_records)
 
         # 2. Merge with VisualLogger's internal tracking dataframe
-        merged_df = pd.merge(self.df, diff_df, on=["run_id", "iteration"], how="inner")
+        if diff_df.empty:
+            merged_df = self.df.copy()
+            merged_df["changed_vars"] = 0
+        else:
+            merged_df = pd.merge(self.df, diff_df, on=["run_id", "iteration"], how="left")
+            merged_df["changed_vars"] = (
+                merged_df["changed_vars"].fillna(0).astype("int32")
+            )
 
         # 3. Plot per Run
         for run_id in merged_df["run_id"].unique():

@@ -1,3 +1,4 @@
+import tqdm
 import argparse
 import json
 import os
@@ -651,7 +652,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    for instance in args.instances:
+    for instance in tqdm.tqdm(args.instances):
         if "precalculated_instances/" in instance:
             instance = instance.split("/")[1]
 

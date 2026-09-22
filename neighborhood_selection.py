@@ -37,7 +37,7 @@ class SelectionResult:
 # Similar orders (already done Shaw) or SKUs
 
 
-def strategy_random_orders(handles, solution, k=None, p=None) -> SelectionResult:
+def strategy_random_orders(handles, k=None, p=None) -> SelectionResult:
     orders = handles["O"]
     num_orders = len(orders)
 
@@ -53,7 +53,7 @@ def strategy_random_orders(handles, solution, k=None, p=None) -> SelectionResult
     return SelectionResult(seed_orders=seed_o)
 
 
-def strategy_random_skus(handles, solution, k=None, p=None) -> SelectionResult:
+def strategy_random_skus(handles, k=None, p=None) -> SelectionResult:
     skus = handles["active_K"]
     num_skus = len(skus)
     if k is not None:
@@ -288,7 +288,7 @@ class StrategyManager:
 
         self.strategies = {
             "random_orders": lambda sev: strategy_random_orders(
-                self.handles, self.current_solution, p=default_percent * sev
+                self.handles, p=default_percent * sev
             ),
             "similar_orders": lambda sev: strategy_similar_orders(
                 self.handles,
@@ -296,14 +296,14 @@ class StrategyManager:
                 self.weighted_jaccard_matrix,
             ),
             "random_skus": lambda sev: strategy_random_skus(
-                self.handles, self.current_solution, p=default_percent * sev
+                self.handles, p=default_percent * sev
             ),
             "random_orders_and_skus": lambda sev: combine_strategies(
                 strategy_random_orders(
-                    self.handles, self.current_solution, p=0.5 * default_percent * sev
+                    self.handles, p=0.5 * default_percent * sev
                 ),
                 strategy_random_skus(
-                    self.handles, self.current_solution, p=0.5 * default_percent * sev
+                    self.handles, p=0.5 * default_percent * sev
                 ),
             ),
             "random_lanes": lambda sev: strategy_random_lanes(
