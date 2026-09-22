@@ -71,6 +71,7 @@ def precalculate_config(config):
         move_cap=config["movecap"],
         ALPHA=config["alpha"],
         BETA=config["beta"],
+        pick_cap=instance.pickcap,
     )
     elapsed = time.perf_counter() - t0
 

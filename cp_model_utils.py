@@ -150,46 +150,75 @@ def build_solve_dict(sres):
     return sol_dict
 
 
-def get_fleet_utilization_timeseries(solution, handles, makespan):
-    """Returns a dense list of length `makespan + 1` where index `t`
+class Diff:
+    def __init__(self, length, solution):
+        self.solution = solution
+        self.length = length
+        # Array of size makespan + 2 to safely record differences at `makespan`
+        self.vals = [0] * (length + 2)
 
-    corresponds to the number of active fleet moves during time step `t`.
-    """
-    # Array of size makespan + 2 to safely record differences at `makespan`
-    diff = [0] * (int(makespan) + 2)
-
-    def register_interval(iv):
+    def register_interval(self, iv):
         if iv is None:
             return
-        if hasattr(solution, "get_var_solution"):
-            sol = solution.get_var_solution(iv)
+        if hasattr(self.solution, "get_var_solution"):
+            sol = self.solution.get_var_solution(iv)
         else:
-            sol = solution.get(iv)
+            sol = self.solution.get(iv)
 
         if sol and sol.is_present():
             st = sol.get_start()
             en = sol.get_end()
             # Only record if the interval starts within the tracked horizon
-            if st <= makespan:
-                diff[st] += 1
-                if en <= makespan:
-                    diff[en] -= 1
+            if st <= self.length:
+                self.vals[st] += 1
+                if en <= self.length:
+                    self.vals[en] -= 1
+
+    def get_utilization(self):
+        utilization = [0] * (int(self.length) + 1)
+        current_moves = 0
+        for t in range(int(self.length) + 1):
+            current_moves += self.vals[t]
+            utilization[t] = current_moves
+
+        return utilization
+
+
+def get_fleet_utilization_timeseries(solution, handles, makespan):
+    """Returns a dense list of length `makespan + 1` where index `t`
+
+    corresponds to the number of active fleet moves during time step `t`.
+    """
+
+    diff = Diff(makespan, solution)
 
     # Record +1 at start and -1 at end for all active F and R intervals[cite: 1]
     for f_var in handles["F"].values():
-        register_interval(f_var)
+        diff.register_interval(f_var)
 
     for r_var in handles["R"].values():
-        register_interval(r_var)
+        diff.register_interval(r_var)
 
     # Compute prefix sums to get dense utilization per discrete time unit
-    utilization = [0] * (int(makespan) + 1)
-    current_moves = 0
-    for t in range(int(makespan) + 1):
-        current_moves += diff[t]
-        utilization[t] = current_moves
+    utilization = diff.get_utilization()
 
     return utilization
+
+
+def get_pickface_utilization_per_station(solution, handles, makespan):
+    per_station_utils = {}
+    for s in handles["S"]:
+        diff = Diff(makespan, solution)
+
+        # Record +1 at start and -1 at end for all active F and R intervals[cite: 1]
+        for tup, var in handles["P"].items():
+            if tup[1] == s:
+                diff.register_interval(var)
+
+        # Compute prefix sums to get dense utilization per discrete time unit
+        utilization = diff.get_utilization()
+        per_station_utils[s] = utilization
+    return per_station_utils
 
 
 class MockIntervalVar:

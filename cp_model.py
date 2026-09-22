@@ -8,7 +8,15 @@ from cp_model_utils import build_solve_dict
 from instance import Instance
 
 
-def build_model(instance: Instance, add_symmetry_breaking: bool, horizon: int):
+def build_model(
+    instance: Instance,
+    add_symmetry_breaking: bool,
+    horizon: int,
+    exo_lanes: dict = None,  # (station, lane) -> list of (start, end)
+    exo_blocks: dict = None,  # sku -> list of (start, end)
+    exo_moves: list = None,  # list of (start, end) for F/R moves):
+    batch_start_time: int = 0,
+):
     """
     Intervals per (s,k,e):
       - F[s,k,e] : fetch (size = rt[k])
@@ -22,10 +30,19 @@ def build_model(instance: Instance, add_symmetry_breaking: bool, horizon: int):
 
     S, L, K, orders_req, rt, p, N = instance
     move_cap = instance.movecap
+    pick_cap = instance.pickcap
     rt_return = instance.rt_ret
+
+    exo_lanes = exo_lanes or defaultdict(list)
+    exo_blocks = exo_blocks or defaultdict(list)
+    exo_moves = exo_moves or []
 
     mdl = CpoModel()
     O = sorted(orders_req.keys())
+
+    # Block out the past so the solver cannot backfill into previous batches
+    if batch_start_time > 0:
+        past_block = mdl.interval_var(start=0, end=batch_start_time, name="Epoch_Past")
 
     # --- demand and candidate copy counts ---
     orders_demanding_sku = defaultdict(set)
@@ -48,6 +65,9 @@ def build_model(instance: Instance, add_symmetry_breaking: bool, horizon: int):
     for o in O:
         for s in S:
             I_os[(o, s)] = mdl.interval_var(optional=True, name=f"I_os[{o},{s}]")
+            if batch_start_time > 0:  # Synthetic blocking interval to force start > 0
+                mdl.add(mdl.end_before_start(past_block, I_os[(o, s)]))
+
             for ln in L:
                 I_os_lane[(o, s, ln)] = mdl.interval_var(
                     optional=True, name=f"I_os_lane[{o},{s},{ln}]"
@@ -77,6 +97,10 @@ def build_model(instance: Instance, add_symmetry_breaking: bool, horizon: int):
                 F[(s, k, e)] = mdl.interval_var(
                     size=rt[k], optional=True, name=f"F[{s},{k},{e}]"
                 )
+
+                if batch_start_time > 0:  # Also synthetic block for fetches
+                    mdl.add(mdl.end_before_start(past_block, F[(s, k, e)]))
+
                 R[(s, k, e)] = mdl.interval_var(
                     size=rt_return[k], optional=True, name=f"R[{s},{k},{e}]"
                 )
@@ -122,15 +146,22 @@ def build_model(instance: Instance, add_symmetry_breaking: bool, horizon: int):
     if horizon == 0:
         horizon = sum((rt[k] + p[k] + rt_return.get(k, rt[k])) * U[k] for k in active_K)
         print(f"New horizon {horizon}")
+
     if move_cap is not None:
-        moves = 0
+        move_pulses = []
         for s in S:
             for k in active_K:
                 for e in range(U[k]):
-                    moves += mdl.pulse(F[(s, k, e)], 1)
-                    moves += mdl.pulse(R[(s, k, e)], 1)
+                    move_pulses.append(mdl.pulse(F[(s, k, e)], 1))
+                    move_pulses.append(mdl.pulse(R[(s, k, e)], 1))
 
-        mdl.add(mdl.always_in(moves, (0, horizon), 0, move_cap))
+        # Inject locked moves (Fetch or Return) from previous batch
+        for st, en in exo_moves:
+            locked_move = mdl.interval_var(start=st, end=en, name=f"exo_mv_{st}")
+            move_pulses.append(mdl.pulse(locked_move, 1))
+
+        if move_pulses:
+            mdl.add(mdl.always_in(sum(move_pulses), (0, horizon), 0, move_cap))
 
     # --- assignment & lanes ---
     # (i) an order chooses exactly ONE station (via I_os presence)
@@ -146,6 +177,14 @@ def build_model(instance: Instance, add_symmetry_breaking: bool, horizon: int):
     for s in S:
         for ln in L:
             lane_set = [I_os_lane[(o, s, ln)] for o in O]
+
+            # Inject locked lane usage from previous time window
+            for st, en in exo_lanes.get((s, ln), []):
+                locked_lane = mdl.interval_var(
+                    start=st, end=en, name=f"exo_ln_{s}_{ln}_{st}"
+                )
+                lane_set.append(locked_lane)
+
             if len(lane_set) >= 2:
                 mdl.add(mdl.no_overlap(lane_set))
 
@@ -184,29 +223,97 @@ def build_model(instance: Instance, add_symmetry_breaking: bool, horizon: int):
     #     - Else: cumulative cap via step function pulses over Block intervals
     for k in active_K:
         family = [Block[(s, k, e)] for s in S for e in range(U[k])]
+
+        # Build pulses for decision variables
+        bin_usage = sum(mdl.pulse(iv, 1) for iv in family)
+
+        # Inject locked bin blocks from other stations or previous windows
+        for st, en in exo_blocks.get(k, []):
+            locked_block = mdl.interval_var(start=st, end=en, name=f"exo_blk_{k}_{st}")
+            family.append(locked_block)  # For N[k]==1 no_overlap
+            bin_usage += mdl.pulse(locked_block, 1)  # For N[k]>1 cumulative
+
         if len(family) <= 1:
             continue
 
-        if N[k] <= 1:
-            if len(family) >= 2:
-                mdl.add(mdl.no_overlap(family))
-        if N[k] > len(family):
-            # 1) Can't overlap more than the number of intervals you created
-            continue
-        if move_cap is not None and N[k] >= (len(S) + int(move_cap)):
-            # 2) If move_cap exists, then at most move_cap bins can be moving (F/R) globally at any time,
-            #    plus at most |S| bins can be at stations (B stage). So overlap for any single SKU
-            #    can't exceed |S| + move_cap.
-            continue
+        if N[k] == 1:
+            mdl.add(mdl.no_overlap(family))
+        elif N[k] > 1:
+            mdl.add(mdl.always_in(bin_usage, (0, horizon), 0, N[k]))
 
-        bin_usage = 0
-        for s in S:
+    # (3) Cap on simultaneous picks at station (Hand Capacity)
+    for s in S:
+        station_pulses = []
+        for k in active_K:
             for e in range(U[k]):
-                # pulse(interval, amount) adds 1 to the function during the Block
-                bin_usage += mdl.pulse(Block[(s, k, e)], 1)
+                for o in orders_demanding_sku[k]:
+                    # Verify P exists (as created in the active_K/O loops above)
+                    if (o, s, k, e) in P:
+                        station_pulses.append(mdl.pulse(P[(o, s, k, e)], 1))
 
-                # Constrain maximum concurrent usage to the available bins N[k]
-        mdl.add(mdl.always_in(bin_usage, (0, horizon), 0, N[k]))
+        if station_pulses:
+            station_picks = sum(station_pulses)  # Or mdl.sum()
+            mdl.add(mdl.always_in(station_picks, (0, horizon), 0, pick_cap))
+
+    # # (4) Fairness constraints with "Empty Station" Alternative
+
+    # --- (A) Shift Length Fairness ---
+    # MIN_SHIFT_DURATION = 900  # 5-minute minimum block (ticks)
+
+    # is_used = {}
+    # shift_len = {}
+    # station_shift_cost = {}
+
+    # for s in S:
+    #     # Station is used (1) if at least one order is assigned to it, else (0)
+    #     is_used[s] = mdl.max([mdl.presence_of(I_os[(o, s)]) for o in O])
+
+    #     # Shift bounds (default values protect absent intervals from corrupting min/max)
+    #     s_start = mdl.min([mdl.start_of(I_os[(o, s)], horizon) for o in O])
+    #     s_end = mdl.max([mdl.end_of(I_os[(o, s)], 0) for o in O])
+
+    #     shift_len[s] = mdl.integer_var(0, horizon, name=f"shift_len_{s}")
+    #     station_shift_cost[s] = mdl.integer_var(0, horizon, name=f"shift_cost_{s}")
+
+    #     # Bind shift_len: strictly 0 if unused, (s_end - s_start) if used
+    #     mdl.add(mdl.if_then(is_used[s] == 1, shift_len[s] == s_end - s_start))
+    #     mdl.add(mdl.if_then(is_used[s] == 0, shift_len[s] == 0))
+
+    #     # Bind station_shift_cost: 0 if unused, max(300, shift_len[s]) if used
+    #     mdl.add(mdl.if_then(is_used[s] == 0, station_shift_cost[s] == 0))
+    #     mdl.add(
+    #         mdl.if_then(
+    #             is_used[s] == 1,
+    #             station_shift_cost[s] == mdl.max(MIN_SHIFT_DURATION, shift_len[s]),
+    #         )
+    #     )
+
+    # # Calculate max and min lengths (ignoring empty stations by adding horizon to their min)
+    # max_len = mdl.max([shift_len[s] for s in S])
+    # min_len = mdl.min([shift_len[s] + (1 - is_used[s]) * horizon for s in S])
+
+    # # Enforce ~10% deviation only if at least one station is operating
+    # any_used = mdl.max([is_used[s] for s in S])
+    # mdl.add(mdl.if_then(any_used == 1, 10 * max_len <= 12 * min_len))
+
+    # # --- (B) Number of Picks Fairness ---
+    # number_of_picks = {}
+    # for s in S:
+    #     pick_vars = []
+    #     for k in active_K:
+    #         for e in range(U[k]):
+    #             for o in orders_demanding_sku[k]:
+    #                 if (o, s, k, e) in P:
+    #                     pick_vars.append(mdl.presence_of(P[(o, s, k, e)]))
+    #     number_of_picks[s] = mdl.sum(pick_vars)
+
+    # # Safe upper bound for picks to isolate empty stations in the min calculation
+    # BIG_P = sum(len(orders_demanding_sku[k]) for k in active_K)
+
+    # max_picks = mdl.max([number_of_picks[s] for s in S])
+    # min_picks = mdl.min([number_of_picks[s] + (1 - is_used[s]) * BIG_P for s in S])
+
+    # mdl.add(mdl.if_then(any_used == 1, 10 * max_picks <= 12 * min_picks))
 
     # --- symmetry breaking ---
     if add_symmetry_breaking:
@@ -259,6 +366,12 @@ def build_model(instance: Instance, add_symmetry_breaking: bool, horizon: int):
     per_order_end = [mdl.max([mdl.end_of(I_os[(o, s)]) for s in S]) for o in O]
     makespan = mdl.max(per_order_end)
     mdl.minimize(makespan)
+
+    # total_wages = mdl.sum(station_shift_cost[s] for s in S)
+
+    # Optional tie-breaker: prioritize lower makespan among equal-wage schedules
+    # total_obj = total_wages * 10 + makespan
+    # mdl.minimize(total_obj)
 
     handles = {
         "I_os_lane": I_os_lane,

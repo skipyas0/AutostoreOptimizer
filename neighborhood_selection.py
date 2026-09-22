@@ -1,10 +1,14 @@
 import random
+from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import numpy as np
 
-from cp_model_utils import get_fleet_utilization_timeseries
+from cp_model_utils import (
+    get_fleet_utilization_timeseries,
+    get_pickface_utilization_per_station,
+)
 from freezing_utils import get_assigned_station
 from matheuristic_plots import Status
 
@@ -75,13 +79,21 @@ def get_order_intervals(handles, solution):
                 var_sol = solution.get_var_solution(var)
                 if var_sol and var_sol.is_present():
                     start, end = var_sol.get_start(), var_sol.get_end()
-                    order_intervals[o] = (start, end)
+                    order_intervals[o] = (start, end, s_assigned)
                     makespan = max(makespan, end)
     return order_intervals, makespan
 
 
-def orders_in_timeslice(order_intervals, t_start, t_end) -> SelectionResult:
-    seed_o = {o for o, (s, e) in order_intervals.items() if s < t_end and e > t_start}
+def orders_in_timeslice(
+    order_intervals, t_start, t_end, stations_mask=None
+) -> SelectionResult:
+    seed_o = {
+        o
+        for o, (s, e, station) in order_intervals.items()
+        if s < t_end
+        and e > t_start
+        and (stations_mask is None or station in stations_mask)
+    }
     return SelectionResult(seed_orders=seed_o)
 
 
@@ -133,31 +145,100 @@ def strategy_movecap_balancing_slices(handles, solution, total_length):
     )
 
 
-def strategy_random_lanes(handles, solution, k) -> SelectionResult:
-    all_lanes = [(s, ln) for s in handles["S"] for ln in handles["L"]]
-    chosen_lanes = set(random.sample(all_lanes, min(k, len(all_lanes))))
+def strategy_pickface_balancing_station_slices(handles, solution, total_length):
+    slice_length = total_length // 2
+    order_intervals, makespan = get_order_intervals(handles, solution)
+    per_station_util = get_pickface_utilization_per_station(solution, handles, makespan)
 
+    order_strats = []
+    for s in handles["S"]:
+        rolling_sums = np.convolve(
+            per_station_util[s], np.ones(slice_length, dtype=int), mode="valid"
+        )
+
+        noisy_sums = rolling_sums + np.random.normal(
+            0, np.std(rolling_sums) / 10, len(rolling_sums)
+        )
+
+        t_start_min = np.argmin(noisy_sums)
+        t_start_max = np.argmax(noisy_sums)
+        (
+            order_strats.append(
+                orders_in_timeslice(
+                    order_intervals,
+                    t_start_min,
+                    t_start_min + slice_length,
+                    stations_mask=[s],
+                )
+            ),
+        )
+        (
+            order_strats.append(
+                orders_in_timeslice(
+                    order_intervals,
+                    t_start_max,
+                    t_start_max + slice_length,
+                    stations_mask=[s],
+                )
+            ),
+        )
+    return combine_strategies(*order_strats)
+
+
+def compute_lane_congestion(handles, solution, use_duration):
+
+    all_lanes = [(s, ln) for s in handles["S"] for ln in handles["L"]]
+    congestion = defaultdict(int)
+    for o in handles["O"]:
+        for s, ln in all_lanes:
+            var = handles["I_os_lane"].get((o, s, ln))
+            if var is not None:
+                var_sol = solution.get_var_solution(var)
+                if var_sol and var_sol.is_present():
+                    if use_duration:
+                        congestion[(s, ln)] += var_sol.get_end() - var_sol.get_start()
+                    else:
+                        congestion[(s, ln)] += 1
+                    break
+    return congestion
+
+
+def orders_at_lanes(handles, solution, chosen_lanes):
     seed_o = set()
     for o in handles["O"]:
         for s, ln in chosen_lanes:
             var = handles["I_os_lane"].get((o, s, ln))
             if var is not None:
-                if hasattr(solution, "BooleanValue"):
-                    if solution.BooleanValue(var.pres):
-                        seed_o.add(o)
-                        break
-                else:
-                    var_sol = solution.get_var_solution(var)
-                    if var_sol and var_sol.is_present():
-                        seed_o.add(o)
-                        break
+                var_sol = solution.get_var_solution(var)
+                if var_sol and var_sol.is_present():
+                    seed_o.add(o)
+                    break
+    return seed_o
 
+
+def strategy_random_lanes(handles, solution, k) -> SelectionResult:
+    all_lanes = [(s, ln) for s in handles["S"] for ln in handles["L"]]
+    chosen_lanes = set(random.sample(all_lanes, min(k, len(all_lanes) - 1)))
+    seed_o = orders_at_lanes(handles, solution, chosen_lanes)
     return SelectionResult(seed_orders=seed_o)
 
 
-def strategy_similar_orders(
-    handles, solution, p_most_similar, jaccard
-) -> SelectionResult:
+def strategy_balancing_lanes(handles, solution, k, use_duration=True):
+    """
+    Compute congestion of lanes by number of orders and select (1) most congested and (k-1) least congested.
+    """
+    k = max(k, 2)
+    congestion = compute_lane_congestion(handles, solution, use_duration)
+    sorted_lanes = sorted(
+        congestion.keys(), key=lambda k: (congestion[k], random.random())
+    )
+    top = sorted_lanes[-1]
+    least = sorted_lanes[: k - 1]
+    seed_o = orders_at_lanes(handles, solution, least + [top])
+    return SelectionResult(seed_orders=seed_o)
+
+
+def strategy_similar_orders(handles, p_most_similar, jaccard) -> SelectionResult:
 
     seed_order = random.choice(handles["O"])
     selected_orders = {seed_order}
@@ -173,7 +254,7 @@ def strategy_similar_orders(
     p = min(1.0, p_most_similar)
     n_select = max(1, int(len(handles["O"]) * p))
     selected_orders.update(
-        {handles["O"][order_ix] for order_ix in sorted_orders[-n_select:]}
+        sorted_orders[-n_select:]
     )
     return SelectionResult(seed_orders=selected_orders)
 
@@ -210,7 +291,6 @@ class StrategyManager:
             ),
             "similar_orders": lambda sev: strategy_similar_orders(
                 self.handles,
-                self.current_solution,
                 0.1 * sev,
                 self.weighted_jaccard_matrix,
             ),
@@ -224,7 +304,10 @@ class StrategyManager:
                 strategy_random_skus(self.handles, self.current_solution, p=0.05 * sev),
             ),
             "random_lanes": lambda sev: strategy_random_lanes(
-                self.handles, self.current_solution, 1
+                self.handles, self.current_solution, 2 + sev
+            ),
+            "balancing_lanes": lambda sev: strategy_balancing_lanes(
+                self.handles, self.current_solution, 2 + sev
             ),
             "single_timeslice": lambda sev: strategy_multi_random_timeslice(
                 self.handles, self.current_solution, 1, 100 * sev
@@ -235,15 +318,28 @@ class StrategyManager:
             "triple_timeslice": lambda sev: strategy_multi_random_timeslice(
                 self.handles, self.current_solution, 3, 100 * sev
             ),
-            "balancing_timeslice": lambda sev: strategy_movecap_balancing_slices(
-                self.handles, self.current_solution, 100 * sev
+            "movecap_balancing_timeslice": lambda sev: (
+                strategy_movecap_balancing_slices(
+                    self.handles, self.current_solution, 100 * sev
+                )
+            ),
+            "pickface_balancing_station_timeslice": lambda sev: (
+                strategy_pickface_balancing_station_slices(
+                    self.handles, self.current_solution, 100 * sev
+                )
             ),
         }
 
         self.presets = {
             "all": None,
             "shaw_random": ["similar_orders", "random_orders"],
-            "random_balance": ["random_orders_and_skus", "balancing_timeslice"],
+            "random_balance": [
+                "random_orders_and_skus",
+                "movecap_balancing_timeslice",
+                "pickface_balancing_station_timeslice",
+                "balancing_lanes",
+                "similar_orders",
+            ],
             "random_orders": ["random_orders"],
         }
 
@@ -264,8 +360,8 @@ class StrategyManager:
         }
 
         self.A, self.B, self.C, self.D = (
-            5,
-            10,
+            100,
+            50,
             1,
             0,
         )  # const term, new best, feasible (something was found), unknown/optimal no improve)

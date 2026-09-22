@@ -19,8 +19,6 @@ from instance import Instance
 
 @dataclass
 class BinEvent:
-    """One bin visit at a station: fetch -> presence -> return."""
-
     sku: int
     copy_id: int
     fetch_start: int
@@ -29,7 +27,9 @@ class BinEvent:
     presence_end: int
     return_start: int
     return_end: int
-    orders_served: list[int] = field(default_factory=list)
+    orders_served: list[int]
+    # Add a list to track exact pick intervals
+    pick_intervals: list[tuple[int, int]] = field(default_factory=list)
 
 
 # ------ [P0-4 cont.] OrderPlan dataclass ------
@@ -537,16 +537,45 @@ def init_state(
     N: dict[int, int],
     horizon: int,
     move_cap: int | None,
+    exo_lanes: dict = None,
+    exo_blocks: dict = None,
+    exo_moves: list = None,
+    batch_start_time: int = 0,
 ) -> HeuristicState:
-    """Build initial HeuristicState with everything at t=0."""
-    lane_free = {(s, ln): 0 for s in S for ln in L}
-    pickface_free = {s: 0 for s in S}
+    """Build initial HeuristicState respecting locked resources and start time."""
+    lane_free = {(s, ln): batch_start_time for s in S for ln in L}
+    pickface_free = {s: batch_start_time for s in S}
+    
     move_da = DifferenceArray(horizon)
+    if exo_moves:
+        for st, en in exo_moves:
+            st = max(0, min(horizon-1, int(st)))
+            en = max(0, min(horizon-1, int(en)))
+            if st < en:
+                move_da.add_move(st, en)
     move_da.build_prefix()
+    
     bin_pools = {k: BinCopyPool(k, N[k]) for k in K}
+    for pool in bin_pools.values():
+        pool._heap = [(batch_start_time, i) for i in range(pool.n_copies)]
+
+    if exo_blocks:
+        for k, blocks in exo_blocks.items():
+            if k in bin_pools:
+                pool = bin_pools[k]
+                for st, en in sorted(blocks):
+                    avail, cid = heapq.heappop(pool._heap)
+                    heapq.heappush(pool._heap, (max(avail, en), cid))
+
     station_bin_events: dict[int, list[BinEvent]] = {s: [] for s in S}
     first_pick = {s: horizon + 1 for s in S}
     last_pick = {s: 0 for s in S}
+
+    lane_intervals = {(s, ln): [] for s in S for ln in L}
+    if exo_lanes:
+        for (s, ln), intervals in exo_lanes.items():
+            if (s, ln) in lane_intervals:
+                lane_intervals[(s, ln)] = sorted([(st, en) for st, en in intervals if st < horizon])
 
     return HeuristicState(
         lane_free=lane_free,
@@ -555,7 +584,7 @@ def init_state(
         bin_pools=bin_pools,
         station_bin_events=station_bin_events,
         pickface_intervals={s: [] for s in S},
-        lane_intervals={(s, ln): [] for s in S for ln in L},
+        lane_intervals=lane_intervals,
         first_pick=first_pick,
         last_pick=last_pick,
         move_cap=move_cap,

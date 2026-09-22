@@ -14,7 +14,28 @@ from autostore_heuristic import (
     init_state,
     validate_solution,
 )
-from instance import Instance
+
+
+def is_capacity_available(
+    existing_intervals: list[tuple[int, int]], p_start: int, p_end: int, pick_cap: int
+) -> bool:
+    events = [(p_start, 1), (p_end, -1)]
+    for s, e in existing_intervals:
+        # Only evaluate intervals that actually overlap with the proposed window
+        if max(s, p_start) < min(e, p_end):
+            events.append((s, 1))
+            events.append((e, -1))
+
+    # Sort chronologically. If times match, process ends (-1) before starts (+1)
+    events.sort(key=lambda x: (x[0], x[1]))
+
+    concurrent_picks = 0
+    for time_tick, change in events:
+        concurrent_picks += change
+        if concurrent_picks > pick_cap:
+            return False
+
+    return True
 
 
 def build_sku_order_index(orders_req: dict[int, list[int]]) -> dict[int, set[int]]:
@@ -71,6 +92,7 @@ def gap_filling_plan_order_at_station(
     ALPHA: float,
     BETA: float,
     demand_count: dict[int, int],
+    pick_cap: int,
 ) -> OrderPlan | None:
     L_at_s = [ln for (ss, ln) in state.lane_free if ss == s]
     if not L_at_s:
@@ -104,10 +126,20 @@ def gap_filling_plan_order_at_station(
         if shared is not None:
             pick_start = max(t_cursor, shared.presence_start)
             pick_end = pick_start + p[k]
-            t_cursor = pick_end
-            pick_times_dict[k] = (pick_start, pick_end)
-            shared_picks.append((k, shared, pick_end))
-            continue
+
+            # Verify the newly proposed interval doesn't breach hand capacity
+            if is_capacity_available(
+                shared.pick_intervals, pick_start, pick_end, pick_cap
+            ):
+                t_cursor = pick_end
+                pick_times_dict[k] = (pick_start, pick_end)
+                shared_picks.append((k, shared, pick_end))
+                # Tentatively add it so subsequent SKUs in this order see the updated load
+                shared.pick_intervals.append((pick_start, pick_end))
+                continue
+            else:
+                # Capacity exceeded at this time-tick; reject sharing and force a new bin fetch
+                shared = None
 
         desired_presence = max(t_cursor, rt[k])
 
@@ -178,6 +210,9 @@ def gap_filling_plan_order_at_station(
             return_start=return_start,
             return_end=return_end,
             orders_served=[o],
+            pick_intervals=[
+                (pick_start, pick_end)
+            ],  # Initialize with the triggering pick
         )
         new_bin_events.append(ev)
         pending_moves.append((t_fetch, fetch_end))
@@ -217,6 +252,7 @@ def score_order_insertions(
     BETA: float,
     demand_count: dict[int, int],
     regret_k: int,
+    pick_cap: int,
 ) -> InsertionScores:
     station_scores = {}
     station_plans = {}
@@ -235,6 +271,7 @@ def score_order_insertions(
             ALPHA,
             BETA,
             demand_count,
+            pick_cap,
         )
         if plan is not None:
             station_scores[s] = plan.score
@@ -321,43 +358,29 @@ def compute_dirty_set(
 
 
 def run_rdi_sgc(instance, *args, **kwargs) -> Solution:
-    if not isinstance(instance, Instance):
-        S = instance
-        L = args[0]
-        K = args[1]
-        O = args[2]
-        orders_req = args[3]
-        rt = args[4]
-        rt_ret = args[5]
-        p = args[6]
-        N = args[7]
-        horizon = kwargs.get("horizon", args[8] if len(args) > 8 else 10000)
-        move_cap = kwargs.get("move_cap", args[9] if len(args) > 9 else None)
-        ALPHA = kwargs.get("ALPHA", args[10] if len(args) > 10 else 1.0)
-        BETA = kwargs.get("BETA", args[11] if len(args) > 11 else 0.0)
-        regret_k = kwargs.get("regret_k", args[12] if len(args) > 12 else 2)
-        use_lazy = kwargs.get("use_lazy", args[13] if len(args) > 13 else True)
-        tiebreaker = kwargs.get(
-            "tiebreaker", args[14] if len(args) > 14 else "sharing_degree"
-        )
-        instance = Instance(S, L, K, orders_req, rt, p, N, rt_ret=rt_ret)
-    else:
-        horizon = kwargs.get("horizon", args[0] if len(args) > 0 else 10000)
-        move_cap = kwargs.get("move_cap", args[1] if len(args) > 1 else None)
-        ALPHA = kwargs.get("ALPHA", args[2] if len(args) > 2 else 1.0)
-        BETA = kwargs.get("BETA", args[3] if len(args) > 3 else 0.0)
-        regret_k = kwargs.get("regret_k", args[4] if len(args) > 4 else 2)
-        use_lazy = kwargs.get("use_lazy", args[5] if len(args) > 5 else True)
-        tiebreaker = kwargs.get(
-            "tiebreaker", args[6] if len(args) > 6 else "sharing_degree"
-        )
-        rt_ret = kwargs.get("rt_ret", args[7] if len(args) > 7 else None)
+
+    horizon = kwargs.get("horizon", args[0] if len(args) > 0 else 10000)
+    ALPHA = kwargs.get("ALPHA", args[2] if len(args) > 2 else 1.0)
+    BETA = kwargs.get("BETA", args[3] if len(args) > 3 else 0.0)
+    regret_k = kwargs.get("regret_k", args[4] if len(args) > 4 else 2)
+    use_lazy = kwargs.get("use_lazy", args[5] if len(args) > 5 else True)
+    tiebreaker = kwargs.get(
+        "tiebreaker", args[6] if len(args) > 6 else "sharing_degree"
+    )
 
     S, L, K, orders_req, rt, p, N = instance
     O = instance.O
-    if rt_ret is None:
-        rt_ret = instance.rt_ret
-    state = init_state(S, L, K, N, horizon, move_cap)
+    rt_ret = instance.rt_ret
+    move_cap = instance.movecap
+    pick_cap = instance.pickcap
+    exo_lanes = kwargs.get("exo_lanes")
+    exo_blocks = kwargs.get("exo_blocks")
+    exo_moves = kwargs.get("exo_moves")
+    batch_start_time = kwargs.get("batch_start_time", 0)
+
+    state = init_state(
+        S, L, K, N, horizon, move_cap, exo_lanes, exo_blocks, exo_moves, batch_start_time
+    )
 
     demand_count = defaultdict(int)
     for reqs in orders_req.values():
@@ -396,6 +419,7 @@ def run_rdi_sgc(instance, *args, **kwargs) -> Solution:
             BETA,
             demand_count,
             regret_k,
+            pick_cap,
         )
 
     order_assignments = {}
@@ -467,6 +491,7 @@ def run_rdi_sgc(instance, *args, **kwargs) -> Solution:
                 BETA,
                 demand_count,
                 regret_k,
+                pick_cap,
             )
 
     # Post-process results into a Solution object

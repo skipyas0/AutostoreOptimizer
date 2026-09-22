@@ -24,6 +24,7 @@ class Instance:
         movecap: int,
         seed: int,
         rt_ret: dict[int, int] | None = None,
+        pickcap: int = 2,
     ):
         self.S = S
         self.L = L
@@ -34,6 +35,7 @@ class Instance:
         self.N = N
         self._rt_ret = rt_ret if rt_ret is not None else dict(rt)
         self._movecap = movecap
+        self._pickcap = pickcap
         self._seed = seed
         self.stats = self.get_statistics()
         self.features = self.get_features()
@@ -71,6 +73,10 @@ class Instance:
     @property
     def movecap(self) -> int:
         return self._movecap
+
+    @property
+    def pickcap(self) -> int:
+        return self._pickcap
 
     @property
     def seed(self) -> int:
