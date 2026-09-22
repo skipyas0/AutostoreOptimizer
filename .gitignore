@@ -9,6 +9,7 @@ results
 experiments
 precalculated_instances
 cpo_verification_results
+olist_analysis.ipynb
 *.html
 *.txt
 *.pkl

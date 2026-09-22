@@ -253,9 +253,7 @@ def strategy_similar_orders(handles, p_most_similar, jaccard) -> SelectionResult
 
     p = min(1.0, p_most_similar)
     n_select = max(1, int(len(handles["O"]) * p))
-    selected_orders.update(
-        sorted_orders[-n_select:]
-    )
+    selected_orders.update(sorted_orders[-n_select:])
     return SelectionResult(seed_orders=selected_orders)
 
 
@@ -277,6 +275,9 @@ class StrategyManager:
         weighted_jaccard_matrix,
         strategy_preset: str = "all",
         strat_choice: str = "uniform",
+        default_percent: float = 0.1,
+        default_n_lanes: int = 2,
+        default_timeslice_width: int = 100,
     ):
         self.strategy_preset = strategy_preset
         self.strat_choice = strat_choice
@@ -287,45 +288,47 @@ class StrategyManager:
 
         self.strategies = {
             "random_orders": lambda sev: strategy_random_orders(
-                self.handles, self.current_solution, p=0.1 * sev
+                self.handles, self.current_solution, p=default_percent * sev
             ),
             "similar_orders": lambda sev: strategy_similar_orders(
                 self.handles,
-                0.1 * sev,
+                default_percent * sev,
                 self.weighted_jaccard_matrix,
             ),
             "random_skus": lambda sev: strategy_random_skus(
-                self.handles, self.current_solution, p=0.1 * sev
+                self.handles, self.current_solution, p=default_percent * sev
             ),
             "random_orders_and_skus": lambda sev: combine_strategies(
                 strategy_random_orders(
-                    self.handles, self.current_solution, p=0.05 * sev
+                    self.handles, self.current_solution, p=0.5 * default_percent * sev
                 ),
-                strategy_random_skus(self.handles, self.current_solution, p=0.05 * sev),
+                strategy_random_skus(
+                    self.handles, self.current_solution, p=0.5 * default_percent * sev
+                ),
             ),
             "random_lanes": lambda sev: strategy_random_lanes(
-                self.handles, self.current_solution, 2 + sev
+                self.handles, self.current_solution, default_n_lanes + sev
             ),
             "balancing_lanes": lambda sev: strategy_balancing_lanes(
-                self.handles, self.current_solution, 2 + sev
+                self.handles, self.current_solution, default_n_lanes + sev
             ),
             "single_timeslice": lambda sev: strategy_multi_random_timeslice(
-                self.handles, self.current_solution, 1, 100 * sev
+                self.handles, self.current_solution, 1, default_timeslice_width * sev
             ),
             "double_timeslice": lambda sev: strategy_multi_random_timeslice(
-                self.handles, self.current_solution, 2, 100 * sev
+                self.handles, self.current_solution, 2, default_timeslice_width * sev
             ),
             "triple_timeslice": lambda sev: strategy_multi_random_timeslice(
-                self.handles, self.current_solution, 3, 100 * sev
+                self.handles, self.current_solution, 3, default_timeslice_width * sev
             ),
             "movecap_balancing_timeslice": lambda sev: (
                 strategy_movecap_balancing_slices(
-                    self.handles, self.current_solution, 100 * sev
+                    self.handles, self.current_solution, default_timeslice_width * sev
                 )
             ),
             "pickface_balancing_station_timeslice": lambda sev: (
                 strategy_pickface_balancing_station_slices(
-                    self.handles, self.current_solution, 100 * sev
+                    self.handles, self.current_solution, default_timeslice_width * sev
                 )
             ),
         }

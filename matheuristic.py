@@ -308,6 +308,9 @@ class Solver:
             self.weighted_jaccard_matrix,
             self.experiment_config["strat_preset"],
             self.experiment_config["strat_choice"],
+            default_percent=self.experiment_config["default_percent"],
+            default_n_lanes=self.experiment_config["default_n_lanes"],
+            default_timeslice_width=self.experiment_config["default_timeslice_width"],
         )
 
         # prepare variable index sorted look-up for unfrozen set logging
@@ -621,6 +624,31 @@ if __name__ == "__main__":
         dest="eps_greedy_prob",
         help="Epsilon-greedy acceptance probability (default: 0.2)",
     )
+
+    parser.add_argument(
+        "--default-timeslice-width",
+        type=int,
+        default=100,
+        dest="default_timeslice_width",
+        help="Default width of window for timeslice strategies",
+    )
+
+    parser.add_argument(
+        "--default-percent",
+        type=float,
+        default=0.1,
+        dest="default_percent",
+        help="Default percentage for unfreezing of orders/sku",
+    )
+
+    parser.add_argument(
+        "--default-n-lanes",
+        type=int,
+        default=2,
+        dest="default_n_lanes",
+        help="Default number of unfrozen lanes",
+    )
+
     args = parser.parse_args()
 
     for instance in args.instances:
@@ -645,6 +673,9 @@ if __name__ == "__main__":
             "search_type": args.search_type,
             "strat_choice": args.strat_choice,
             "strat_preset": args.strat_preset,
+            "default_timeslice_width": args.default_timeslice_width,
+            "default_n_lanes": args.default_n_lanes,
+            "default_percent": args.default_percent,
         }
         solver = Solver(
             experiment_config,
