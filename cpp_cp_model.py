@@ -5,10 +5,25 @@ import cp_lns_core
 from cp_model_utils import MockIntervalVar
 
 
-def build_model(instance, add_symmetry_breaking: bool, horizon: int):
+def build_model(
+    instance,
+    add_symmetry_breaking: bool,
+    horizon: int,
+    exo_lanes: dict = None,  # (station, lane) -> list of (start, end)
+    exo_blocks: dict = None,  # sku -> list of (start, end)
+    exo_moves: list = None,  # list of (start, end) for F/R moves
+    batch_start_time: int = 0,
+    objective_func: str = "makespan",
+):
     S, L, K, orders_req, rt, p, N = instance
     move_cap = instance.movecap
+    pick_cap = getattr(instance, 'pickcap', None)
     rt_return = instance.rt_ret
+    
+    exo_lanes = exo_lanes or defaultdict(list)
+    exo_blocks = exo_blocks or defaultdict(list)
+    exo_moves = exo_moves or []
+
 
     O = sorted(orders_req.keys())
 
@@ -32,11 +47,17 @@ def build_model(instance, add_symmetry_breaking: bool, horizon: int):
         p,
         N,
         move_cap,
+        pick_cap,
         rt_return,
         active_K,
         U,
         horizon,
         add_symmetry_breaking,
+        exo_lanes,
+        exo_blocks,
+        exo_moves,
+        batch_start_time,
+        objective_func,
     )
 
     # Reconstruct handles dictionary with MockIntervalVar

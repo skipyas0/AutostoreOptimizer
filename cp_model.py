@@ -378,15 +378,21 @@ def build_model(
         [mdl.presence_of(F[s, k, e]) for s in S for k in active_K for e in range(U[k])]
     )
 
+    # --- objective (total order flow time) ---
+    total_flow_time = mdl.sum([mdl.end_of(I_os[(o, s)]) for o in O for s in S])
+
     mdl.add_kpi(makespan, "makespan")
     mdl.add_kpi(num_bin_fetches, "bin_fetches")
+    mdl.add_kpi(total_flow_time, "total_flow_time")
 
     if objective_func == "bin_fetches":
         mdl.minimize(num_bin_fetches)
     elif objective_func == "makespan":
         mdl.minimize(makespan)
+    elif objective_func == "total_flow_time":
+        mdl.minimize(total_flow_time)
     else:
-        raise ValueError()
+        raise ValueError(f"Unknown objective function: {objective_func}")
 
     handles = {
         "I_os_lane": I_os_lane,
@@ -412,6 +418,7 @@ def build_model(
         "move_cap": move_cap,
         "makespan": makespan,
         "bin_fetches": num_bin_fetches,
+        "total_flow_time": total_flow_time,
     }
     return mdl, handles
 

@@ -23,3 +23,4 @@ olist_analysis.ipynb
 *.cpo
 *.log
 decomposition_experiments
+patch_*.py

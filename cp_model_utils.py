@@ -260,6 +260,10 @@ class CppSolveResult:
         self.total_time = result_dict.get("TotalTime", 0.0)
         self.extraction_time = result_dict.get("ExtractionTime", 0.0)
         self.solve_time = result_dict.get("SolveTime", 0.0)
+        self.kpis = result_dict.get("kpis", {"makespan": self.objective})
+
+    def get_kpis(self):
+        return self.kpis
 
     def get_info(self, key):
         if key == "TotalTime":

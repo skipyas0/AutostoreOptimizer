@@ -26,6 +26,13 @@ private:
     std::string make_key_o_s_k_e(const std::string& prefix, int o, int s, int k, int e) { return prefix + "[" + std::to_string(o) + "," + std::to_string(s) + "," + std::to_string(k) + "," + std::to_string(e) + "]"; }
 
 public:
+    IloObjective active_obj;
+    IloObjective bin_fetches_obj;
+    IloObjective total_flow_time_obj;
+    IloIntExpr makespan_expr;
+    IloIntExpr bin_fetches_expr;
+    IloIntExpr total_flow_time_expr;
+
     CpLnsModel(const std::vector<int>& S,
                const std::vector<int>& L,
                const std::vector<int>& K,
@@ -34,11 +41,17 @@ public:
                const std::map<int, int>& p,
                const std::map<int, int>& N,
                std::optional<int> move_cap,
+               std::optional<int> pick_cap,
                const std::map<int, int>& rt_return,
                const std::vector<int>& active_K,
                const std::map<int, int>& U,
                int horizon,
-               bool add_symmetry_breaking) {
+               bool add_symmetry_breaking,
+               const std::map<std::pair<int, int>, std::vector<std::pair<int, int>>>& exo_lanes,
+               const std::map<int, std::vector<std::pair<int, int>>>& exo_blocks,
+               const std::vector<std::pair<int, int>>& exo_moves,
+               int batch_start_time,
+               const std::string& objective_func) {
         
         model = IloModel(env);
         cp = IloCP(model);
@@ -49,6 +62,16 @@ public:
             O.push_back(pair.first);
         }
         
+        IloIntervalVar past_block;
+        if (batch_start_time > 0) {
+            past_block = IloIntervalVar(env, batch_start_time);
+            past_block.setStartMin(0);
+            past_block.setStartMax(0);
+            past_block.setEndMin(batch_start_time);
+            past_block.setEndMax(batch_start_time);
+            past_block.setName("Epoch_Past");
+        }
+
         for (int o : O) {
             for (int s : S) {
                 std::string name_I_os = make_key("I_os", o, s);
@@ -56,6 +79,10 @@ public:
                 iv.setOptional();
                 iv.setName(name_I_os.c_str());
                 vars[name_I_os] = iv;
+                
+                if (batch_start_time > 0) {
+                    model.add(IloEndBeforeStart(env, past_block, iv));
+                }
                 
                 for (int ln : L) {
                     std::string name_lane = make_key("I_os_lane", o, s, ln);
@@ -100,6 +127,10 @@ public:
                     iv_F.setOptional();
                     iv_F.setName(name_F.c_str());
                     vars[name_F] = iv_F;
+                    
+                    if (batch_start_time > 0) {
+                        model.add(IloEndBeforeStart(env, past_block, iv_F));
+                    }
                     
                     std::string name_R = make_key_s_k_e("R", s, k, e);
                     int rt_ret_val = (rt_return.find(k) != rt_return.end()) ? rt_return.at(k) : rt.at(k);
@@ -173,7 +204,41 @@ public:
                     }
                 }
             }
+            for (const auto& st_en : exo_moves) {
+                IloIntervalVar locked(env, st_en.second - st_en.first);
+                locked.setStartMin(st_en.first);
+                locked.setStartMax(st_en.first);
+                locked.setEndMin(st_en.second);
+                locked.setEndMax(st_en.second);
+                std::string nm = "exo_mv_" + std::to_string(st_en.first);
+                locked.setName(nm.c_str());
+                moves += IloPulse(locked, 1);
+            }
             model.add(IloAlwaysIn(env, moves, 0, horizon, 0, move_cap.value()));
+        }
+        
+        if (pick_cap.has_value()) {
+            for (int s : S) {
+                IloCumulFunctionExpr station_picks(env);
+                bool has_picks = false;
+                for (int k : active_K) {
+                    for (int e = 0; e < U.at(k); ++e) {
+                        for (int o : O) {
+                            const auto& reqs = orders_req.at(o);
+                            if (std::find(reqs.begin(), reqs.end(), k) != reqs.end()) {
+                                std::string name_P = make_key_o_s_k_e("P", o, s, k, e);
+                                if (vars.find(name_P) != vars.end()) {
+                                    station_picks += IloPulse(vars[name_P], 1);
+                                    has_picks = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                if (has_picks) {
+                    model.add(IloAlwaysIn(env, station_picks, 0, horizon, 0, pick_cap.value()));
+                }
+            }
         }
 
         for (int o : O) {
@@ -201,6 +266,21 @@ public:
                 for (int o : O) {
                     lane_set.add(vars[make_key("I_os_lane", o, s, ln)]);
                 }
+                
+                auto key = std::make_pair(s, ln);
+                if (exo_lanes.find(key) != exo_lanes.end()) {
+                    for (const auto& st_en : exo_lanes.at(key)) {
+                        IloIntervalVar locked(env, st_en.second - st_en.first);
+                        locked.setStartMin(st_en.first);
+                        locked.setStartMax(st_en.first);
+                        locked.setEndMin(st_en.second);
+                        locked.setEndMax(st_en.second);
+                        std::string nm = "exo_ln_" + std::to_string(s) + "_" + std::to_string(ln) + "_" + std::to_string(st_en.first);
+                        locked.setName(nm.c_str());
+                        lane_set.add(locked);
+                    }
+                }
+                
                 if (lane_set.getSize() >= 2) {
                     model.add(IloNoOverlap(env, lane_set));
                 }
@@ -260,30 +340,36 @@ public:
         
         for (int k : active_K) {
             IloIntervalVarArray family(env);
-            for (int s : S) {
-                for (int e = 0; e < U.at(k); ++e) {
-                    family.add(vars[make_key_s_k_e("Block", s, k, e)]);
-                }
-            }
-            if (family.getSize() <= 1) continue;
-            
-            if (N.at(k) <= 1) {
-                if (family.getSize() >= 2) {
-                    model.add(IloNoOverlap(env, family));
-                }
-            }
-            
-            if (N.at(k) > family.getSize()) continue;
-            
-            if (move_cap.has_value() && (size_t)N.at(k) >= (S.size() + (size_t)move_cap.value())) continue;
-            
             IloCumulFunctionExpr bin_usage(env);
             for (int s : S) {
                 for (int e = 0; e < U.at(k); ++e) {
-                    bin_usage += IloPulse(vars[make_key_s_k_e("Block", s, k, e)], 1);
+                    IloIntervalVar iv_Block = vars[make_key_s_k_e("Block", s, k, e)];
+                    family.add(iv_Block);
+                    bin_usage += IloPulse(iv_Block, 1);
                 }
             }
-            model.add(IloAlwaysIn(env, bin_usage, 0, horizon, 0, N.at(k)));
+            
+            if (exo_blocks.find(k) != exo_blocks.end()) {
+                for (const auto& st_en : exo_blocks.at(k)) {
+                    IloIntervalVar locked(env, st_en.second - st_en.first);
+                    locked.setStartMin(st_en.first);
+                    locked.setStartMax(st_en.first);
+                    locked.setEndMin(st_en.second);
+                    locked.setEndMax(st_en.second);
+                    std::string nm = "exo_blk_" + std::to_string(k) + "_" + std::to_string(st_en.first);
+                    locked.setName(nm.c_str());
+                    family.add(locked);
+                    bin_usage += IloPulse(locked, 1);
+                }
+            }
+
+            if (family.getSize() <= 1) continue;
+            
+            if (N.at(k) == 1) {
+                model.add(IloNoOverlap(env, family));
+            } else if (N.at(k) > 1) {
+                model.add(IloAlwaysIn(env, bin_usage, 0, horizon, 0, N.at(k)));
+            }
         }
         
         if (add_symmetry_breaking) {
@@ -330,16 +416,56 @@ public:
             per_order_ends[i] = IloMax(ends);
         }
         
-        IloIntExpr makespan_expr = IloMax(per_order_ends);
+        makespan_expr = IloMax(per_order_ends);
         makespan_obj = IloMinimize(env, makespan_expr);
-        model.add(makespan_obj);
+        
+        bin_fetches_expr = IloIntExpr(env);
+        for (int s : S) {
+            for (int k : active_K) {
+                for (int e = 0; e < U.at(k); ++e) {
+                    bin_fetches_expr += IloPresenceOf(env, vars[make_key_s_k_e("F", s, k, e)]);
+                }
+            }
+        }
+        bin_fetches_obj = IloMinimize(env, bin_fetches_expr);
+        
+        total_flow_time_expr = IloIntExpr(env);
+        for (int o : O) {
+            for (int s : S) {
+                total_flow_time_expr += IloEndOf(vars[make_key("I_os", o, s)]);
+            }
+        }
+        total_flow_time_obj = IloMinimize(env, total_flow_time_expr);
+        
+        if (objective_func == "bin_fetches") {
+            active_obj = bin_fetches_obj;
+        } else if (objective_func == "total_flow_time") {
+            active_obj = total_flow_time_obj;
+        } else {
+            active_obj = makespan_obj;
+        }
+        model.add(active_obj);
     }
     
+    void set_objective(const std::string& target) {
+        if (active_obj.getImpl()) {
+            model.remove(active_obj);
+        }
+        if (target == "bin_fetches") {
+            active_obj = bin_fetches_obj;
+        } else if (target == "total_flow_time") {
+            active_obj = total_flow_time_obj;
+        } else {
+            active_obj = makespan_obj;
+        }
+        model.add(active_obj);
+    }
+
     ~CpLnsModel() {
         env.end();
     }
     
-    void apply_warm_start(const std::vector<std::string>& names, const std::vector<int>& present, const std::vector<int>& start, const std::vector<int>& end) {
+    void apply_warm_start(const std::vector<std::string>& names, const std::vector<int>& present, const std::vector<long long>& start, const std::vector<long long>& end) {
         IloSolution sp(env);
         for (size_t i = 0; i < names.size(); ++i) {
             const std::string& name = names[i];
@@ -358,7 +484,7 @@ public:
         cp.setStartingPoint(sp);
     }
     
-    void apply_delta_freezing(const std::vector<std::string>& to_freeze, const std::vector<int>& present, const std::vector<int>& start, const std::vector<int>& end, const std::vector<std::string>& to_unfreeze) {
+    void apply_delta_freezing(const std::vector<std::string>& to_freeze, const std::vector<int>& present, const std::vector<long long>& start, const std::vector<long long>& end, const std::vector<std::string>& to_unfreeze) {
         IloExtractableArray bulk_remove(env);
         for (const std::string& name : to_unfreeze) {
             auto it = active_freeze_constraints.find(name);
@@ -452,6 +578,12 @@ public:
             result["ExtractionTime"] = extraction_time;
             result["SolveTime"] = total_time - extraction_time;
             
+            py::dict kpis;
+            kpis["makespan"] = cp.getValue(makespan_expr);
+            kpis["bin_fetches"] = cp.getValue(bin_fetches_expr);
+            kpis["total_flow_time"] = cp.getValue(total_flow_time_expr);
+            result["kpis"] = kpis;
+
             py::dict var_sols;
             for (const auto& pair : vars) {
                 const std::string& name = pair.first;
@@ -502,11 +634,12 @@ public:
 
 PYBIND11_MODULE(cp_lns_core, m) {
     py::class_<CpLnsModel>(m, "CpLnsModel")
-        .def(py::init<std::vector<int>, std::vector<int>, std::vector<int>, std::map<int, std::vector<int>>, std::map<int, int>, std::map<int, int>, std::map<int, int>, std::optional<int>, std::map<int, int>, std::vector<int>, std::map<int, int>, int, bool>())
+        .def(py::init<std::vector<int>, std::vector<int>, std::vector<int>, std::map<int, std::vector<int>>, std::map<int, int>, std::map<int, int>, std::map<int, int>, std::optional<int>, std::optional<int>, std::map<int, int>, std::vector<int>, std::map<int, int>, int, bool, std::map<std::pair<int, int>, std::vector<std::pair<int, int>>>, std::map<int, std::vector<std::pair<int, int>>>, std::vector<std::pair<int, int>>, int, std::string>())
         .def("apply_warm_start", &CpLnsModel::apply_warm_start)
         .def("apply_delta_freezing", &CpLnsModel::apply_delta_freezing)
         .def("solve", &CpLnsModel::solve, py::arg("time_limit"), py::arg("improvement_makespan") = -1, py::arg("workers") = 1, py::arg("presolve") = "Auto", py::arg("search_type") = "Auto")
-        .def("export_model", &CpLnsModel::export_model, py::arg("filename"));
+        .def("export_model", &CpLnsModel::export_model, py::arg("filename"))
+        .def("set_objective", &CpLnsModel::set_objective, py::arg("target"));
 }
 
 
