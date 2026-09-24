@@ -76,7 +76,7 @@ class Instance:
 
     @property
     def pickcap(self) -> int:
-        return self._pickcap
+        return self._pickcap if hasattr(self, "_pickcap") else len(self.L)
 
     @property
     def seed(self) -> int:

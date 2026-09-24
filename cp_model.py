@@ -16,6 +16,7 @@ def build_model(
     exo_blocks: dict = None,  # sku -> list of (start, end)
     exo_moves: list = None,  # list of (start, end) for F/R moves):
     batch_start_time: int = 0,
+    objective_func: str = "movecap",
 ):
     """
     Intervals per (s,k,e):
@@ -362,16 +363,30 @@ def build_model(
                 # This constrains the end time *if* the interval is present
                 mdl.add(mdl.end_of(I_os[(o, s)]) <= horizon)
 
+    # --- objective (station wages) ---
+    # total_wages = mdl.sum(station_shift_cost[s] for s in S)
+    # Optional tie-breaker: prioritize lower makespan among equal-wage schedules
+    # total_obj = total_wages
+    # mdl.minimize(total_obj)
+
     # --- objective (makespan over station windows) ---
     per_order_end = [mdl.max([mdl.end_of(I_os[(o, s)]) for s in S]) for o in O]
     makespan = mdl.max(per_order_end)
-    mdl.minimize(makespan)
 
-    # total_wages = mdl.sum(station_shift_cost[s] for s in S)
+    # --- objective (number of bin fetches) ---
+    num_bin_fetches = mdl.sum(
+        [mdl.presence_of(F[s, k, e]) for s in S for k in active_K for e in range(U[k])]
+    )
 
-    # Optional tie-breaker: prioritize lower makespan among equal-wage schedules
-    # total_obj = total_wages * 10 + makespan
-    # mdl.minimize(total_obj)
+    mdl.add_kpi(makespan, "makespan")
+    mdl.add_kpi(num_bin_fetches, "bin_fetches")
+
+    if objective_func == "bin_fetches":
+        mdl.minimize(num_bin_fetches)
+    elif objective_func == "makespan":
+        mdl.minimize(makespan)
+    else:
+        raise ValueError()
 
     handles = {
         "I_os_lane": I_os_lane,
@@ -396,6 +411,7 @@ def build_model(
         "N": N,
         "move_cap": move_cap,
         "makespan": makespan,
+        "bin_fetches": num_bin_fetches,
     }
     return mdl, handles
 

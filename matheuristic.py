@@ -1,10 +1,10 @@
-import tqdm
 import argparse
 import json
 import os
 import pickle
 import random
 
+import tqdm
 from docplex.cp.solution import CpoSolveResult
 from loguru import logger
 
@@ -62,12 +62,13 @@ def load_instance(instance_config=None, instance_folder=None):
     return instance, heur_sol, instance_folder, instance_config
 
 
-def prepare_model_docplex(config, instance, heur_sol):
+def prepare_model_docplex(config, instance, heur_sol, objective_func):
 
     mdl, handles = docplex_model.build_model(
         instance,
         add_symmetry_breaking=config["symmetry_breaking"],
         horizon=config["horizon"],
+        objective_func=objective_func,
     )
 
     starting_point = docplex_model.inject_warmstart(
@@ -148,10 +149,29 @@ class Solver:
         self.severity = 1
         self.stagnation_count = 0
         self.experiment_config = experiment_config
-
+        self.cp_obj = experiment_config["cp_objective"]
         for run in range(self.experiment_config["runs"]):
             self.run_solver()
         self.vlg.save_experiment()
+
+    def update_iteration_objective(self, mdl, target="makespan"):
+        """Swaps the active objective function for the current LNS iteration."""
+
+        # 1. Safely remove the current objective from the model
+        current_obj = mdl.get_objective()
+        if current_obj is not None:
+            mdl.remove(current_obj)
+
+        # 2. Inject the new target (assuming makespan_expr and fetches_expr are saved as class attributes)
+        logger.info(f"Changing objective to '{target}'")
+        if target == "makespan":
+            mdl.minimize(self.handles["makespan"])
+            self.cp_obj = "makespan"
+        elif target == "bin_fetches":
+            mdl.minimize(self.handles["bin_fetches"])
+            self.cp_obj = "bin_fetches"
+        else:
+            raise ValueError(f"Unknown objective target: {target}")
 
     def eps_greedy_acceptance(self, sol_object, solve_status=None):
         """
@@ -178,7 +198,11 @@ class Solver:
             return Status.Unknown
 
         solve_status = sol_object.get_solve_status()
-        incumbent = sol_object.get_objective_value()
+
+        current_makespan = sol_object.get_kpis()["makespan"]
+        # current_fetches = sol_object.get_kpis_value("bin_fetches")
+
+        incumbent = current_makespan
 
         if incumbent < self.current_result:
             # result is better than current: auto-accept
@@ -206,7 +230,8 @@ class Solver:
 
             if incumbent > self.current_result + 1e-6:
                 # it shouldn't be possible to get a worse result if the solver achieved optimum
-                assert solve_status == "Feasible"
+                if solve_status != "Feasible" and self.cp_obj == "makespan":
+                    raise AssertionError
                 status = Status.Feasible_Degradation
 
             elif incumbent >= self.current_result:
@@ -278,7 +303,10 @@ class Solver:
         # run reset logic
         if self.experiment_config["backend"] == "docplex":
             self.mdl, self.handles, sp = prepare_model_docplex(
-                self.instance_config, self.instance, self.heur_sol
+                self.instance_config,
+                self.instance,
+                self.heur_sol,
+                experiment_config["cp_objective"],
             )
         elif self.experiment_config["backend"] == "cpp":
             self.mdl, self.handles, sp = prepare_model_cpp(
@@ -410,6 +438,13 @@ class Solver:
             starting_point = self.get_starting_point(to_optimize)
 
             if self.experiment_config["backend"] == "docplex":
+                cycle_per = self.experiment_config["cp_objective_cycle_period"]
+                if cycle_per > 0 and (i + 1) % cycle_per == 0:
+                    self.update_iteration_objective(
+                        self.mdl,
+                        "makespan" if self.cp_obj == "bin_fetches" else "bin_fetches",
+                    )
+
                 # set iteration starting point
                 self.mdl.set_starting_point(starting_point)
                 # add and remove freeze constraints
@@ -595,6 +630,21 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--cp-objective",
+        type=str,
+        default="makespan",
+        choices=["makespan", "bin_fetches"],
+        help="Objective function for the underlying CP model.",
+    )
+
+    parser.add_argument(
+        "--cp-objective-cycle-period",
+        type=int,
+        default="0",
+        help="Every how many iterations to switch the CP objective (0 means no cycling)",
+    )
+
+    parser.add_argument(
         "--delta-freezing",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -677,6 +727,8 @@ if __name__ == "__main__":
             "default_timeslice_width": args.default_timeslice_width,
             "default_n_lanes": args.default_n_lanes,
             "default_percent": args.default_percent,
+            "cp_objective": args.cp_objective,
+            "cp_objective_cycle_period": args.cp_objective_cycle_period,
         }
         solver = Solver(
             experiment_config,

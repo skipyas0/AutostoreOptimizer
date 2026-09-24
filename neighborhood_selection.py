@@ -298,14 +298,10 @@ class StrategyManager:
             "random_skus": lambda sev: strategy_random_skus(
                 self.handles, p=default_percent * sev
             ),
-            "random_orders_and_skus": lambda sev: combine_strategies(
-                strategy_random_orders(
-                    self.handles, p=0.5 * default_percent * sev
-                ),
-                strategy_random_skus(
-                    self.handles, p=0.5 * default_percent * sev
-                ),
-            ),
+            # "random_orders_and_skus": lambda sev: combine_strategies(
+            #     strategy_random_orders(self.handles, p=0.5 * default_percent * sev),
+            #     strategy_random_skus(self.handles, p=0.5 * default_percent * sev),
+            # ),
             "random_lanes": lambda sev: strategy_random_lanes(
                 self.handles, self.current_solution, default_n_lanes + sev
             ),
@@ -318,9 +314,9 @@ class StrategyManager:
             "double_timeslice": lambda sev: strategy_multi_random_timeslice(
                 self.handles, self.current_solution, 2, default_timeslice_width * sev
             ),
-            "triple_timeslice": lambda sev: strategy_multi_random_timeslice(
-                self.handles, self.current_solution, 3, default_timeslice_width * sev
-            ),
+            # "triple_timeslice": lambda sev: strategy_multi_random_timeslice(
+            #     self.handles, self.current_solution, 3, default_timeslice_width * sev
+            # ),
             "movecap_balancing_timeslice": lambda sev: (
                 strategy_movecap_balancing_slices(
                     self.handles, self.current_solution, default_timeslice_width * sev
