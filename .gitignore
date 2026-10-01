@@ -24,3 +24,4 @@ olist_analysis.ipynb
 *.log
 decomposition_experiments
 patch_*.py
+media

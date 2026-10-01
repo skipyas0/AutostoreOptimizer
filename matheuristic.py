@@ -146,7 +146,7 @@ class Solver:
             instance_config,
         ) = load_instance(instance_config, instance_path)
         self.instance_config = instance_config
-        self.vlg = VisualLogger(instance_path, instance_config, experiment_config)
+        self.vlg = VisualLogger(instance_path, instance_config, experiment_config, self.instance)
         self.severity = 1
         self.stagnation_count = 0
         self.experiment_config = experiment_config
@@ -215,12 +215,14 @@ class Solver:
             self.vlg.add_stat_to_current("statuses", Status.Infeasible)
             self.vlg.add_stat_to_current("best", self.best_result)
             self.vlg.add_stat_to_current("current", self.current_result)
+            self._log_kpis()
             return Status.Infeasible
 
         if sol_object is None or sol_object.get_solve_status() == "Unknown":
             self.vlg.add_stat_to_current("statuses", Status.Unknown)
             self.vlg.add_stat_to_current("best", self.best_result)
             self.vlg.add_stat_to_current("current", self.current_result)
+            self._log_kpis()
             return Status.Unknown
 
         solve_status = sol_object.get_solve_status()
@@ -286,8 +288,20 @@ class Solver:
         self.vlg.add_stat_to_current("statuses", status)
         self.vlg.add_stat_to_current("best", self.best_result)
         self.vlg.add_stat_to_current("current", self.current_result)
+        self._log_kpis()
 
         return status
+
+    def _log_kpis(self):
+        cur_kpis = self.current_solution.get_kpis() if getattr(self, "current_solution", None) else {}
+        best_kpis = self.best_solution.get_kpis() if getattr(self, "best_solution", None) else {}
+        self.vlg.add_stat_to_current("current_makespan", cur_kpis.get("makespan", self.current_result))
+        self.vlg.add_stat_to_current("current_bin_fetches", cur_kpis.get("bin_fetches", -1))
+        self.vlg.add_stat_to_current("current_total_flow_time", cur_kpis.get("total_flow_time", -1))
+        self.vlg.add_stat_to_current("best_makespan", best_kpis.get("makespan", self.best_result))
+        self.vlg.add_stat_to_current("best_bin_fetches", best_kpis.get("bin_fetches", -1))
+        self.vlg.add_stat_to_current("best_total_flow_time", best_kpis.get("total_flow_time", -1))
+        self.vlg.add_stat_to_current("cp_obj", self.cp_obj)
 
     def get_freeze_sets(self, to_optimize, old_freeze_constraints, strategy_results):
         if self.experiment_config["delta_freezing"]:
@@ -516,6 +530,7 @@ class Solver:
 
             # log solution and run eps-greedy
             self.vlg.log_solve_time(sol)
+            prev_solution = self.current_solution
             status = self.eps_greedy_acceptance(sol, sol.get_solve_status())
 
             # log to strategy manager
@@ -524,7 +539,7 @@ class Solver:
             strategy_manager.current_solution = self.current_solution
 
             # log iteration end in VisualLogger
-            self.vlg.all_run_solutions[-1].append(self.current_solution)
+            self.vlg.log_solution_delta(prev_solution, self.current_solution, to_optimize)
             self.vlg.log_iteration()
 
         # End of LNS loop: Validate the best solution found
@@ -701,6 +716,14 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--render-video",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        dest="render_video",
+        help="Render a Manim video at the end of each run",
+    )
+
+    parser.add_argument(
         "--eps-greedy-prob",
         type=float,
         default=0.2,
@@ -762,6 +785,7 @@ if __name__ == "__main__":
             "cp_objective": args.cp_objective,
             "cp_objective_phase_duration": args.cp_objective_phase_duration,
             "cp_objective_phase_schedule": args.cp_objective_phase_schedule, 
+            "render_video": args.render_video,
         }
         solver = Solver(
             experiment_config,

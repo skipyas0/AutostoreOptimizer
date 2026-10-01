@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 import pickle
@@ -28,6 +29,33 @@ class Status(IntEnum):
     Infeasible = 9
 
 
+def get_distinct_colors(n: int) -> list:
+    """
+    Returns a list of at least n visually distinct colors.
+    Handles any n >= 1 without failing or truncation.
+    Uses tab10 (<=10), tab20 (<=20), tab20+tab20b+tab20c (<=60),
+    and continuous colormaps for larger n.
+    """
+    if n <= 0:
+        return []
+    if n <= 10:
+        return list(plt.cm.tab10.colors[:n])
+    if n <= 20:
+        return list(plt.cm.tab20.colors[:n])
+
+    colors = list(plt.cm.tab20.colors)
+    if hasattr(plt.cm, "tab20b"):
+        colors.extend(plt.cm.tab20b.colors)
+    if hasattr(plt.cm, "tab20c"):
+        colors.extend(plt.cm.tab20c.colors)
+
+    if n <= len(colors):
+        return colors[:n]
+
+    cmap = getattr(plt.cm, "turbo", plt.cm.jet)
+    return [cmap(i / n) for i in range(n)]
+
+
 class LoguruStream:
     def __init__(self, level="INFO"):
         self.level = level
@@ -42,9 +70,10 @@ class LoguruStream:
 
 
 class VisualLogger:
-    def __init__(self, instance_folder, instance_config, experiment_config):
+    def __init__(self, instance_folder, instance_config, experiment_config, instance=None):
         self.experiment_timestamp = datetime.now().strftime("%d-%m-%Y_%H-%M-%S")
 
+        self.instance = instance
         self.instance_folder = instance_folder
         self.instance_config = instance_config
         self.experiment_config = experiment_config
@@ -59,6 +88,11 @@ class VisualLogger:
         self.active_run_start = None
         self.active_iteration_start = None
         self.all_run_solutions = []
+        self.all_run_initial_solutions = []
+        self.all_run_deltas = []
+        self.current_run_initial_solution = {}
+        self.current_run_deltas = []
+        self.current_solution_dict = {}
 
         # Data storage
         self.df = pd.DataFrame()
@@ -86,6 +120,11 @@ class VisualLogger:
         self.current_run += 1
         self.all_run_solutions.append([])
         self.num_variables = num_variables
+        self.current_solution_dict = self._extract_full_solution_dict(sp)
+        self.current_run_initial_solution = copy.deepcopy(self.current_solution_dict)
+        self.all_run_initial_solutions.append(self.current_run_initial_solution)
+        self.current_run_deltas = []
+        self.all_run_deltas.append(self.current_run_deltas)
         self.open_log = logger.add(
             f"{self.path}/run_{self.current_run}.log",
             mode="w",
@@ -100,6 +139,13 @@ class VisualLogger:
             "iteration": np.arange(iters, dtype=np.int32),
             "best": np.full(iters, -1, dtype=np.float64),
             "current": np.full(iters, -1, dtype=np.float64),
+            "current_makespan": np.full(iters, -1, dtype=np.float64),
+            "current_bin_fetches": np.full(iters, -1, dtype=np.float64),
+            "current_total_flow_time": np.full(iters, -1, dtype=np.float64),
+            "best_makespan": np.full(iters, -1, dtype=np.float64),
+            "best_bin_fetches": np.full(iters, -1, dtype=np.float64),
+            "best_total_flow_time": np.full(iters, -1, dtype=np.float64),
+            "cp_obj": np.full(iters, "", dtype=object),
             "num_optimized": np.full(iters, -1, dtype=np.int32),
             "total_iter_time": np.full(iters, -1.0, dtype=np.float64),
             "lns_strategy_time": np.full(iters, -1.0, dtype=np.float64),
@@ -211,6 +257,63 @@ class VisualLogger:
             if cp_1hour_best > 0
             else 0
         )
+        
+        if self.experiment_config.get("render_video", False):
+            logger.info("Rendering Manim video...")
+            try:
+                from manim_visualizer import LNSOptimizationScene
+                
+                frozen_vars = []
+                iters = self.experiment_config["iters"]
+                for it in range(iters):
+                    frozen_in_it = []
+                    for v_idx in range(self.num_variables):
+                        if self.current_barcode[it, v_idx] == -1: # frozen
+                            frozen_in_it.append(self.var_names[v_idx])
+                    frozen_vars.append(frozen_in_it)
+                
+                objectives = self.current_run_data["best"]
+                makespans = self.current_run_data["current_makespan"]
+                fetches = self.current_run_data["current_bin_fetches"]
+                flows = self.current_run_data["current_total_flow_time"]
+                best_makespans = self.current_run_data["best_makespan"]
+                best_fetches = self.current_run_data["best_bin_fetches"]
+                best_flows = self.current_run_data["best_total_flow_time"]
+                cp_objs = self.current_run_data["cp_obj"]
+                statuses = self.current_run_data["statuses"]
+                strategies = self.current_run_data["strategy"]
+                strategy_names = [self.strategy_map.get(s, "Unknown") for s in strategies]
+                status_names = [Status(s).name if s > 0 else "Unknown" for s in statuses]
+                
+                init_makespan = objectives[0] if len(objectives) > 0 else 1
+                improvements = [((init_makespan - obj) / init_makespan * 100) if init_makespan > 0 else 0 for obj in objectives]
+                
+                scene = LNSOptimizationScene(
+                    instance=self.instance,
+                    initial_solution=self.current_run_initial_solution,
+                    deltas=self.current_run_deltas,
+                    frozen_vars=frozen_vars,
+                    objectives=objectives.tolist() if isinstance(objectives, np.ndarray) else objectives,
+                    improvements=improvements,
+                    makespans=makespans.tolist() if isinstance(makespans, np.ndarray) else makespans,
+                    fetches=fetches.tolist() if isinstance(fetches, np.ndarray) else fetches,
+                    flows=flows.tolist() if isinstance(flows, np.ndarray) else flows,
+                    best_makespans=best_makespans.tolist() if isinstance(best_makespans, np.ndarray) else best_makespans,
+                    best_fetches=best_fetches.tolist() if isinstance(best_fetches, np.ndarray) else best_fetches,
+                    best_flows=best_flows.tolist() if isinstance(best_flows, np.ndarray) else best_flows,
+                    cp_objs=cp_objs.tolist() if isinstance(cp_objs, np.ndarray) else cp_objs,
+                    statuses=status_names,
+                    strategies=strategy_names,
+                )
+                scene.render()
+                logger.info("Manim video rendered successfully.")
+            except Exception as e:
+                import traceback
+                error_trace = traceback.format_exc()
+                log_file = f"{self.path}/manim_error.log"
+                with open(log_file, "w") as f:
+                    f.write(error_trace)
+                logger.error(f"Failed to render Manim video: {e}. Check {log_file} for traceback.")
 
         # 3. Clean Print
         logger.info(
@@ -326,6 +429,108 @@ class VisualLogger:
 
         self.current_run_data[stat_name][self.current_iteration] = value
 
+    def _extract_full_solution_dict(self, sol):
+        if sol is None:
+            return {}
+        if isinstance(sol, dict):
+            raw_dict = sol
+        else:
+            raw_dict = build_solve_dict(sol)
+
+        clean_dict = {}
+        for k, v in raw_dict.items():
+            if isinstance(v, dict):
+                pres = bool(v.get("present"))
+                clean_dict[k] = {
+                    "present": pres,
+                    "start": int(v["start"]) if pres and v.get("start") is not None else None,
+                    "end": int(v["end"]) if pres and v.get("end") is not None else None,
+                }
+            else:
+                clean_dict[k] = v
+        return clean_dict
+
+    @staticmethod
+    def _extract_var_state(sol, var):
+        if sol is None:
+            return None
+        var_name = var.get_name() if hasattr(var, "get_name") else (var.name if hasattr(var, "name") else str(var))
+
+        if isinstance(sol, dict):
+            val = sol.get(var_name)
+            if isinstance(val, dict):
+                pres = bool(val.get("present"))
+                return {
+                    "present": pres,
+                    "start": int(val["start"]) if pres and val.get("start") is not None else None,
+                    "end": int(val["end"]) if pres and val.get("end") is not None else None,
+                }
+            return val
+
+        if hasattr(sol, "var_sols") and var_name in sol.var_sols:
+            vs = sol.var_sols[var_name]
+            pres = bool(vs.get("present"))
+            return {
+                "present": pres,
+                "start": int(vs["start"]) if pres and vs.get("start") is not None else None,
+                "end": int(vs["end"]) if pres and vs.get("end") is not None else None,
+            }
+
+        if hasattr(sol, "state_dict") and var_name in sol.state_dict:
+            vs = sol.state_dict[var_name]
+            pres = bool(vs.get("present"))
+            return {
+                "present": pres,
+                "start": int(vs["start"]) if pres and vs.get("start") is not None else None,
+                "end": int(vs["end"]) if pres and vs.get("end") is not None else None,
+            }
+
+        if hasattr(sol, "get_var_solution"):
+            var_sol = sol.get_var_solution(var)
+            if var_sol is None:
+                return None
+            val = var_sol.get_value() if hasattr(var_sol, "get_value") else var_sol
+            if hasattr(val, "is_present"):
+                pres = bool(val.is_present())
+                return {
+                    "present": pres,
+                    "start": int(val.get_start()) if pres and val.get_start() is not None else None,
+                    "end": int(val.get_end()) if pres and val.get_end() is not None else None,
+                }
+            return val
+
+        return None
+
+    def log_solution_delta(self, prev_solution, new_solution=None, to_optimize=None):
+        """
+        Compares the current/previous solution and the new solution across all unfrozen
+        variables (to_optimize) and logs a dictionary of changed variables and their new values.
+        """
+        if to_optimize is None and isinstance(new_solution, (list, set)):
+            to_optimize = new_solution
+            new_solution = prev_solution
+            prev_solution = self.current_solution_dict
+
+        delta = {}
+        if (
+            new_solution is not None
+            and prev_solution is not None
+            and new_solution is not prev_solution
+            and to_optimize is not None
+        ):
+            for var in to_optimize:
+                var_name = var.get_name() if hasattr(var, "get_name") else (var.name if hasattr(var, "name") else str(var))
+                prev_val = self._extract_var_state(prev_solution, var)
+                if prev_val is None and var_name in self.current_solution_dict:
+                    prev_val = self.current_solution_dict[var_name]
+
+                new_val = self._extract_var_state(new_solution, var)
+                if prev_val != new_val and new_val is not None:
+                    delta[var_name] = new_val
+                    self.current_solution_dict[var_name] = new_val
+
+        self.current_run_deltas.append(delta)
+
     def get_cp_performance(self, mth_mean_ticks):
         """Load all cp_intermediate_records_{seed}.pkl files and compute
         mean ± std CP trajectory (time-aligned) and mean ± std 1-hour best."""
@@ -386,46 +591,34 @@ class VisualLogger:
         with open(f"{self.path}/experiment_config.json", "w+") as f:
             json.dump(self.experiment_config, f, indent=4)
 
-        # convert only iterations where the solution changed (a new best was encountered)
-        new_best_statuses = [
-            Status.Optimal_New_Best.value,
-            Status.Feasible_New_Best.value,
-        ]
-        filtered_run_solutions = []
-        for r_idx, run_sols in enumerate(self.all_run_solutions):
-            run_id = r_idx + 1
-            if (
-                not self.df.empty
-                and "run_id" in self.df.columns
-                and "statuses" in self.df.columns
-                and run_id in self.df["run_id"].values
-            ):
-                run_df = self.df[self.df["run_id"] == run_id]
-                new_best_mask = run_df["statuses"].isin(new_best_statuses)
-                new_best_iters = set(run_df[new_best_mask]["iteration"].tolist())
-            else:
-                new_best_iters = set(range(len(run_sols)))
+        # Save initial solution and solution deltas as JSON
+        if len(self.all_run_deltas) == 1:
+            solutions_payload = {
+                "run_id": 1,
+                "initial_solution": (
+                    self.all_run_initial_solutions[0]
+                    if self.all_run_initial_solutions
+                    else {}
+                ),
+                "deltas": self.all_run_deltas[0],
+            }
+        else:
+            solutions_payload = [
+                {
+                    "run_id": r_idx + 1,
+                    "initial_solution": (
+                        self.all_run_initial_solutions[r_idx]
+                        if r_idx < len(self.all_run_initial_solutions)
+                        else {}
+                    ),
+                    "deltas": self.all_run_deltas[r_idx],
+                }
+                for r_idx in range(len(self.all_run_deltas))
+            ]
 
-            run_records = []
-            for default_idx, item in enumerate(run_sols):
-                if isinstance(item, tuple) and len(item) == 2:
-                    iter_idx, sol = item
-                else:
-                    iter_idx, sol = default_idx, item
+        with open(f"{self.path}/solutions.json", "w+") as f:
+            json.dump(solutions_payload, f, indent=4)
 
-                if iter_idx in new_best_iters:
-                    sol_dict = (
-                        build_solve_dict(sol)
-                        if not isinstance(sol, dict)
-                        else sol
-                    )
-                    run_records.append((iter_idx, sol_dict))
-            filtered_run_solutions.append(run_records)
-
-        self.all_run_solutions = filtered_run_solutions
-
-        solutions_df = self.get_solution_history_df(self.all_run_solutions)
-        solutions_df.to_pickle(f"{self.path}/solutions_dataframe.pkl")
         self.df.to_pickle(f"{self.path}/experiment_dataframe.pkl")
 
         with open(f"{self.path}/barcodes.pkl", "wb") as f:
@@ -443,7 +636,7 @@ class VisualLogger:
         self.plot_chronological_durations()
         self.plot_binned_durations_composition()
         self.plot_status_time_histogram()
-        self.plot_solution_stability(self.all_run_solutions)
+        self.plot_solution_stability(self.all_run_deltas)
         self.plot_strategy_footprints()
         self.plot_status_time_distributions()
         logger.info(f"Experiment saved successfully to {self.path}")
@@ -567,7 +760,7 @@ class VisualLogger:
         )
 
         # Apply a distinct color map to the boxes
-        colors = plt.cm.tab10.colors[: len(labels)]
+        colors = get_distinct_colors(len(labels))
         for patch, color in zip(bplot["boxes"], colors):
             patch.set_facecolor(color)
             patch.set_alpha(0.8)
@@ -762,17 +955,32 @@ class VisualLogger:
         crosstab.index = status_names
 
         # Map strategy IDs to names for the legend
+        # Map strategy IDs to names for the legend
+        strat_cols = list(crosstab.columns)
         strat_names = [
-            self.strategy_map.get(col, f"Strategy {col}") for col in crosstab.columns
+            self.strategy_map.get(col, f"Strategy {col}") for col in strat_cols
         ]
         crosstab.columns = strat_names
+
+        max_strat = (
+            max(self.strategy_map.keys())
+            if self.strategy_map
+            else max(strat_cols, default=0)
+        )
+        all_strat_colors = get_distinct_colors(max(max_strat + 1, len(strat_cols)))
+        bar_colors = [
+            all_strat_colors[col]
+            if isinstance(col, int) and col < len(all_strat_colors)
+            else all_strat_colors[i % len(all_strat_colors)]
+            for i, col in enumerate(strat_cols)
+        ]
 
         # Plot stacked bar chart directly from Pandas
         ax = crosstab.plot(
             kind="bar",
             stacked=True,
             figsize=(12, 7),
-            colormap="tab10",
+            color=bar_colors,
             edgecolor="black",
         )
 
@@ -797,7 +1005,12 @@ class VisualLogger:
 
         plt.title("Iteration Results by Strategy")
         plt.ylabel("Count")
-        plt.legend(title="Strategies", bbox_to_anchor=(1.05, 1), loc="upper left")
+        plt.legend(
+            title="Strategies",
+            bbox_to_anchor=(1.05, 1),
+            loc="upper left",
+            fontsize=8 if len(strat_cols) > 10 else 10,
+        )
 
         plt.tight_layout()
         plt.savefig(
@@ -813,12 +1026,14 @@ class VisualLogger:
             matrix = self.barcodes[r]
             matrix_t = matrix.T
 
-            # Build dynamic colormap mapping -1 to Grey, and Strategy Indices to Tab10 Colors
+            # Build dynamic colormap mapping -1 to Grey, and Strategy Indices to Colors
             max_strat = max(self.strategy_map.keys()) if self.strategy_map else 0
-            colors = ["#e0e0e0"] + list(plt.cm.tab10.colors[: max_strat + 1])
+            strat_colors = get_distinct_colors(max_strat + 1)
+            colors = ["#e0e0e0"] + list(strat_colors)
             cmap = ListedColormap(colors)
 
-            bounds = np.arange(-1.5, max_strat + 1.5, 1.0)
+            # Bins: [-1.5, -0.5) for -1 (Frozen), and [s - 0.5, s + 0.5) for each strategy s
+            bounds = [i - 0.5 for i in range(-1, max_strat + 2)]
             norm = BoundaryNorm(bounds, cmap.N)
 
             fig, ax = plt.subplots(figsize=(12, 8))
@@ -910,7 +1125,9 @@ class VisualLogger:
                 else ax
             )
             cbar = fig.colorbar(cax, ax=axes_to_steal_from, ticks=ticks, pad=0.08)
-            cbar.ax.set_yticklabels(strategy_names)
+            cbar.ax.set_yticklabels(
+                strategy_names, fontsize=8 if max_strat >= 10 else 10
+            )
 
             # Use layout engine instead of tight_layout for safer multi-axis bounding
             fig.set_layout_engine("constrained")
@@ -1060,7 +1277,7 @@ class VisualLogger:
         plt.figure(figsize=(12, 7))
 
         # Dynamically grab enough colors for the present statuses
-        colors = plt.cm.tab10.colors[: len(labels)]
+        colors = get_distinct_colors(len(labels))
 
         # Plot the stacked histogram
         plt.hist(
@@ -1178,10 +1395,11 @@ class VisualLogger:
             width_ratios = [max(1, len(active_iters_dict[s])) for s in used_strats]
 
             # Create side-by-side subplots (thin vertical subgraphs)
+            fig_width = max(14, k * 1.3)
             fig, axes = plt.subplots(
                 nrows=1,
                 ncols=k,
-                figsize=(14, 8),
+                figsize=(fig_width, 8),
                 sharey=True,
                 gridspec_kw={"width_ratios": width_ratios, "wspace": 0.05},
             )
@@ -1189,9 +1407,20 @@ class VisualLogger:
             if k == 1:
                 axes = [axes]
 
+            max_strat = (
+                max(self.strategy_map.keys())
+                if self.strategy_map
+                else max(used_strats, default=0)
+            )
+            strat_colors_list = get_distinct_colors(max_strat + 1)
+
             for i, (ax, strat_idx) in enumerate(zip(axes, used_strats)):
                 strat_name = self.strategy_map.get(strat_idx, f"Strategy {strat_idx}")
-                strat_color = plt.cm.tab10.colors[strat_idx % 10]
+                strat_color = (
+                    strat_colors_list[strat_idx]
+                    if strat_idx < len(strat_colors_list)
+                    else get_distinct_colors(strat_idx + 1)[strat_idx]
+                )
                 active_iters = active_iters_dict[strat_idx]
 
                 # Slice the matrix to only include this strategy's iterations and transpose
@@ -1248,7 +1477,11 @@ class VisualLogger:
 
                 # Title for each vertical subgraph
                 ax.set_title(
-                    strat_name, fontsize=10, rotation=45, ha="left", va="bottom"
+                    strat_name,
+                    fontsize=8 if k > 10 else 10,
+                    rotation=45,
+                    ha="left",
+                    va="bottom",
                 )
 
                 # Only label the Y-axis on the very first subplot
@@ -1310,32 +1543,26 @@ class VisualLogger:
             )
             plt.close()
 
-    def plot_solution_stability(self, solution_history):
+    def plot_solution_stability(self, deltas=None):
         """
-        Calculates raw inter-iteration variable changes and plots them,
+        Calculates raw inter-iteration variable changes from solution deltas and plots them,
         marking iterations where a new best objective was found.
         """
+        if deltas is None:
+            deltas = self.all_run_deltas
+
         diff_records = []
 
-        # 1. Fast Dictionary Comparison for Raw Diffs
-        for r_idx, run_sols in enumerate(solution_history):
+        # 1. Delta count per iteration
+        for r_idx, run_deltas in enumerate(deltas):
             run_id = r_idx + 1
-            for idx, item in enumerate(run_sols):
-                if isinstance(item, tuple) and len(item) == 2:
-                    iter_idx, curr_sol = item
-                    prev_sol = run_sols[idx - 1][1] if idx > 0 else None
+            for iter_idx, item in enumerate(run_deltas):
+                if isinstance(item, dict):
+                    changed_count = len(item)
+                elif isinstance(item, tuple) and len(item) == 2 and isinstance(item[1], dict):
+                    changed_count = len(item[1])
                 else:
-                    iter_idx = idx
-                    curr_sol = item
-                    prev_sol = run_sols[idx - 1] if idx > 0 else None
-
-                if idx == 0 or prev_sol is None:
                     changed_count = 0
-                else:
-                    # Count variables whose state dictionary or value does not perfectly match the previous iteration
-                    changed_count = sum(
-                        1 for k, v in curr_sol.items() if prev_sol.get(k) != v
-                    )
 
                 diff_records.append(
                     {
@@ -1397,3 +1624,67 @@ class VisualLogger:
                 bbox_inches="tight",
             )
             plt.close()
+
+    def reconstruct_solutions(self, run_idx=0):
+        """Reconstruct complete solution dicts for a specific run."""
+        if run_idx < len(self.all_run_initial_solutions) and run_idx < len(self.all_run_deltas):
+            return reconstruct_solutions(
+                self.all_run_initial_solutions[run_idx],
+                self.all_run_deltas[run_idx],
+            )
+        return []
+
+
+def reconstruct_solutions(initial_solution_or_data, deltas=None):
+    """
+    Converts an initial solution dictionary and a list of solution deltas
+    back to a complete list of solution dictionaries (one per iteration).
+
+    Parameters:
+    - initial_solution_or_data: Can be:
+        1. A dict representing the initial solution (if deltas is passed).
+        2. A dict with 'initial_solution' and 'deltas' keys.
+        3. A list of run dicts, each with 'initial_solution' and 'deltas'.
+        4. A string path to a solutions.json file.
+    - deltas: Optional list of delta dicts (if initial_solution is passed as first arg).
+
+    Returns:
+    - A list of solution dicts (one per iteration), or a list of such lists if multiple runs are provided.
+    """
+    if isinstance(initial_solution_or_data, str):
+        with open(initial_solution_or_data, "r") as f:
+            data = json.load(f)
+        return reconstruct_solutions(data)
+
+    if deltas is not None:
+        current = copy.deepcopy(initial_solution_or_data)
+        solutions = []
+        for delta in deltas:
+            if isinstance(delta, dict):
+                for var_name, state in delta.items():
+                    if isinstance(state, dict):
+                        current[var_name] = copy.deepcopy(state)
+                    else:
+                        current[var_name] = state
+            solutions.append(copy.deepcopy(current))
+        return solutions
+
+    if isinstance(initial_solution_or_data, list):
+        return [
+            reconstruct_solutions(run_data["initial_solution"], run_data.get("deltas", []))
+            for run_data in initial_solution_or_data
+        ]
+
+    if isinstance(initial_solution_or_data, dict):
+        if "initial_solution" in initial_solution_or_data:
+            return reconstruct_solutions(
+                initial_solution_or_data["initial_solution"],
+                initial_solution_or_data.get("deltas", []),
+            )
+        if "runs" in initial_solution_or_data:
+            return [
+                reconstruct_solutions(run_data["initial_solution"], run_data.get("deltas", []))
+                for run_data in initial_solution_or_data["runs"]
+            ]
+
+    raise ValueError(f"Invalid input to reconstruct_solutions: {type(initial_solution_or_data)}")
