@@ -71,16 +71,27 @@ def strategy_random_skus(handles, k=None, p=None) -> SelectionResult:
 def get_order_intervals(handles, solution):
     order_intervals = {}
     makespan = 0
+    if solution is None:
+        return order_intervals, makespan
     for o in handles["O"]:
         s_assigned = get_assigned_station(handles, solution, o)
         if s_assigned is not None:
             var = handles["I_os"].get((o, s_assigned))
             if var is not None:
-                var_sol = solution.get_var_solution(var)
-                if var_sol and var_sol.is_present():
-                    start, end = var_sol.get_start(), var_sol.get_end()
+                if (
+                    hasattr(solution, "Value")
+                    and hasattr(var, "start")
+                    and hasattr(var, "end")
+                ):
+                    start, end = solution.Value(var.start), solution.Value(var.end)
                     order_intervals[o] = (start, end, s_assigned)
                     makespan = max(makespan, end)
+                else:
+                    var_sol = solution.get_var_solution(var)
+                    if var_sol and var_sol.is_present():
+                        start, end = var_sol.get_start(), var_sol.get_end()
+                        order_intervals[o] = (start, end, s_assigned)
+                        makespan = max(makespan, end)
     return order_intervals, makespan
 
 
@@ -257,6 +268,145 @@ def strategy_similar_orders(handles, p_most_similar, jaccard) -> SelectionResult
     return SelectionResult(seed_orders=selected_orders)
 
 
+def is_interval_present(solution, var) -> bool:
+    """Checks if an interval variable is active in the given solution."""
+    if var is None or solution is None:
+        return False
+    if hasattr(solution, "BooleanValue"):
+        pres_var = getattr(var, "pres", var)
+        try:
+            return bool(solution.BooleanValue(pres_var))
+        except Exception:
+            pass
+    if hasattr(solution, "get_var_solution"):
+        var_sol = solution.get_var_solution(var)
+        return var_sol is not None and var_sol.is_present()
+    if hasattr(var, "is_present"):
+        return bool(var.is_present())
+    return False
+
+
+def strategy_frequently_refetched_skus(
+    handles, solution, k=None, p=None, weighted: bool = False
+) -> SelectionResult:
+    """
+    Selects top p% (or k) SKUs with the highest number of refetches.
+    If weighted is True, counts total cycle time cost instead: (r + p + r_return) * num_refetch.
+    """
+    if solution is None:
+        return SelectionResult()
+
+    active_skus = handles.get("active_K", [])
+    if not active_skus:
+        return SelectionResult()
+
+    active_k_set = set(active_skus)
+    fetch_counts = {sku: 0 for sku in active_skus}
+
+    F_handles = handles.get("F", {})
+    for (s, sku, e), f_var in F_handles.items():
+        if sku in active_k_set and is_interval_present(solution, f_var):
+            fetch_counts[sku] += 1
+
+    if weighted:
+        rt = handles.get("rt", handles.get("r", {}))
+        p_times = handles.get("p", {})
+        rt_return = handles.get("rt_return", handles.get("r_return", rt))
+
+        scores = {}
+        for sku in active_skus:
+            r_k = (
+                rt.get(sku, 0)
+                if isinstance(rt, dict)
+                else (rt if isinstance(rt, (int, float)) else 0)
+            )
+            p_k = (
+                p_times.get(sku, 0)
+                if isinstance(p_times, dict)
+                else (p_times if isinstance(p_times, (int, float)) else 0)
+            )
+            r_ret_k = (
+                rt_return.get(sku, r_k)
+                if isinstance(rt_return, dict)
+                else (rt_return if isinstance(rt_return, (int, float)) else r_k)
+            )
+            cycle_time = r_k + p_k + r_ret_k
+            scores[sku] = cycle_time * fetch_counts[sku]
+    else:
+        scores = fetch_counts
+
+    num_skus = len(active_skus)
+    if k is not None:
+        n_select = min(k, num_skus)
+    elif p is not None:
+        p = min(1.0, p)
+        n_select = max(1, int(num_skus * p))
+    else:
+        n_select = max(1, int(num_skus * 0.1))
+
+    n_select = min(n_select, num_skus)
+
+    # Sort descending by score, tie-break randomly
+    sorted_skus = sorted(
+        active_skus,
+        key=lambda sku: (scores[sku], random.random()),
+        reverse=True,
+    )
+
+    candidate_skus = [sku for sku in sorted_skus if scores[sku] > 0]
+    seed_k = set(candidate_skus[:n_select])
+    return SelectionResult(seed_skus=seed_k)
+
+
+def strategy_cycle_time_weighted_refetched_skus(
+    handles, solution, k=None, p=None
+) -> SelectionResult:
+    """
+    Selects top p% (or k) SKUs with the highest cycle time-weighted refetch cost:
+    (r + p + r_return) * num_refetch.
+    """
+    return strategy_frequently_refetched_skus(
+        handles, solution, k=k, p=p, weighted=True
+    )
+
+
+# Convenience alias
+strategy_refetched_skus = strategy_frequently_refetched_skus
+
+
+def strategy_longest_orders(handles, solution, k=None, p=None) -> SelectionResult:
+    """
+    Finds the top p% (or k) orders which are taking the longest to fulfill
+    by sorting their I_os interval lengths (flow time = end - start).
+    """
+    if solution is None:
+        return SelectionResult()
+
+    order_intervals, _ = get_order_intervals(handles, solution)
+    if not order_intervals:
+        return SelectionResult()
+
+    num_orders = len(handles.get("O", []))
+    if k is not None:
+        n_select = min(k, len(order_intervals))
+    elif p is not None:
+        p = min(1.0, p)
+        n_select = max(1, int(num_orders * p))
+    else:
+        n_select = max(1, int(num_orders * 0.1))
+
+    n_select = min(n_select, len(order_intervals))
+
+    # Sort descending by flow time (end - start), breaking ties randomly
+    sorted_orders = sorted(
+        order_intervals.keys(),
+        key=lambda o: (order_intervals[o][1] - order_intervals[o][0], random.random()),
+        reverse=True,
+    )
+    seed_o = set(sorted_orders[:n_select])
+    return SelectionResult(seed_orders=seed_o)
+
+
 def combine_strategies(*strategy_outputs: SelectionResult) -> SelectionResult:
     """Combines any number of selection results into a single selection."""
     combined_res = SelectionResult()
@@ -297,6 +447,29 @@ class StrategyManager:
             ),
             "random_skus": lambda sev: strategy_random_skus(
                 self.handles, p=default_percent * sev
+            ),
+            "frequently_refetched_skus": lambda sev: strategy_frequently_refetched_skus(
+                self.handles,
+                self.current_solution,
+                p=default_percent * sev,
+                weighted=False,
+            ),
+            "refetched_skus": lambda sev: strategy_frequently_refetched_skus(
+                self.handles,
+                self.current_solution,
+                p=default_percent * sev,
+                weighted=False,
+            ),
+            "cycle_time_weighted_refetched_skus": lambda sev: (
+                strategy_frequently_refetched_skus(
+                    self.handles,
+                    self.current_solution,
+                    p=default_percent * sev,
+                    weighted=True,
+                )
+            ),
+            "longest_orders": lambda sev: strategy_longest_orders(
+                self.handles, self.current_solution, p=default_percent * sev
             ),
             # "random_orders_and_skus": lambda sev: combine_strategies(
             #     strategy_random_orders(self.handles, p=0.5 * default_percent * sev),
