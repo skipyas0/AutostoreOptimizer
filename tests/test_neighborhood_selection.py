@@ -122,6 +122,7 @@ class TestNeighborhoodSelection(unittest.TestCase):
         manager = StrategyManager(
             self.handles,
             self.solution,
+            None,
             weighted_jaccard_matrix={},
             strategy_preset="bottlenecks",
         )

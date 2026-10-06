@@ -158,6 +158,8 @@ class VisualLogger:
             "statuses": np.full(iters, -1, dtype=np.int32),
             "severity_increases": np.zeros(iters, dtype=np.int8),
             "strategy": np.full(iters, -1, dtype=np.int32),
+            "unfrozen_orders": np.full(iters, None, dtype=object),
+            "unfrozen_skus": np.full(iters, None, dtype=object),
         }
 
         self.current_barcode = np.full((iters, num_variables), -1, dtype=np.int8)
@@ -282,8 +284,13 @@ class VisualLogger:
                 cp_objs = self.current_run_data["cp_obj"]
                 statuses = self.current_run_data["statuses"]
                 strategies = self.current_run_data["strategy"]
+                total_iter_time = self.current_run_data["total_iter_time"]
                 strategy_names = [self.strategy_map.get(s, "Unknown") for s in strategies]
                 status_names = [Status(s).name if s > 0 else "Unknown" for s in statuses]
+                
+                time_ticks = np.cumsum(total_iter_time)
+                cp_mean_traj, _, _, _ = self.get_cp_performance(time_ticks)
+                cp_traj = cp_mean_traj.tolist() if cp_mean_traj is not None else None
                 
                 init_makespan = objectives[0] if len(objectives) > 0 else 1
                 improvements = [((init_makespan - obj) / init_makespan * 100) if init_makespan > 0 else 0 for obj in objectives]
@@ -304,6 +311,7 @@ class VisualLogger:
                     cp_objs=cp_objs.tolist() if isinstance(cp_objs, np.ndarray) else cp_objs,
                     statuses=status_names,
                     strategies=strategy_names,
+                    cp_trajectory=cp_traj,
                 )
                 scene.render()
                 logger.info("Manim video rendered successfully.")
@@ -369,6 +377,12 @@ class VisualLogger:
         status_val = self.current_run_data["statuses"][self.current_iteration]
         best_res = self.current_run_data["best"][self.current_iteration]
         curr_res = self.current_run_data["current"][self.current_iteration]
+        
+        curr_fetches = self.current_run_data["current_bin_fetches"][self.current_iteration]
+        curr_flow = self.current_run_data["current_total_flow_time"][self.current_iteration]
+        best_fetches = self.current_run_data["best_bin_fetches"][self.current_iteration]
+        best_flow = self.current_run_data["best_total_flow_time"][self.current_iteration]
+        
         num_optimized = self.current_run_data["num_optimized"][self.current_iteration]
         strategy = self.current_run_data["strategy"][self.current_iteration]
         status_name = Status(status_val).name if status_val > 0 else "Unknown"
@@ -379,8 +393,8 @@ class VisualLogger:
             f"Current Severity: {np.sum(self.current_run_data['severity_increases'])} | "
             f"Optimized {num_optimized:06d}/{self.num_variables:06d} ({100 * num_optimized / self.num_variables:.3f})% | "
             f"Status: {status_name:22s} | "
-            f"Best: {best_res:6.1f} | "
-            f"Curr: {curr_res:6.1f} | "
+            f"Best (M/F/T): {best_res:6.1f} / {best_fetches:6.1f} / {best_flow:6.1f} | "
+            f"Curr (M/F/T): {curr_res:6.1f} / {curr_fetches:6.1f} / {curr_flow:6.1f} | "
             f"Strategy: {self.strategy_map[strategy]:20s}({strategy}) | "
             f"Times: Strat {strat_time:.3f}s, "
             f"Constr Gen {constr_generate_time:.3f}s, "
@@ -397,11 +411,37 @@ class VisualLogger:
     def log_freeze_constr(self, to_optimize, var_to_idx, strategy_idx):
         self.add_stat_to_current("constr_update_time", self.time_diff_with_overwrite())
         self.add_stat_to_current("num_optimized", len(to_optimize))
+        
+        unfrozen_orders = set()
+        unfrozen_skus = set()
+        
         for var in to_optimize:
             var_name = var.name if hasattr(var, "name") else var.get_name()
             if var_name in self.var_name_to_idx:
                 var_idx = self.var_name_to_idx[var_name]
                 self.current_barcode[self.current_iteration, var_idx] = strategy_idx
+                
+            parts = var_name.split("[")
+            if len(parts) == 2:
+                prefix = parts[0]
+                args_str = parts[1].rstrip("]")
+                args = [arg.strip() for arg in args_str.split(",")]
+                try:
+                    if prefix in ("I_os", "I_os_lane"):
+                        unfrozen_orders.add(int(args[0]))
+                    elif prefix == "C":
+                        unfrozen_orders.add(int(args[0]))
+                        unfrozen_skus.add(int(args[1]))
+                    elif prefix == "P":
+                        unfrozen_orders.add(int(args[0]))
+                        unfrozen_skus.add(int(args[2]))
+                    elif prefix in ("F", "R", "B", "Block"):
+                        unfrozen_skus.add(int(args[1]))
+                except (ValueError, IndexError):
+                    pass
+                    
+        self.add_stat_to_current("unfrozen_orders", unfrozen_orders)
+        self.add_stat_to_current("unfrozen_skus", unfrozen_skus)
 
     def log_solve_time(self, sol, status=None):
         wall_solve_time = self.time_diff_with_overwrite()
@@ -639,6 +679,7 @@ class VisualLogger:
         self.plot_solution_stability(self.all_run_deltas)
         self.plot_strategy_footprints()
         self.plot_status_time_distributions()
+        self.plot_kpis_interplay()
         logger.info(f"Experiment saved successfully to {self.path}")
 
     def get_solution_history_df(self, solution_history):
@@ -897,35 +938,118 @@ class VisualLogger:
         )
         plt.close()
 
+    def plot_kpis_interplay(self):
+        if self.df.empty:
+            return
+            
+        plt.figure(figsize=(10, 6))
+        
+        gb = self.df.groupby("iteration")
+        iters = list(gb.groups.keys())
+        
+        mean_makespan = gb["current_makespan"].mean()
+        mean_flow = gb["current_total_flow_time"].mean()
+        mean_fetches = gb["current_bin_fetches"].mean()
+        
+        # Replace missing or default values (-1) with NaN to ignore them in normalization
+        mean_makespan = mean_makespan.replace(-1, np.nan)
+        mean_flow = mean_flow.replace(-1, np.nan)
+        mean_fetches = mean_fetches.replace(-1, np.nan)
+        
+        def normalize(s):
+            min_s, max_s = s.min(), s.max()
+            if pd.isna(min_s) or pd.isna(max_s) or max_s == min_s:
+                # Fallback to zero if constant or missing
+                return pd.Series(0, index=s.index)
+            return (s - min_s) / (max_s - min_s)
+            
+        norm_makespan = normalize(mean_makespan)
+        norm_flow = normalize(mean_flow)
+        norm_fetches = normalize(mean_fetches)
+        
+        plt.plot(iters, norm_makespan, color="blue", label="Makespan", linewidth=2)
+        plt.plot(iters, norm_flow, color="green", label="Total Flow Time", linewidth=2)
+        plt.plot(iters, norm_fetches, color="red", label="Bin Fetches", linewidth=2)
+        
+        plt.title("Interplay of KPIs (Min-Max Normalized)", fontsize=14)
+        plt.xlabel("Iteration", fontsize=12)
+        plt.ylabel("Normalized Value [0, 1]", fontsize=12)
+        
+        plt.ylim(-0.05, 1.05)
+        plt.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
+        plt.grid(True, alpha=0.3)
+        plt.gcf().set_layout_engine("constrained")
+        
+        plt.savefig(
+            f"{self.path}/kpis_interplay.svg",
+            format="svg",
+            bbox_inches="tight",
+        )
+        plt.close()
+
     def _write_summary_file(self):
         best_overall = self.df["best"].min()
         mean_solve_time = self.df.groupby("run_id")["solve_time"].sum().mean()
 
         # --- Strategy Statistics ---
-        total_iters = len(self.df)
-        strat_counts = self.df["strategy"].value_counts()
-
-        # Count New Bests (Status 3 or 6)
-        new_best_mask = self.df["statuses"].isin(
-            [Status.Optimal_New_Best.value, Status.Feasible_New_Best.value]
-        )
-        success_counts = self.df[new_best_mask]["strategy"].value_counts()
-
-        strat_stats_str = "\n=== Strategy Statistics ===\n"
-        for strat_id, count in strat_counts.items():
-            if strat_id == -1:
-                continue  # Skip unassigned/frozen
-
-            strat_name = self.strategy_map.get(strat_id, f"Strategy {strat_id}")
-            successes = success_counts.get(strat_id, 0)
-            usage_pct = (count / total_iters) * 100 if total_iters > 0 else 0
-            success_rate = (successes / count) * 100 if count > 0 else 0
-
-            strat_stats_str += (
-                f"{strat_name}:\n"
-                f"  Usage: {count} times ({usage_pct:.1f}% of all iterations)\n"
-                f"  New Bests Found: {successes} ({success_rate:.1f}% success rate)\n"
+        valid_df = self.df[self.df["strategy"] >= 0].copy()
+        
+        # Calculate improvements based on the targeted cp_obj
+        # An improvement is when the current value of cp_obj is strictly less than the previous iteration's current value
+        improved_mask = pd.Series(False, index=valid_df.index)
+        
+        # We need the previous values for all iterations, not just valid ones, so we compute on self.df
+        for obj in self.df["cp_obj"].unique():
+            if obj == "":
+                continue
+            col_name = f"current_{obj}"
+            if col_name in self.df.columns:
+                # True if the value decreased compared to the previous row
+                decreased = (self.df[col_name].diff() < 0)
+                # Apply this only to rows where cp_obj was this objective
+                obj_mask = (self.df["cp_obj"] == obj)
+                improved_mask |= (decreased & obj_mask)
+        
+        # Align improved_mask with valid_df
+        valid_improved_mask = improved_mask.loc[valid_df.index]
+        
+        usage_crosstab = pd.crosstab(valid_df["strategy"], valid_df["cp_obj"])
+        
+        valid_improved = valid_df[valid_improved_mask]
+        if not valid_improved.empty:
+            success_crosstab = pd.crosstab(
+                valid_improved["strategy"], 
+                valid_improved["cp_obj"]
             )
+        else:
+            success_crosstab = pd.DataFrame()
+            
+        success_crosstab = success_crosstab.reindex(index=usage_crosstab.index, columns=usage_crosstab.columns, fill_value=0)
+        
+        all_objs = list(usage_crosstab.columns)
+        all_strats = list(usage_crosstab.index)
+        
+        strat_stats_str = "\n=== Strategy Statistics (Solution Changes / Uses) ===\n"
+        headers = ["Strategy"] + all_objs + ["Total"]
+        strat_stats_str += f"{headers[0]:<40} | " + " | ".join(f"{h:<15}" for h in headers[1:]) + "\n"
+        strat_stats_str += "-" * (40 + 3 + 18 * len(headers[1:]) - 3) + "\n"
+        
+        for strat_id in all_strats:
+            strat_name = self.strategy_map.get(strat_id, f"Strategy {strat_id}")
+            row_str = f"{strat_name:<40} | "
+            total_success = 0
+            total_uses = 0
+            for obj in all_objs:
+                s_count = success_crosstab.loc[strat_id, obj]
+                u_count = usage_crosstab.loc[strat_id, obj]
+                total_success += s_count
+                total_uses += u_count
+                cell_str = f"{s_count}/{u_count}"
+                row_str += f"{cell_str:^15} | "
+            
+            cell_str_total = f"{total_success}/{total_uses}"
+            row_str += f"{cell_str_total:^15}\n"
+            strat_stats_str += row_str
 
         summary = (
             f"=== Experiment Summary ===\n"

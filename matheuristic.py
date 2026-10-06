@@ -131,6 +131,11 @@ def prepare_model_cpp(config, instance, heur_sol, objective_func):
                 "status": "Feasible",
                 "objective": heur_sol.makespan,
                 "var_solutions": mock_sp.state_dict,
+                "kpis": {
+                    "makespan": heur_sol.makespan,
+                    "bin_fetches": sum(len(events) for events in heur_sol.bin_events.values()),
+                    "total_flow_time": sum(end for s, ln, start, end in heur_sol.order_assignments.values())
+                }
             }
         ),
     )
@@ -295,12 +300,23 @@ class Solver:
     def _log_kpis(self):
         cur_kpis = self.current_solution.get_kpis() if getattr(self, "current_solution", None) else {}
         best_kpis = self.best_solution.get_kpis() if getattr(self, "best_solution", None) else {}
+        
+        curr_fetches = cur_kpis.get("bin_fetches", -1)
+        curr_flow = cur_kpis.get("total_flow_time", -1)
+        
+        if curr_fetches != -1 and (self.best_bin_fetches == -1 or curr_fetches < self.best_bin_fetches):
+            self.best_bin_fetches = curr_fetches
+            
+        if curr_flow != -1 and (self.best_total_flow_time == -1 or curr_flow < self.best_total_flow_time):
+            self.best_total_flow_time = curr_flow
+            
         self.vlg.add_stat_to_current("current_makespan", cur_kpis.get("makespan", self.current_result))
-        self.vlg.add_stat_to_current("current_bin_fetches", cur_kpis.get("bin_fetches", -1))
-        self.vlg.add_stat_to_current("current_total_flow_time", cur_kpis.get("total_flow_time", -1))
+        self.vlg.add_stat_to_current("current_bin_fetches", curr_fetches)
+        self.vlg.add_stat_to_current("current_total_flow_time", curr_flow)
+        
         self.vlg.add_stat_to_current("best_makespan", best_kpis.get("makespan", self.best_result))
-        self.vlg.add_stat_to_current("best_bin_fetches", best_kpis.get("bin_fetches", -1))
-        self.vlg.add_stat_to_current("best_total_flow_time", best_kpis.get("total_flow_time", -1))
+        self.vlg.add_stat_to_current("best_bin_fetches", self.best_bin_fetches)
+        self.vlg.add_stat_to_current("best_total_flow_time", self.best_total_flow_time)
         self.vlg.add_stat_to_current("cp_obj", self.cp_obj)
 
     def get_freeze_sets(self, to_optimize, old_freeze_constraints, strategy_results):
@@ -374,6 +390,7 @@ class Solver:
         strategy_manager = StrategyManager(
             self.handles,
             sp,
+            self.vlg,
             self.weighted_jaccard_matrix,
             self.experiment_config["strat_preset"],
             self.experiment_config["strat_choice"],
@@ -389,7 +406,11 @@ class Solver:
 
         self.severity = 1
         self.stagnation_count = 0
+        
         self.best_result = self.heur_sol.makespan
+        self.best_bin_fetches = sum(len(events) for events in self.heur_sol.bin_events.values())
+        self.best_total_flow_time = sum(end for s, ln, start, end in self.heur_sol.order_assignments.values())
+            
         self.best_solution = sp
         self.current_solution = self.best_solution
         self.current_result = self.best_result

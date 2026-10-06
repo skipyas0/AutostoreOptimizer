@@ -407,6 +407,107 @@ def strategy_longest_orders(handles, solution, k=None, p=None) -> SelectionResul
     return SelectionResult(seed_orders=seed_o)
 
 
+def strategy_history_selection_frequency(handles, vlg, p=0.05) -> SelectionResult:
+    """
+    Selects top p% orders and SKUs with the LOWEST selection frequency to encourage uniformity.
+    """
+    if vlg is None or vlg.current_iteration == 0:
+        return combine_strategies(
+            strategy_random_orders(handles, p=p),
+            strategy_random_skus(handles, p=p)
+        )
+    
+    order_counts = {o: 0 for o in handles.get("O", [])}
+    sku_counts = {k: 0 for k in handles.get("active_K", [])}
+    
+    for i in range(vlg.current_iteration):
+        orders = vlg.current_run_data["unfrozen_orders"][i]
+        skus = vlg.current_run_data["unfrozen_skus"][i]
+        if orders is not None:
+            for o in orders:
+                if o in order_counts:
+                    order_counts[o] += 1
+        if skus is not None:
+            for k in skus:
+                if k in sku_counts:
+                    sku_counts[k] += 1
+                    
+    sorted_orders = sorted(order_counts.keys(), key=lambda o: (order_counts[o], random.random()))
+    sorted_skus = sorted(sku_counts.keys(), key=lambda k: (sku_counts[k], random.random()))
+    
+    num_orders = len(sorted_orders)
+    n_sel_o = max(1, int(num_orders * p))
+    
+    num_skus = len(sorted_skus)
+    n_sel_k = max(1, int(num_skus * p))
+    
+    seed_o = set(sorted_orders[:n_sel_o])
+    seed_k = set(sorted_skus[:n_sel_k])
+    
+    return SelectionResult(seed_orders=seed_o, seed_skus=seed_k)
+
+
+def strategy_history_success_ratio(handles, vlg, p=0.05) -> SelectionResult:
+    """
+    Selects top p% orders and SKUs with the HIGHEST success ratio.
+    """
+    if vlg is None or vlg.current_iteration == 0:
+        return combine_strategies(
+            strategy_random_orders(handles, p=p),
+            strategy_random_skus(handles, p=p)
+        )
+    
+    order_success = {o: 0 for o in handles.get("O", [])}
+    order_total = {o: 0 for o in handles.get("O", [])}
+    sku_success = {k: 0 for k in handles.get("active_K", [])}
+    sku_total = {k: 0 for k in handles.get("active_K", [])}
+    
+    success_statuses = {
+        Status.Optimal_New_Best.value, 
+        Status.Feasible_New_Best.value, 
+        Status.Optimal_Improve.value, 
+        Status.Feasible_Improve.value
+    }
+    
+    for i in range(vlg.current_iteration):
+        orders = vlg.current_run_data["unfrozen_orders"][i]
+        skus = vlg.current_run_data["unfrozen_skus"][i]
+        status = vlg.current_run_data["statuses"][i]
+        
+        is_success = (status in success_statuses)
+        
+        if orders is not None:
+            for o in orders:
+                if o in order_total:
+                    order_total[o] += 1
+                    if is_success:
+                        order_success[o] += 1
+                        
+        if skus is not None:
+            for k in skus:
+                if k in sku_total:
+                    sku_total[k] += 1
+                    if is_success:
+                        sku_success[k] += 1
+                        
+    order_ratios = {o: (order_success[o]/order_total[o] if order_total[o] > 0 else 0) for o in order_total}
+    sku_ratios = {k: (sku_success[k]/sku_total[k] if sku_total[k] > 0 else 0) for k in sku_total}
+    
+    sorted_orders = sorted(order_ratios.keys(), key=lambda o: (order_ratios[o], random.random()), reverse=True)
+    sorted_skus = sorted(sku_ratios.keys(), key=lambda k: (sku_ratios[k], random.random()), reverse=True)
+    
+    num_orders = len(sorted_orders)
+    n_sel_o = max(1, int(num_orders * p))
+    
+    num_skus = len(sorted_skus)
+    n_sel_k = max(1, int(num_skus * p))
+    
+    seed_o = set(sorted_orders[:n_sel_o])
+    seed_k = set(sorted_skus[:n_sel_k])
+    
+    return SelectionResult(seed_orders=seed_o, seed_skus=seed_k)
+
+
 def combine_strategies(*strategy_outputs: SelectionResult) -> SelectionResult:
     """Combines any number of selection results into a single selection."""
     combined_res = SelectionResult()
@@ -422,6 +523,7 @@ class StrategyManager:
         self,
         handles,
         solution,
+        vlg,
         weighted_jaccard_matrix,
         strategy_preset: str = "all",
         strat_choice: str = "uniform",
@@ -434,42 +536,44 @@ class StrategyManager:
 
         self.handles = handles
         self.current_solution = solution
+        self.vlg = vlg
         self.weighted_jaccard_matrix = weighted_jaccard_matrix
 
         self.strategies = {
-            "random_orders": lambda sev: strategy_random_orders(
-                self.handles, p=default_percent * sev
-            ),
-            "similar_orders": lambda sev: strategy_similar_orders(
-                self.handles,
-                default_percent * sev,
-                self.weighted_jaccard_matrix,
-            ),
+            # "random_orders": lambda sev: strategy_random_orders(
+            #     self.handles, p=default_percent * sev
+            # ),
+            # "similar_orders": lambda sev: strategy_similar_orders(
+            #     self.handles,
+            #     default_percent * sev,
+            #     self.weighted_jaccard_matrix,
+            # ),
             "random_skus": lambda sev: strategy_random_skus(
                 self.handles, p=default_percent * sev
             ),
-            "frequently_refetched_skus": lambda sev: strategy_frequently_refetched_skus(
-                self.handles,
-                self.current_solution,
-                p=default_percent * sev,
-                weighted=False,
-            ),
+            
             "refetched_skus": lambda sev: strategy_frequently_refetched_skus(
                 self.handles,
                 self.current_solution,
                 p=default_percent * sev,
                 weighted=False,
             ),
-            "cycle_time_weighted_refetched_skus": lambda sev: (
-                strategy_frequently_refetched_skus(
-                    self.handles,
-                    self.current_solution,
-                    p=default_percent * sev,
-                    weighted=True,
-                )
-            ),
+            # "cycle_time_weighted_refetched_skus": lambda sev: (
+            #     strategy_frequently_refetched_skus(
+            #         self.handles,
+            #         self.current_solution,
+            #         p=default_percent * sev,
+            #         weighted=True,
+            #     )
+            # ),
             "longest_orders": lambda sev: strategy_longest_orders(
                 self.handles, self.current_solution, p=default_percent * sev
+            ),
+            "history_selection_frequency": lambda sev: strategy_history_selection_frequency(
+                self.handles, self.vlg, p=0.5 * default_percent * sev
+            ),
+            "history_success_ratio": lambda sev: strategy_history_success_ratio(
+                self.handles, self.vlg, p=0.5 * default_percent * sev
             ),
             # "random_orders_and_skus": lambda sev: combine_strategies(
             #     strategy_random_orders(self.handles, p=0.5 * default_percent * sev),
@@ -484,9 +588,9 @@ class StrategyManager:
             "single_timeslice": lambda sev: strategy_multi_random_timeslice(
                 self.handles, self.current_solution, 1, default_timeslice_width * sev
             ),
-            "double_timeslice": lambda sev: strategy_multi_random_timeslice(
-                self.handles, self.current_solution, 2, default_timeslice_width * sev
-            ),
+            # "double_timeslice": lambda sev: strategy_multi_random_timeslice(
+            #     self.handles, self.current_solution, 2, default_timeslice_width * sev
+            # ),
             # "triple_timeslice": lambda sev: strategy_multi_random_timeslice(
             #     self.handles, self.current_solution, 3, default_timeslice_width * sev
             # ),
@@ -513,6 +617,13 @@ class StrategyManager:
                 "similar_orders",
             ],
             "random_orders": ["random_orders"],
+            "bottlenecks": [
+                "frequently_refetched_skus",
+                "cycle_time_weighted_refetched_skus",
+                "longest_orders",
+                "history_selection_frequency",
+                "history_success_ratio",
+            ],
         }
 
         active_preset = self.presets[self.strategy_preset]

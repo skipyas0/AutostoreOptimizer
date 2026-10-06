@@ -1,6 +1,6 @@
 import re
 from manim import *
-
+from manim.utils.color import interpolate_color, ManimColor
 # Override default background color
 config.background_color = "#FFFFFF"
 
@@ -94,7 +94,7 @@ class IntervalVar(VGroup):
         target_opacity = 0.4 if is_frozen else 1.0
         
         if is_frozen:
-            from manim.utils.color import interpolate_color, ManimColor
+            
             target_fill_color = interpolate_color(ManimColor(self.color), ManimColor("#90CAF9"), 0.6) # blue tint
         else:
             target_fill_color = self.color if self.vtype != "C" else COLORS["cons"]
@@ -114,7 +114,7 @@ class IntervalVar(VGroup):
         return AnimationGroup(*anims)
         
 class LNSOptimizationScene(Scene):
-    def __init__(self, instance, initial_solution, deltas, frozen_vars, objectives, improvements, makespans, fetches, flows, best_makespans, best_fetches, best_flows, cp_objs, statuses, strategies, *args, **kwargs):
+    def __init__(self, instance, initial_solution, deltas, frozen_vars, objectives, improvements, makespans, fetches, flows, best_makespans, best_fetches, best_flows, cp_objs, statuses, strategies, cp_trajectory=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.instance = instance
         self.initial_solution = initial_solution
@@ -131,6 +131,7 @@ class LNSOptimizationScene(Scene):
         self.cp_objs = cp_objs
         self.statuses = statuses
         self.strategies = strategies
+        self.cp_trajectory = cp_trajectory
 
     def construct(self):
         # 1. Determine timeline scaling
@@ -253,8 +254,11 @@ class LNSOptimizationScene(Scene):
         # Add KPI Graphs on the right
         iters = len(self.makespans)
         
-        def get_axis_config(data):
-            vmin, vmax = min(data), max(data)
+        def get_axis_config(data, extra_data=None):
+            valid1 = [x for x in data if not np.isnan(x)]
+            valid2 = [x for x in extra_data if not np.isnan(x)] if extra_data else []
+            combined = valid1 + valid2
+            vmin, vmax = min(combined), max(combined)
             if vmin == vmax:
                 return [vmin - 1, vmax + 1, 1]
             step = (vmax - vmin) / 3.0
@@ -271,7 +275,7 @@ class LNSOptimizationScene(Scene):
             best_txt = f"{best:.1f}" if isinstance(best, float) else f"{best}"
             return Text(f"{name} (Curr: {val_txt}, Best: {best_txt})", font_size=14, color=color)
 
-        ax_makespan = Axes(x_range=[0, iters, max(1, iters//5)], y_range=get_axis_config(self.makespans),
+        ax_makespan = Axes(x_range=[0, iters, max(1, iters//5)], y_range=get_axis_config(self.makespans, self.cp_trajectory),
                            x_length=graph_w, y_length=graph_h, tips=False, axis_config=axis_cfg, x_axis_config=x_cfg, y_axis_config=y_cfg).move_to([graph_x, 2.0, 0])
         title_makespan = get_kpi_title("Makespan", self.makespans[0], self.makespans[0], COLORS["pick"]).next_to(ax_makespan, UP, buff=0.1).align_to(ax_makespan, LEFT)
         self.add(ax_makespan, title_makespan)
@@ -289,6 +293,11 @@ class LNSOptimizationScene(Scene):
         pt_makespan = ax_makespan.c2p(0, self.makespans[0])
         pt_fetch = ax_fetch.c2p(0, self.fetches[0])
         pt_flow = ax_flow.c2p(0, self.flows[0])
+        
+        if self.cp_trajectory and not np.isnan(self.cp_trajectory[0]):
+            pt_cp = ax_makespan.c2p(0, self.cp_trajectory[0])
+        else:
+            pt_cp = None
             
         # HUD Helper
         def get_hud(iter_idx, obj_txt, strat_txt, stat_txt):
@@ -340,8 +349,17 @@ class LNSOptimizationScene(Scene):
             t = Text(lbl, font_size=14, color=BLACK)
             vg = VGroup(r, t).arrange(RIGHT, buff=0.1)
             legend_group.add(vg)
+            
         legend_group.arrange(RIGHT, buff=0.4).to_corner(UL).shift(DOWN * 0.8)
         self.add(legend_group)
+        
+        if self.cp_trajectory:
+            r = Rectangle(width=0.3, height=0.05, fill_color=ManimColor("#2E7D32"), fill_opacity=1, stroke_width=0)
+            t = Text("CP Solver", font_size=14, color=BLACK)
+            cp_legend = VGroup(r, t).arrange(RIGHT, buff=0.1)
+            cp_legend.align_to(title_makespan, DOWN)
+            cp_legend.shift(RIGHT * (ax_makespan.get_right()[0] - cp_legend.get_right()[0]))
+            self.add(cp_legend)
 
         def get_row_idx(varname, state_dict, robot_assigns):
             vtype, indices = parse_varname(varname)
@@ -414,7 +432,7 @@ class LNSOptimizationScene(Scene):
                 else:
                     iv = IntervalVar(varname, state["start"], state["end"], row_idx, time_scale, y_positions, self.instance)
                     if is_frozen:
-                        from manim.utils.color import interpolate_color, ManimColor
+                        # from manim.utils.color import interpolate_color, ManimColor
                         frozen_color = interpolate_color(ManimColor(iv.color), ManimColor("#90CAF9"), 0.6)
                         iv.rect.set_fill(color=frozen_color, opacity=0.4)
                         iv.rect.set_stroke(color=GRAY, width=1)
@@ -469,6 +487,15 @@ class LNSOptimizationScene(Scene):
                 pt_fl_new = ax_flow.c2p(i+1, self.flows[i+1] if i+1 < len(self.flows) else self.flows[-1])
                 anims.append(Create(Line(pt_flow, pt_fl_new, color=COLORS["order"], stroke_width=3)))
                 pt_flow = pt_fl_new
+                
+                if self.cp_trajectory:
+                    cp_val = self.cp_trajectory[i+1] if i+1 < len(self.cp_trajectory) else self.cp_trajectory[-1]
+                    if not np.isnan(cp_val) and pt_cp is not None:
+                        pt_cp_new = ax_makespan.c2p(i+1, cp_val)
+                        anims.append(Create(Line(pt_cp, pt_cp_new, color=ManimColor("#2E7D32"), stroke_width=3)))
+                        pt_cp = pt_cp_new
+                    elif not np.isnan(cp_val):
+                        pt_cp = ax_makespan.c2p(i+1, cp_val)
             
             if anims:
                 self.play(AnimationGroup(*anims), run_time=1.0)
