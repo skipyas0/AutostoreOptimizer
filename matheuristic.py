@@ -163,6 +163,10 @@ class Solver:
                 self.cycling_schedule.append("total_flow_time")
             elif phase == 'b':
                 self.cycling_schedule.append("bin_fetches")
+            elif phase == 'i':
+                self.cycling_schedule.append("idle_time")
+            elif phase == 'p':
+                self.cycling_schedule.append("max_picks")
             else:
                 raise ValueError(phase)
             
@@ -197,6 +201,12 @@ class Solver:
             elif target == "total_flow_time":
                 mdl.minimize(self.handles["total_flow_time"])
                 self.cp_obj = "total_flow_time"
+            elif target == "idle_time":
+                mdl.minimize(self.handles["idle_time"])
+                self.cp_obj = "idle_time"
+            elif target == "max_picks":
+                mdl.minimize(self.handles["max_picks"])
+                self.cp_obj = "max_picks"
             else:
                 raise ValueError(f"Unknown objective target: {target}")
         elif self.experiment_config["backend"] == "cpp":
@@ -204,11 +214,10 @@ class Solver:
             mdl.set_objective(target)
             self.cp_obj = target
 
-    def eps_greedy_acceptance(self, sol_object, solve_status=None):
+    def rrt_acceptance(self, sol_object, solve_status=None):
         """
-        Perform eps-greedy acceptance on incumbent solution:
-            - Always update current solution if the incumbent is strictly better
-            - Otherwise update with a fixed probability: config['eps_greedy_prob']
+        Perform Record-to-Record Travel (RRT) acceptance on incumbent solution:
+            - Accept solution if its makespan is at most (1 + rrt_threshold) * best_makespan
 
         Handles best/current solution updates, stagnation count and logging to VLG
         """
@@ -231,10 +240,7 @@ class Solver:
             return Status.Unknown
 
         solve_status = sol_object.get_solve_status()
-
         current_makespan = sol_object.get_kpis()["makespan"]
-        # current_fetches = sol_object.get_kpis_value("bin_fetches")
-
         incumbent = current_makespan
 
         if incumbent < self.current_result:
@@ -248,8 +254,6 @@ class Solver:
                     else Status.Feasible_New_Best
                 )
                 self.best_solution = sol_object
-
-                # update best-so-far
                 self.best_result = incumbent
             else:
                 status = (
@@ -258,15 +262,14 @@ class Solver:
                     else Status.Feasible_Improve
                 )
         else:
-            # result is worse or equal to current: use eps
-            accept = random.random() < self.experiment_config["eps_greedy_prob"]
+            # Check RRT threshold: accept if within threshold of best_result
+            rrt_limit = self.best_result * (1 + self.experiment_config["rrt_threshold"])
+            accept = incumbent <= rrt_limit
 
             if incumbent > self.current_result + 1e-6:
-                # it shouldn't be possible to get a worse result if the solver achieved optimum
                 if solve_status != "Feasible" and self.cp_obj == "makespan":
                     raise AssertionError
                 status = Status.Feasible_Degradation
-
             elif incumbent >= self.current_result:
                 status = (
                     Status.Optimal_No_Improve
@@ -303,20 +306,32 @@ class Solver:
         
         curr_fetches = cur_kpis.get("bin_fetches", -1)
         curr_flow = cur_kpis.get("total_flow_time", -1)
+        curr_idle = cur_kpis.get("idle_time", -1)
+        curr_picks = cur_kpis.get("max_picks", -1)
         
         if curr_fetches != -1 and (self.best_bin_fetches == -1 or curr_fetches < self.best_bin_fetches):
             self.best_bin_fetches = curr_fetches
             
-        if curr_flow != -1 and (self.best_total_flow_time == -1 or curr_flow < self.best_total_flow_time):
+        if curr_flow != -1 and (getattr(self, "best_total_flow_time", -1) == -1 or curr_flow < self.best_total_flow_time):
             self.best_total_flow_time = curr_flow
+
+        if curr_idle != -1 and (getattr(self, "best_idle_time", -1) == -1 or curr_idle < getattr(self, "best_idle_time", -1)):
+            self.best_idle_time = curr_idle
+
+        if curr_picks != -1 and (getattr(self, "best_max_picks", -1) == -1 or curr_picks < getattr(self, "best_max_picks", -1)):
+            self.best_max_picks = curr_picks
             
         self.vlg.add_stat_to_current("current_makespan", cur_kpis.get("makespan", self.current_result))
         self.vlg.add_stat_to_current("current_bin_fetches", curr_fetches)
         self.vlg.add_stat_to_current("current_total_flow_time", curr_flow)
+        self.vlg.add_stat_to_current("current_idle_time", curr_idle)
+        self.vlg.add_stat_to_current("current_max_picks", curr_picks)
         
         self.vlg.add_stat_to_current("best_makespan", best_kpis.get("makespan", self.best_result))
         self.vlg.add_stat_to_current("best_bin_fetches", self.best_bin_fetches)
-        self.vlg.add_stat_to_current("best_total_flow_time", self.best_total_flow_time)
+        self.vlg.add_stat_to_current("best_total_flow_time", getattr(self, "best_total_flow_time", -1))
+        self.vlg.add_stat_to_current("best_idle_time", getattr(self, "best_idle_time", -1))
+        self.vlg.add_stat_to_current("best_max_picks", getattr(self, "best_max_picks", -1))
         self.vlg.add_stat_to_current("cp_obj", self.cp_obj)
 
     def get_freeze_sets(self, to_optimize, old_freeze_constraints, strategy_results):
@@ -421,8 +436,18 @@ class Solver:
         old_freeze_constraints = []
 
         # start iterations
+        import time
+        run_start_time = time.time()
         self.vlg.log_run_start(num_variables, var_to_idx, sp)
-        for i in range(self.experiment_config["iters"]):
+
+        n_iters = self.experiment_config["iters"] if self.experiment_config["iters"] is not None else 999999 
+        for i in range(n_iters):
+            if self.experiment_config.get("time_limit") is not None:
+                elapsed = time.time() - run_start_time
+                if self.experiment_config["time_limit"] - elapsed < self.experiment_config["iter_time_limit"]:
+                    logger.info(f"Time limit reached ({elapsed:.1f}s / {self.experiment_config['time_limit']}s). Stopping iterations.")
+                    break
+                    
             self.vlg.log_iteration_start(i)
             if (
                 self.stagnation_count >= self.experiment_config["stagnation_th"]
@@ -504,6 +529,19 @@ class Solver:
                 next_obj = self.cycling_schedule[self.cycle_ix]
                 self.update_iteration_objective(self.mdl, next_obj)
 
+            impr_bound = -1
+            if self.experiment_config["improvement_constr"]:
+                if self.cp_obj == "makespan":
+                    impr_bound = int(self.current_result - 1)
+                elif self.cp_obj == "bin_fetches" and getattr(self, "best_bin_fetches", -1) != -1:
+                    impr_bound = int(self.best_bin_fetches - 1)
+                elif self.cp_obj == "total_flow_time" and getattr(self, "best_total_flow_time", -1) != -1:
+                    impr_bound = int(self.best_total_flow_time - 1)
+                elif self.cp_obj == "idle_time" and getattr(self, "best_idle_time", -1) != -1:
+                    impr_bound = int(self.best_idle_time - 1)
+                elif self.cp_obj == "max_picks" and getattr(self, "best_max_picks", -1) != -1:
+                    impr_bound = int(self.best_max_picks - 1)
+
             if self.experiment_config["backend"] == "docplex":
                 # set iteration starting point
                 self.mdl.set_starting_point(starting_point)
@@ -514,36 +552,39 @@ class Solver:
                 self.vlg.log_freeze_constr(to_optimize, var_to_idx, strat_idx)
 
                 # Force improvement
-                if self.experiment_config["improvement_constr"]:
-                    if self.obj_constraint is not None:
-                        self.mdl.remove(self.obj_constraint)
+                if getattr(self, "obj_constraint", None) is not None:
+                    self.mdl.remove(self.obj_constraint)
+                    self.obj_constraint = None
+                
+                if impr_bound != -1:
                     self.obj_constraint = self.mdl.add(
-                        self.handles["makespan"] <= self.current_result - 1
+                        self.handles[self.cp_obj] <= impr_bound
                     )
 
                 # run solve on partially frozen model
                 self.vlg.time_from_here()
-                sol = self.mdl.solve(
-                    TimeLimit=self.experiment_config["iter_time_limit"],
-                    LogVerbosity="Quiet",
-                    Workers=self.experiment_config["workers"],
-                    Presolve=self.experiment_config["presolve"],
-                    SearchType=self.experiment_config["search_type"],
-                )
+                solve_kwargs = {
+                    "TimeLimit": self.experiment_config["iter_time_limit"],
+                    "LogVerbosity": "Quiet",
+                    "Workers": self.experiment_config["workers"],
+                    "Presolve": self.experiment_config["presolve"],
+                    "SearchType": self.experiment_config["search_type"],
+                }
+                if self.experiment_config.get("only_first_sol", False):
+                    solve_kwargs["SolutionLimit"] = 1
+
+                sol = self.mdl.solve(**solve_kwargs)
             elif self.experiment_config["backend"] == "cpp":
                 self.vlg.log_freeze_constr(to_optimize, var_to_idx, strat_idx)
-
-                impr_makespan = -1
-                if self.experiment_config["improvement_constr"]:
-                    impr_makespan = self.current_result - 1
 
                 self.vlg.time_from_here()
                 result_dict = self.mdl.solve(
                     self.experiment_config["iter_time_limit"],
-                    impr_makespan,
+                    impr_bound,
                     self.experiment_config["workers"],
                     self.experiment_config["presolve"],
                     self.experiment_config["search_type"],
+                    self.experiment_config.get("only_first_sol", False)
                 )
                 sol = CppSolveResult(result_dict)
             else:
@@ -552,7 +593,7 @@ class Solver:
             # log solution and run eps-greedy
             self.vlg.log_solve_time(sol)
             prev_solution = self.current_solution
-            status = self.eps_greedy_acceptance(sol, sol.get_solve_status())
+            status = self.rrt_acceptance(sol, sol.get_solve_status())
 
             # log to strategy manager
             strategy_manager.strat_statistics[strat_name]["num_uses"] += 1
@@ -613,7 +654,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--iters",
         type=int,
-        default=300,
+        default=None,
         help="Number of iterations per run (default: 300)",
     )
     parser.add_argument(
@@ -694,7 +735,7 @@ if __name__ == "__main__":
         "--cp-objective",
         type=str,
         default="makespan",
-        choices=["makespan", "bin_fetches", "total_flow_time"],
+        choices=["makespan", "bin_fetches", "total_flow_time", "idle_time", "max_picks"],
         help="Objective function for the underlying CP model.",
     )
 
@@ -709,7 +750,7 @@ if __name__ == "__main__":
         "--cp-objective-phase-schedule",
         type=str,
         default="m",
-        help="Manual design of the objective schedule. Use a string like 'mmfmb' where 'm' is a makespan phase, 'f' is a flow time phase and 'b' is a number of bin fetches phase.",
+        help="Manual design of the objective schedule. Use a string like 'mmfmb' where 'm' is a makespan phase, 'f' is a flow time phase, 'b' is a number of bin fetches phase, 'i' is an idle time phase, and 'p' is a max picks phase.",
     )
 
     parser.add_argument(
@@ -745,11 +786,19 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--eps-greedy-prob",
+        "--time-limit",
         type=float,
-        default=0.2,
-        dest="eps_greedy_prob",
-        help="Epsilon-greedy acceptance probability (default: 0.2)",
+        default=None,
+        dest="time_limit",
+        help="Hard time limit in seconds to override the iteration cap (default: None)",
+    )
+
+    parser.add_argument(
+        "--rrt-threshold",
+        type=float,
+        default=0.05,
+        dest="rrt_threshold",
+        help="Record-to-Record Travel threshold percentage (default: 0.05 means accept if within 5% of best)",
     )
 
     parser.add_argument(
@@ -776,7 +825,20 @@ if __name__ == "__main__":
         help="Default number of unfrozen lanes",
     )
 
+    parser.add_argument(
+        "--only-first-sol",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        dest="only_first_sol",
+        help="Exit iteration after finding the first solution (SolutionLimit=1)",
+    )
+
     args = parser.parse_args()
+
+    # Check termination conditions
+    il_set, tl_set = args.iters is not None, args.time_limit is not None
+    if (il_set and tl_set) or (not il_set and not tl_set) :
+        raise ValueError("Exactly one of '--iters' and '--time-limit' has to be set!")
 
     for instance in tqdm.tqdm(args.instances):
         if "precalculated_instances/" in instance:
@@ -792,7 +854,8 @@ if __name__ == "__main__":
             "iter_time_limit": args.iter_time_limit,
             "delta_freezing": args.delta_freezing,
             "starting_point_for_frozen": args.starting_point_for_frozen,
-            "eps_greedy_prob": args.eps_greedy_prob,
+            "rrt_threshold": args.rrt_threshold,
+            "time_limit": args.time_limit,
             "backend": args.backend,
             "improvement_constr": args.improvement_constr,
             "presolve": args.presolve,
@@ -807,6 +870,7 @@ if __name__ == "__main__":
             "cp_objective_phase_duration": args.cp_objective_phase_duration,
             "cp_objective_phase_schedule": args.cp_objective_phase_schedule, 
             "render_video": args.render_video,
+            "only_first_sol": args.only_first_sol,
         }
         solver = Solver(
             experiment_config,

@@ -381,9 +381,29 @@ def build_model(
     # --- objective (total order flow time) ---
     total_flow_time = mdl.sum([mdl.end_of(I_os[(o, s)]) for o in O for s in S])
 
+    # --- objective (idle time & max picks) ---
+    station_spans = []
+    station_idles = []
+    station_pick_counts = []
+    for s in S:
+        station_span = mdl.interval_var(optional=True, name=f"station_span_{s}")
+        mdl.add(mdl.span(station_span, [I_os[(o, s)] for o in O]))
+        station_spans.append(station_span)
+        
+        sum_pick_durations = mdl.sum(mdl.size_of(P[(o, s, k, e)]) for o in O for k in orders_req[o] for e in range(U[k]))
+        station_idles.append(mdl.length_of(station_span) - sum_pick_durations)
+        
+        pick_count = mdl.sum(mdl.presence_of(P[(o, s, k, e)]) for o in O for k in orders_req[o] for e in range(U[k]))
+        station_pick_counts.append(pick_count)
+        
+    idle_time = mdl.sum(station_idles)
+    max_picks = mdl.max(station_pick_counts)
+
     mdl.add_kpi(makespan, "makespan")
     mdl.add_kpi(num_bin_fetches, "bin_fetches")
     mdl.add_kpi(total_flow_time, "total_flow_time")
+    mdl.add_kpi(idle_time, "idle_time")
+    mdl.add_kpi(max_picks, "max_picks")
 
     if objective_func == "bin_fetches":
         mdl.minimize(num_bin_fetches)
@@ -391,6 +411,10 @@ def build_model(
         mdl.minimize(makespan)
     elif objective_func == "total_flow_time":
         mdl.minimize(total_flow_time)
+    elif objective_func == "idle_time":
+        mdl.minimize(idle_time)
+    elif objective_func == "max_picks":
+        mdl.minimize(max_picks)
     else:
         raise ValueError(f"Unknown objective function: {objective_func}")
 
@@ -419,6 +443,8 @@ def build_model(
         "makespan": makespan,
         "bin_fetches": num_bin_fetches,
         "total_flow_time": total_flow_time,
+        "idle_time": idle_time,
+        "max_picks": max_picks,
     }
     return mdl, handles
 

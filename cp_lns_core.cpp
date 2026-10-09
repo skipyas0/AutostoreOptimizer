@@ -29,9 +29,13 @@ public:
     IloObjective active_obj;
     IloObjective bin_fetches_obj;
     IloObjective total_flow_time_obj;
+    IloObjective idle_time_obj;
+    IloObjective max_picks_obj;
     IloIntExpr makespan_expr;
     IloIntExpr bin_fetches_expr;
     IloIntExpr total_flow_time_expr;
+    IloIntExpr idle_time_expr;
+    IloIntExpr max_picks_expr;
 
     CpLnsModel(const std::vector<int>& S,
                const std::vector<int>& L,
@@ -437,10 +441,51 @@ public:
         }
         total_flow_time_obj = IloMinimize(env, total_flow_time_expr);
         
+        idle_time_expr = IloIntExpr(env);
+        IloIntExprArray pick_counts(env);
+
+        for (int s : S) {
+            IloIntervalVar station_span(env);
+            station_span.setOptional();
+            
+            IloIntervalVarArray s_orders(env);
+            for (int o : O) {
+                s_orders.add(vars[make_key("I_os", o, s)]);
+            }
+            model.add(IloSpan(env, station_span, s_orders));
+            
+            IloIntExpr pick_sum(env);
+            IloIntExpr pick_count(env);
+            for (int o : O) {
+                if (orders_req.find(o) != orders_req.end()) {
+                    for (int k : orders_req.at(o)) {
+                        if (std::find(active_K.begin(), active_K.end(), k) != active_K.end()) {
+                            for (int e = 0; e < U.at(k); ++e) {
+                                std::string p_key = make_key_o_s_k_e("P", o, s, k, e);
+                                if (vars.find(p_key) != vars.end()) {
+                                    pick_sum += IloSizeOf(vars[p_key]);
+                                    pick_count += IloPresenceOf(env, vars[p_key]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            idle_time_expr += IloLengthOf(station_span) - pick_sum;
+            pick_counts.add(pick_count);
+        }
+        idle_time_obj = IloMinimize(env, idle_time_expr);
+        max_picks_expr = IloMax(pick_counts);
+        max_picks_obj = IloMinimize(env, max_picks_expr);
+        
         if (objective_func == "bin_fetches") {
             active_obj = bin_fetches_obj;
         } else if (objective_func == "total_flow_time") {
             active_obj = total_flow_time_obj;
+        } else if (objective_func == "idle_time") {
+            active_obj = idle_time_obj;
+        } else if (objective_func == "max_picks") {
+            active_obj = max_picks_obj;
         } else {
             active_obj = makespan_obj;
         }
@@ -455,6 +500,10 @@ public:
             active_obj = bin_fetches_obj;
         } else if (target == "total_flow_time") {
             active_obj = total_flow_time_obj;
+        } else if (target == "idle_time") {
+            active_obj = idle_time_obj;
+        } else if (target == "max_picks") {
+            active_obj = max_picks_obj;
         } else {
             active_obj = makespan_obj;
         }
@@ -532,7 +581,7 @@ public:
         bulk_add.end();
     }
     
-    py::dict solve(double time_limit, int improvement_makespan = -1, int workers = 1, std::string presolve = "Auto", std::string search_type = "Auto") {
+    py::dict solve(double time_limit, int improvement_bound = -1, int workers = 1, std::string presolve = "Auto", std::string search_type = "Auto", bool only_first_sol = false) {
         cp.setParameter(IloCP::TimeLimit, time_limit);
         cp.setParameter(IloCP::Workers, workers);
         cp.setParameter(IloCP::LogVerbosity, IloCP::Quiet);
@@ -553,9 +602,27 @@ public:
             cp.setParameter(IloCP::SearchType, IloCP::Auto);
         }
 
+        if (only_first_sol) {
+            cp.setParameter(IloCP::SolutionLimit, 1);
+        } else {
+            cp.setParameter(IloCP::SolutionLimit, 2000000000);
+        }
+
         IloConstraint impr_constr;
-        if (improvement_makespan != -1) {
-            impr_constr = (makespan_obj.getExpr() <= improvement_makespan);
+        if (improvement_bound != -1) {
+            if (active_obj.getImpl() == makespan_obj.getImpl()) {
+                impr_constr = (makespan_expr <= improvement_bound);
+            } else if (active_obj.getImpl() == bin_fetches_obj.getImpl()) {
+                impr_constr = (bin_fetches_expr <= improvement_bound);
+            } else if (active_obj.getImpl() == total_flow_time_obj.getImpl()) {
+                impr_constr = (total_flow_time_expr <= improvement_bound);
+            } else if (active_obj.getImpl() == idle_time_obj.getImpl()) {
+                impr_constr = (idle_time_expr <= improvement_bound);
+            } else if (active_obj.getImpl() == max_picks_obj.getImpl()) {
+                impr_constr = (max_picks_expr <= improvement_bound);
+            } else {
+                impr_constr = (makespan_expr <= improvement_bound);
+            }
             model.add(impr_constr);
         }
         
@@ -582,6 +649,8 @@ public:
             kpis["makespan"] = cp.getValue(makespan_expr);
             kpis["bin_fetches"] = cp.getValue(bin_fetches_expr);
             kpis["total_flow_time"] = cp.getValue(total_flow_time_expr);
+            kpis["idle_time"] = cp.getValue(idle_time_expr);
+            kpis["max_picks"] = cp.getValue(max_picks_expr);
             result["kpis"] = kpis;
 
             py::dict var_sols;
@@ -620,7 +689,7 @@ public:
             result["SolveTime"] = total_time - extraction_time;
         }
         
-        if (improvement_makespan != -1) {
+        if (improvement_bound != -1) {
             model.remove(impr_constr);
         }
         
@@ -637,7 +706,7 @@ PYBIND11_MODULE(cp_lns_core, m) {
         .def(py::init<std::vector<int>, std::vector<int>, std::vector<int>, std::map<int, std::vector<int>>, std::map<int, int>, std::map<int, int>, std::map<int, int>, std::optional<int>, std::optional<int>, std::map<int, int>, std::vector<int>, std::map<int, int>, int, bool, std::map<std::pair<int, int>, std::vector<std::pair<int, int>>>, std::map<int, std::vector<std::pair<int, int>>>, std::vector<std::pair<int, int>>, int, std::string>())
         .def("apply_warm_start", &CpLnsModel::apply_warm_start)
         .def("apply_delta_freezing", &CpLnsModel::apply_delta_freezing)
-        .def("solve", &CpLnsModel::solve, py::arg("time_limit"), py::arg("improvement_makespan") = -1, py::arg("workers") = 1, py::arg("presolve") = "Auto", py::arg("search_type") = "Auto")
+        .def("solve", &CpLnsModel::solve, py::arg("time_limit"), py::arg("improvement_bound") = -1, py::arg("workers") = 1, py::arg("presolve") = "Auto", py::arg("search_type") = "Auto", py::arg("only_first_sol") = false)
         .def("export_model", &CpLnsModel::export_model, py::arg("filename"))
         .def("set_objective", &CpLnsModel::set_objective, py::arg("target"));
 }

@@ -131,7 +131,7 @@ class VisualLogger:
         )
         logger.info(f"Starting run #{self.current_run}")
 
-        iters = self.experiment_config["iters"]
+        iters = self.experiment_config["iters"] if self.experiment_config["iters"] is not None else 100000
 
         # Pre-allocate run data
         self.current_run_data = {
@@ -142,9 +142,13 @@ class VisualLogger:
             "current_makespan": np.full(iters, -1, dtype=np.float64),
             "current_bin_fetches": np.full(iters, -1, dtype=np.float64),
             "current_total_flow_time": np.full(iters, -1, dtype=np.float64),
+            "current_idle_time": np.full(iters, -1, dtype=np.float64),
+            "current_max_picks": np.full(iters, -1, dtype=np.float64),
             "best_makespan": np.full(iters, -1, dtype=np.float64),
             "best_bin_fetches": np.full(iters, -1, dtype=np.float64),
             "best_total_flow_time": np.full(iters, -1, dtype=np.float64),
+            "best_idle_time": np.full(iters, -1, dtype=np.float64),
+            "best_max_picks": np.full(iters, -1, dtype=np.float64),
             "cp_obj": np.full(iters, "", dtype=object),
             "num_optimized": np.full(iters, -1, dtype=np.int32),
             "total_iter_time": np.full(iters, -1.0, dtype=np.float64),
@@ -164,6 +168,7 @@ class VisualLogger:
 
         self.current_barcode = np.full((iters, num_variables), -1, dtype=np.int8)
         self.current_iteration = 0
+        self.completed_iterations = 0
         self.active_run_start = time.perf_counter()
         self.last_time = self.active_run_start
 
@@ -207,6 +212,12 @@ class VisualLogger:
 
     def log_run_end(self, solution, handles):
         # 1. Store run data
+        # Truncate data to actual completed iterations in case we stopped early (e.g., time limit)
+        c_iters = self.completed_iterations
+        for key in self.current_run_data:
+            self.current_run_data[key] = self.current_run_data[key][:c_iters]
+        self.current_barcode = self.current_barcode[:c_iters]
+
         run_df = pd.DataFrame(self.current_run_data)
         self.df = pd.concat([self.df, run_df], ignore_index=True)
         self.barcodes.append(self.current_barcode)
@@ -402,6 +413,7 @@ class VisualLogger:
             f"Solve {solve_time:.3f}s, (API {solve_api_overhead:.3f}, Presolve {solve_cpp_presolve:.3f}, Search {solve_cpp_search:.3f})"
             f"Total {total_time:.3f}s"
         )
+        self.completed_iterations += 1
 
     def log_strategy(self, strategy_name: str, strategy_idx: int):
         self.add_stat_to_current("lns_strategy_time", self.time_diff_with_overwrite())
@@ -669,6 +681,7 @@ class VisualLogger:
 
         # 3. Generate Plots
         self.plot_solver_progress()
+        self.plot_solver_progress_time()
         self.plot_unfrozen_ratio()
         self.plot_iter_statuses()
         self.plot_and_save_durations_hist()
@@ -828,14 +841,29 @@ class VisualLogger:
         plt.close()
 
     def plot_solver_progress(self):
+        if self.df.empty:
+            return
+
         plt.figure(figsize=(10, 6))
 
-        gb = self.df.groupby("iteration")
-        iters = list(gb.groups.keys())
+        # Align runs across iterations by forward-filling best values for runs that stopped early (e.g. due to time limit)
+        pivot_best = (
+            self.df.pivot(index="iteration", columns="run_id", values="best")
+            .ffill()
+        )
+        iters = list(pivot_best.index)
 
-        mean_best = gb["best"].mean()
-        std_best = gb["best"].std().fillna(0)
-        mean_time = gb["total_iter_time"].mean().cumsum()
+        mean_best = pivot_best.mean(axis=1)
+        std_best = pivot_best.std(axis=1).fillna(0)
+
+        # Cumulative time per run, forward-filled for stopped runs to avoid skewing
+        if "cum_time" not in self.df.columns:
+            self.df["cum_time"] = self.df.groupby("run_id")["total_iter_time"].cumsum()
+        pivot_time = (
+            self.df.pivot(index="iteration", columns="run_id", values="cum_time")
+            .ffill()
+        )
+        mean_time = pivot_time.mean(axis=1)
 
         # Plot Best Makespan on Iteration Axis
         plt.plot(iters, mean_best, color="blue", label="Mean Best Solution")
@@ -889,7 +917,7 @@ class VisualLogger:
         # Overlay Severity Lines
         self._plot_severity_lines()
 
-        plt.title("Warmstarted Matheuristic vs CP Performance")
+        plt.title("Warmstarted Matheuristic vs CP Performance (Iteration Progress)")
         plt.xlabel("Iteration")
         plt.ylabel("Makespan")
         plt.legend(loc="upper right")
@@ -899,6 +927,156 @@ class VisualLogger:
             f"{self.path}/solver_progress.svg", format="svg", bbox_inches="tight"
         )
         plt.close()
+
+    def plot_solver_progress_time(self):
+        """
+        Plots solver progress where the x-axis represents time in seconds,
+        aligning both LNS and CP results appropriately.
+        """
+        if self.df.empty:
+            return
+
+        plt.figure(figsize=(10, 6))
+
+        if "cum_time" not in self.df.columns:
+            self.df["cum_time"] = self.df.groupby("run_id")["total_iter_time"].cumsum()
+
+        # Determine time horizon (seconds)
+        time_limit = self.experiment_config.get("time_limit")
+        max_observed_time = float(self.df["cum_time"].max())
+        if time_limit is not None and float(time_limit) > 0:
+            max_time = max(float(time_limit), max_observed_time)
+        else:
+            max_time = max_observed_time
+
+        if max_time <= 0:
+            plt.close()
+            return
+
+        # Common time grid for evaluating both LNS and CP
+        n_points = min(max(int(max_time), 200), 1000)
+        time_grid = np.linspace(0.0, max_time, n_points)
+
+        # Determine initial heuristic makespan
+        heuristic_makespan = None
+        heur_summary_file = os.path.join(self.instance_folder, "heuristic_summary.txt")
+        if os.path.exists(heur_summary_file):
+            try:
+                with open(heur_summary_file, "r") as f:
+                    for part in f.read().split("|"):
+                        if "Makespan" in part:
+                            heuristic_makespan = float(part.split(":")[1].strip())
+                            break
+            except Exception:
+                pass
+
+        if heuristic_makespan is None:
+            heuristic_makespan = float(self.df["best"].iloc[0])
+
+        # Compute LNS trajectory for each run along the common time grid
+        run_ids = sorted(self.df["run_id"].unique())
+        all_trajectories = []
+
+        for r_id in run_ids:
+            run_df = self.df[self.df["run_id"] == r_id].sort_values("cum_time")
+            t_points = np.array([0.0] + run_df["cum_time"].tolist(), dtype=np.float64)
+            b_points = np.array([heuristic_makespan] + run_df["best"].tolist(), dtype=np.float64)
+
+            # Step function: for each t in time_grid, find last recorded value with time <= t
+            indices = np.searchsorted(t_points, time_grid, side="right") - 1
+            indices = np.clip(indices, 0, len(b_points) - 1)
+            all_trajectories.append(b_points[indices])
+
+        all_trajectories = np.array(all_trajectories)
+        lns_mean = np.mean(all_trajectories, axis=0)
+        lns_std = (
+            np.std(all_trajectories, axis=0, ddof=1)
+            if len(run_ids) > 1
+            else np.zeros_like(lns_mean)
+        )
+
+        # Plot LNS Progress on Time Axis
+        plt.plot(time_grid, lns_mean, color="blue", label="Mean LNS Solution", linewidth=2)
+        plt.fill_between(
+            time_grid,
+            lns_mean - lns_std,
+            lns_mean + lns_std,
+            color="blue",
+            alpha=0.2,
+        )
+
+        # CP Performance on the same time grid
+        cp_mean, cp_std, cp_final_mean, cp_final_std = self.get_cp_performance(time_grid)
+
+        if cp_mean is not None:
+            plt.plot(
+                time_grid,
+                cp_mean,
+                color="green",
+                linestyle="--",
+                label="CP Trajectory (Mean ± 1σ)",
+                linewidth=2,
+            )
+            plt.fill_between(
+                time_grid,
+                cp_mean - cp_std,
+                cp_mean + cp_std,
+                color="green",
+                alpha=0.15,
+            )
+
+            # 1-hour CP baseline
+            if cp_final_mean > 0:
+                plt.axhline(
+                    y=cp_final_mean,
+                    color="red",
+                    linestyle=":",
+                    label="CP 1-Hour Best (Mean ± 1σ)",
+                )
+                plt.axhline(
+                    y=cp_final_mean - cp_final_std,
+                    color="red",
+                    linestyle=":",
+                    alpha=0.3,
+                )
+                plt.axhline(
+                    y=cp_final_mean + cp_final_std,
+                    color="red",
+                    linestyle=":",
+                    alpha=0.3,
+                )
+
+        # Overlay Severity Lines mapped to time
+        if "severity_increases" in self.df.columns and (self.df["severity_increases"] > 0).any():
+            sev_df = self.df[self.df["severity_increases"] > 0]
+            sev_iters = sorted(sev_df["iteration"].unique())
+            for i, siter in enumerate(sev_iters):
+                mean_sev_time = sev_df[sev_df["iteration"] == siter]["cum_time"].mean()
+                label = "Severity Increase" if i == 0 else ""
+                plt.axvline(
+                    x=mean_sev_time,
+                    color="gray",
+                    linestyle=":",
+                    alpha=0.3,
+                    label=label,
+                )
+
+        plt.title("Warmstarted Matheuristic vs CP Performance (Time-Aligned)")
+        plt.xlabel("Time (s)")
+        plt.ylabel("Makespan")
+        plt.xlim(0, max_time)
+        plt.legend(loc="upper right")
+        plt.grid(True, alpha=0.3)
+
+        plt.savefig(
+            f"{self.path}/solver_progress_time.svg",
+            format="svg",
+            bbox_inches="tight",
+        )
+        plt.close()
+
+    # Alias for convenience
+    plot_solver_progress_by_time = plot_solver_progress_time
 
     def plot_unfrozen_ratio(self):
         plt.figure(figsize=(10, 6))
