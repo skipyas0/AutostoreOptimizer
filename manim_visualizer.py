@@ -139,66 +139,89 @@ class LNSOptimizationScene(Scene):
         time_scale = 7.0 / max_time # X spans -6.0 to 1.0 (width 7)
         
         # 2. Compute dynamic robot lane packing logic
-        def get_robot_assignments(state, previous_assignment):
+        def get_robot_assignments(state, previous_assignment, frozen_vars=None):
+            if frozen_vars is None: frozen_vars = set()
             fr_events = []
             for k_var, v_state in state.items():
                 vtype, indices = parse_varname(k_var)
                 if not indices: continue
                 if vtype in ["F", "R"]:
-                    s = indices[0]
-                    if s == 0:
-                        fr_events.append({
-                            "id": (indices[1], indices[2]), 
-                            "start": v_state["start"], 
-                            "end": v_state["end"]
-                        })
+                    fr_events.append({
+                        "k_var": k_var,
+                        "id": (indices[0], indices[1], indices[2]), 
+                        "start": v_state["start"], 
+                        "end": v_state["end"]
+                    })
             spans = {}
+            span_vars = {}
             for ev in fr_events:
                 idx = ev["id"]
                 if idx not in spans:
                     spans[idx] = [ev["start"], ev["end"]]
+                    span_vars[idx] = [ev["k_var"]]
                 else:
                     spans[idx][0] = min(spans[idx][0], ev["start"])
                     spans[idx][1] = max(spans[idx][1], ev["end"])
+                    span_vars[idx].append(ev["k_var"])
+            
+            if not spans: return {}, 0
+            
+            from docplex.cp.model import CpoModel
+            mdl = CpoModel()
+            
+            intervals = [(idx, spans[idx][0], spans[idx][1], span_vars[idx]) for idx in spans]
+            N = len(intervals)
+            
+            num_lanes = mdl.integer_var(0, N, "num_lanes")
+            lane_vars = {idx: mdl.integer_var(0, N - 1, f"lane_{idx[0]}_{idx[1]}") for idx, s, e, vars_ in intervals}
+            
+            for idx, s, e, vars_ in intervals:
+                mdl.add(lane_vars[idx] < num_lanes)
+                if idx in previous_assignment and all(v in frozen_vars for v in vars_):
+                    mdl.add(lane_vars[idx] == previous_assignment[idx])
+                    
+            for i, (idx1, s1, e1, _) in enumerate(intervals):
+                for j, (idx2, s2, e2, _) in enumerate(intervals):
+                    if i < j:
+                        if not (e1 <= s2 or e2 <= s1):
+                            mdl.add(lane_vars[idx1] != lane_vars[idx2])
+                            
+            changes = []
+            for idx, s, e, _ in intervals:
+                if idx in previous_assignment:
+                    changes.append(lane_vars[idx] != previous_assignment[idx])
+                    
+            if changes: mdl.minimize(num_lanes * 1000 + mdl.sum(changes))
+            else: mdl.minimize(num_lanes)
+                
+            sol = mdl.solve(TimeLimit=5, LogVerbosity="Quiet")
             
             assignment = {}
-            lanes_content = {}
-            
-            def overlap(span1, span2):
-                return not (span1[1] <= span2[0] or span1[0] >= span2[1])
-
-            unplaced = []
-            # Pass 1: Retain previous assignment if no overlap
-            for idx, span in sorted(spans.items(), key=lambda x: x[0]):
-                placed = False
-                if idx in previous_assignment:
-                    prev_lane = previous_assignment[idx]
-                    lane_spans = lanes_content.get(prev_lane, [])
-                    if not any(overlap(span, s) for s in lane_spans):
-                        assignment[idx] = prev_lane
-                        if prev_lane not in lanes_content:
-                            lanes_content[prev_lane] = []
-                        lanes_content[prev_lane].append(span)
-                        placed = True
-                if not placed:
-                    unplaced.append((idx, span))
-                    
-            # Pass 2: Greedily place the rest by start time
-            unplaced.sort(key=lambda x: x[1][0])
-            for idx, span in unplaced:
-                lane_idx = 0
-                while True:
-                    lane_spans = lanes_content.get(lane_idx, [])
-                    if not any(overlap(span, s) for s in lane_spans):
+            if sol:
+                for idx, s, e, _ in intervals:
+                    assignment[idx] = sol.get_value(lane_vars[idx])
+                return assignment, sol.get_value(num_lanes)
+            else:
+                # Fallback to greedy
+                unplaced = list(spans.items())
+                unplaced.sort(key=lambda x: x[1][0])
+                lanes_content = {}
+                for idx, span in unplaced:
+                    if idx in previous_assignment and all(v in frozen_vars for v in span_vars[idx]):
+                        lane_idx = previous_assignment[idx]
                         assignment[idx] = lane_idx
-                        if lane_idx not in lanes_content:
-                            lanes_content[lane_idx] = []
+                        if lane_idx not in lanes_content: lanes_content[lane_idx] = []
                         lanes_content[lane_idx].append(span)
-                        break
-                    lane_idx += 1
-                    
-            max_l = max(assignment.values()) + 1 if assignment else 0
-            return assignment, max_l
+                        continue
+                    lane_idx = 0
+                    while True:
+                        if not any(not (span[1] <= s[0] or s[1] <= span[0]) for s in lanes_content.get(lane_idx, [])):
+                            assignment[idx] = lane_idx
+                            if lane_idx not in lanes_content: lanes_content[lane_idx] = []
+                            lanes_content[lane_idx].append(span)
+                            break
+                        lane_idx += 1
+                return assignment, max(assignment.values()) + 1 if assignment else 0
 
         current_state = {}
         for k, v in self.initial_solution.items():
@@ -210,16 +233,17 @@ class LNSOptimizationScene(Scene):
         robot_assignments, l_count = get_robot_assignments(current_state, robot_assignments)
         max_lanes = max(max_lanes, l_count)
         
-        for d in self.deltas:
+        for d, f in zip(self.deltas, self.frozen_vars):
             for k, v in d.items():
                 if isinstance(v, dict):
                     if v.get("present"): current_state[k] = v
                     else: current_state.pop(k, None)
-            robot_assignments, l_count = get_robot_assignments(current_state, robot_assignments)
+            robot_assignments, l_count = get_robot_assignments(current_state, robot_assignments, set(f))
             max_lanes = max(max_lanes, l_count)
             
+        num_stations = len(self.instance.S) if hasattr(self.instance, "S") else 1
         num_order_lanes = len(self.instance.L) if hasattr(self.instance, "L") else 1
-        num_tracks = num_order_lanes + 2 + max_lanes
+        num_tracks = num_stations * (num_order_lanes + 2) + max_lanes
         
         # 3. Y-axis layout
         y_max = 2.0
@@ -244,12 +268,16 @@ class LNSOptimizationScene(Scene):
         # Draw Y-axis labels
         x_lbl = -6.7
         f_size = max(6, min(14, int(35 * y_step)))
-        for i in range(num_order_lanes):
-            self.add(Text(f"S0 · Lane {i}", font_size=f_size, color=BLACK).move_to([x_lbl, y_positions[i], 0]))
-        self.add(Text("S0 · Pick", font_size=f_size, color=BLACK).move_to([x_lbl, y_positions[num_order_lanes], 0]))
-        self.add(Text("S0 · Bin", font_size=f_size, color=BLACK).move_to([x_lbl, y_positions[num_order_lanes+1], 0]))
+        for s_idx in range(num_stations):
+            offset = s_idx * (num_order_lanes + 2)
+            for i in range(num_order_lanes):
+                self.add(Text(f"S{s_idx} · Lane {i}", font_size=f_size, color=BLACK).move_to([x_lbl, y_positions[offset + i], 0]))
+            self.add(Text(f"S{s_idx} · Pick", font_size=f_size, color=BLACK).move_to([x_lbl, y_positions[offset + num_order_lanes], 0]))
+            self.add(Text(f"S{s_idx} · Bin", font_size=f_size, color=BLACK).move_to([x_lbl, y_positions[offset + num_order_lanes + 1], 0]))
+            
+        robot_offset = num_stations * (num_order_lanes + 2)
         for i in range(max_lanes):
-            self.add(Text(f"S0 · Robot {i}", font_size=f_size, color=BLACK).move_to([x_lbl, y_positions[num_order_lanes+2+i], 0]))
+            self.add(Text(f"Robots · {i}", font_size=f_size, color=BLACK).move_to([x_lbl, y_positions[robot_offset + i], 0]))
             
         # Add KPI Graphs on the right
         iters = len(self.makespans)
@@ -371,22 +399,22 @@ class LNSOptimizationScene(Scene):
             elif vtype in ["B", "F", "R"]: s = indices[0]
             else: return -1
             
-            if s != 0: return -1 # Render station 0 only
+            offset = s * (num_order_lanes + 2)
             
             if vtype == "I_os_lane":
-                return indices[2]
+                return offset + indices[2]
             elif vtype == "C":
                 o = indices[0]
                 for k_var in state_dict:
                     vt, ind = parse_varname(k_var)
-                    if vt == "I_os_lane" and ind and ind[0] == o and ind[1] == 0:
-                        return ind[2]
-                return 0
-            elif vtype == "P": return num_order_lanes
-            elif vtype == "B": return num_order_lanes + 1
+                    if vt == "I_os_lane" and ind and ind[0] == o and ind[1] == s:
+                        return offset + ind[2]
+                return offset + 0
+            elif vtype == "P": return offset + num_order_lanes
+            elif vtype == "B": return offset + num_order_lanes + 1
             elif vtype in ["F", "R"]:
-                k_e = (indices[1], indices[2])
-                return num_order_lanes + 2 + robot_assigns.get(k_e, 0)
+                s_k_e = (indices[0], indices[1], indices[2])
+                return num_stations * (num_order_lanes + 2) + robot_assigns.get(s_k_e, 0)
             return -1
             
         current_state = {}
@@ -416,7 +444,7 @@ class LNSOptimizationScene(Scene):
                     if state.get("present"): current_state[varname] = state
                     else: current_state.pop(varname, None)
                     
-            robot_assignments, _ = get_robot_assignments(current_state, robot_assignments)
+            robot_assignments, _ = get_robot_assignments(current_state, robot_assignments, set(frozen))
             anims = []
             
             for varname, state in current_state.items():
