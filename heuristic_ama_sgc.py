@@ -182,7 +182,9 @@ def plan_order_at_station_parameterised(
 
     for k in skus_sorted:
         # --- Try shared bin first ---
-        shared = find_shared_bin(state.station_bin_events[s], k, t_cursor, p)
+        shared, pick_start = find_shared_bin(
+            state.station_bin_events[s], k, t_cursor, p
+        )
 
         if shared is None:
             for ev in new_bin_events:
@@ -190,11 +192,12 @@ def plan_order_at_station_parameterised(
                     start = max(t_cursor, ev.presence_start)
                     if start + p[k] <= ev.presence_end:
                         shared = ev
+                        pick_start = start
                         break
 
         if shared is not None:
-            pick_start = max(t_cursor, shared.presence_start)
             pick_end = pick_start + p[k]
+            shared.pick_intervals.append((pick_start, pick_end))
             t_cursor = pick_end
             pick_times_dict[k] = (pick_start, pick_end)
             shared_picks.append((k, shared, pick_end))

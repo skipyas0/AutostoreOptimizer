@@ -6,6 +6,7 @@ from docplex.cp.solver.solver_listener import CpoSolverListener
 
 from cp_model_utils import build_solve_dict
 from instance import Instance
+from autostore_heuristic import validate_warmstart
 
 
 def build_model(

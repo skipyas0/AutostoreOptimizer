@@ -10,21 +10,29 @@ Unit tests for autostore_heuristic.py — Phases 0 and 1.
 [P2-VW] validate_warmstart tests (require docplex / CP Optimizer)
 [P2-HE] Heuristic edge-case tests
 """
+
+import copy
+import os
+import sys
+
+import pytest
+
+from autostore_heuristic import (
+    BinCopyPool,
+    BinEvent,
+    DifferenceArray,
+    find_shared_bin,
+    run_sgc,
+    static_priority_sort,
+    validate_solution,
+)
 from cp_model import (
     build_model,
-    validate_warmstart,
     inject_warmstart,
+    validate_warmstart,
 )
 from datagen import generate_data as gen_v5
-from autostore_heuristic import (
-    DifferenceArray, BinCopyPool, BinEvent, HeuristicState,
-    static_priority_sort, find_shared_bin, run_sgc, validate_solution,
-    init_state, plan_order_at_station, commit_plan,
-)
-import copy
-import pytest
-import sys
-import os
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
@@ -36,34 +44,62 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # Module-level helpers
 # ---------------------------------------------------------------------------
 
+
 def _small_v5_instance(stations=1, lanes=2, orders=7, skus=5, seed=42):
     """Generate a small problem instance using v5's generate_data."""
     S, L, K, orders_req, rt, p, N = gen_v5(
-        num_stations=stations, lanes_per_station=lanes, num_orders=orders,
-        num_skus=skus, seed=seed, pick_touch_time=4,
+        num_stations=stations,
+        lanes_per_station=lanes,
+        num_orders=orders,
+        num_skus=skus,
+        seed=seed,
+        pick_touch_time=4,
     )
     rt_ret = dict(rt)
     O = sorted(orders_req.keys())
     return S, L, K, O, orders_req, rt, rt_ret, p, N
 
 
-def _run_small(stations=1, lanes=2, orders=7, skus=5, seed=42,
-               horizon=2000, move_cap=None):
+def _run_small(
+    stations=1, lanes=2, orders=7, skus=5, seed=42, horizon=2000, move_cap=None
+):
     """Generate a small instance and run the SGC heuristic on it."""
     S, L, K, O, orders_req, rt, rt_ret, p, N = _small_v5_instance(
-        stations, lanes, orders, skus, seed)
-    sol = run_sgc(S, L, K, O, orders_req, rt, rt_ret, p, N,
-                  horizon=horizon, move_cap=move_cap)
+        stations, lanes, orders, skus, seed
+    )
+    sol = run_sgc(
+        S, L, K, O, orders_req, rt, rt_ret, p, N, horizon=horizon, move_cap=move_cap
+    )
     return sol, S, L, K, O, orders_req, rt, rt_ret, p, N
 
 
-def _build_handles(S, L, K, O, orders_req, rt, rt_ret, p, N,
-                   horizon=2000, move_cap=None, symmetry_breaking=True):
+def _build_handles(
+    S,
+    L,
+    K,
+    O,
+    orders_req,
+    rt,
+    rt_ret,
+    p,
+    N,
+    horizon=2000,
+    move_cap=None,
+    symmetry_breaking=True,
+):
     """Build the CP model and return (mdl, handles)."""
     mdl, handles = build_model(
-        S, L, K, orders_req, rt, p,
-        rt_return=rt_ret, horizon=horizon, N=N,
-        move_cap=move_cap, add_symmetry_breaking=symmetry_breaking,
+        S,
+        L,
+        K,
+        orders_req,
+        rt,
+        p,
+        rt_return=rt_ret,
+        horizon=horizon,
+        N=N,
+        move_cap=move_cap,
+        add_symmetry_breaking=symmetry_breaking,
     )
     return mdl, handles
 
@@ -72,13 +108,18 @@ def _build_handles(S, L, K, O, orders_req, rt, rt_ret, p, N,
 # Corruption helpers — shallow-copy a Solution with one field patched
 # ---------------------------------------------------------------------------
 
+
 def _patch_order(sol, o, **kw):
     """Return a Solution copy with one order_assignments entry patched."""
     new_sol = copy.copy(sol)
     a = dict(sol.order_assignments)
     s_a, ln_a, t_s, t_e = a[o]
-    a[o] = (kw.get("s", s_a), kw.get("ln", ln_a),
-            kw.get("start", t_s), kw.get("end", t_e))
+    a[o] = (
+        kw.get("s", s_a),
+        kw.get("ln", ln_a),
+        kw.get("start", t_s),
+        kw.get("end", t_e),
+    )
     new_sol.order_assignments = a
     return new_sol
 
@@ -107,13 +148,16 @@ def _append_bin_event(sol, s, be):
 def _drop_order(sol, o):
     """Return a Solution copy with order o removed from order_assignments."""
     new_sol = copy.copy(sol)
-    new_sol.order_assignments = {k: v for k, v in sol.order_assignments.items() if k != o}
+    new_sol.order_assignments = {
+        k: v for k, v in sol.order_assignments.items() if k != o
+    }
     return new_sol
 
 
 # ============================================================
 # [P0-7] DifferenceArray tests
 # ============================================================
+
 
 class TestDifferenceArray:
     def test_empty_profile(self):
@@ -185,6 +229,7 @@ class TestDifferenceArray:
 # [P0-8] BinCopyPool tests
 # ============================================================
 
+
 class TestBinCopyPool:
     def test_single_copy(self):
         pool = BinCopyPool(sku=0, n_copies=1)
@@ -237,6 +282,7 @@ class TestBinCopyPool:
 # [P1-1] static_priority_sort test
 # ============================================================
 
+
 class TestStaticPrioritySort:
     def test_sort_by_sharing_degree(self):
         orders_req = {0: [0, 1], 1: [2], 2: [0, 1, 2]}
@@ -255,38 +301,102 @@ class TestStaticPrioritySort:
 # [P1-2] find_shared_bin test
 # ============================================================
 
+
 class TestFindSharedBin:
     def test_finds_overlap(self):
-        ev = BinEvent(sku=3, copy_id=0,
-                      fetch_start=0, fetch_end=10,
-                      presence_start=10, presence_end=20,
-                      return_start=20, return_end=30,
-                      orders_served=[0])
-        result = find_shared_bin([ev], k=3, t_cursor=15, p={3: 4})
-        assert result is ev
+        ev = BinEvent(
+            sku=3,
+            copy_id=0,
+            fetch_start=0,
+            fetch_end=10,
+            presence_start=10,
+            presence_end=20,
+            return_start=20,
+            return_end=30,
+            orders_served=[0],
+        )
+        bin_ev, pick_start = find_shared_bin([ev], k=3, t_cursor=15, p={3: 4})
+        assert bin_ev is ev
+        assert pick_start == 15
 
     def test_no_overlap(self):
-        ev = BinEvent(sku=3, copy_id=0,
-                      fetch_start=0, fetch_end=10,
-                      presence_start=10, presence_end=20,
-                      return_start=20, return_end=30,
-                      orders_served=[0])
-        result = find_shared_bin([ev], k=3, t_cursor=25, p={3: 4})
-        assert result is None
+        ev = BinEvent(
+            sku=3,
+            copy_id=0,
+            fetch_start=0,
+            fetch_end=10,
+            presence_start=10,
+            presence_end=20,
+            return_start=20,
+            return_end=30,
+            orders_served=[0],
+        )
+        bin_ev, pick_start = find_shared_bin([ev], k=3, t_cursor=25, p={3: 4})
+        assert bin_ev is None
+        assert pick_start is None
 
     def test_wrong_sku(self):
-        ev = BinEvent(sku=3, copy_id=0,
-                      fetch_start=0, fetch_end=10,
-                      presence_start=10, presence_end=20,
-                      return_start=20, return_end=30,
-                      orders_served=[0])
-        result = find_shared_bin([ev], k=5, t_cursor=15, p={5: 4})
-        assert result is None
+        ev = BinEvent(
+            sku=3,
+            copy_id=0,
+            fetch_start=0,
+            fetch_end=10,
+            presence_start=10,
+            presence_end=20,
+            return_start=20,
+            return_end=30,
+            orders_served=[0],
+        )
+        bin_ev, pick_start = find_shared_bin([ev], k=5, t_cursor=15, p={5: 4})
+        assert bin_ev is None
+        assert pick_start is None
+
+    def test_pick_cap_rejects_when_full(self):
+        ev = BinEvent(
+            sku=3,
+            copy_id=0,
+            fetch_start=0,
+            fetch_end=10,
+            presence_start=10,
+            presence_end=30,
+            return_start=30,
+            return_end=40,
+            orders_served=[0],
+            pick_intervals=[(10, 14)],
+        )
+        # pick_cap=1, so concurrent pick at t=10-14 already exists; new pick slides
+        # past that interval to start at 14.
+        bin_ev, pick_start = find_shared_bin(
+            [ev], k=3, t_cursor=12, p={3: 4}, pick_cap=1
+        )
+        assert bin_ev is ev
+        assert pick_start == 14
+
+    def test_pick_cap_no_capacity_returns_none(self):
+        ev = BinEvent(
+            sku=3,
+            copy_id=0,
+            fetch_start=0,
+            fetch_end=10,
+            presence_start=10,
+            presence_end=14,
+            return_start=14,
+            return_end=24,
+            orders_served=[0],
+            pick_intervals=[(10, 14)],
+        )
+        # pick_cap=1, the whole presence is already occupied; cannot fit
+        bin_ev, pick_start = find_shared_bin(
+            [ev], k=3, t_cursor=10, p={3: 4}, pick_cap=1
+        )
+        assert bin_ev is None
+        assert pick_start is None
 
 
 # ============================================================
 # [P2-VW] validate_warmstart tests
 # ============================================================
+
 
 class TestValidateWarmstart:
     """Tests for validate_warmstart in cp_model.py.
@@ -330,8 +440,10 @@ class TestValidateWarmstart:
         for i in range(max(1, n_extra)):
             t = 50000 + i * 500
             extra = BinEvent(
-                sku=k_target, copy_id=i,
-                fetch_start=t, fetch_end=t + rt[k_target],
+                sku=k_target,
+                copy_id=i,
+                fetch_start=t,
+                fetch_end=t + rt[k_target],
                 presence_start=t + rt[k_target],
                 presence_end=t + rt[k_target] + p[k_target],
                 return_start=t + rt[k_target] + p[k_target],
@@ -339,7 +451,9 @@ class TestValidateWarmstart:
             )
             bad_sol = _append_bin_event(bad_sol, s0, extra)
         violations = validate_warmstart(bad_sol, bad_sol.pick_events, handles)
-        assert any("trips" in v for v in violations), f"Expected U overflow violation, got: {violations}"
+        assert any("trips" in v for v in violations), (
+            f"Expected U overflow violation, got: {violations}"
+        )
 
     # --- Check 2: pick within bin presence ---
 
@@ -353,7 +467,9 @@ class TestValidateWarmstart:
         ps, pe = bad_pe[first_key]
         bad_pe[first_key] = (ps + 100_000, pe + 100_000)
         violations = validate_warmstart(sol, bad_pe, handles)
-        assert any("not covered" in v for v in violations), f"Expected pick-outside-presence, got: {violations}"
+        assert any("not covered" in v for v in violations), (
+            f"Expected pick-outside-presence, got: {violations}"
+        )
 
     # --- Check 3: order window spans picks ---
 
@@ -369,7 +485,9 @@ class TestValidateWarmstart:
             pytest.skip("All orders start at t=0")
         bad_sol = _patch_order(sol, o_target, start=0)
         violations = validate_warmstart(bad_sol, sol.pick_events, handles)
-        assert any("Start" in v for v in violations), f"Expected start mismatch, got: {violations}"
+        assert any("Start" in v for v in violations), (
+            f"Expected start mismatch, got: {violations}"
+        )
 
     def test_order_end_mismatch(self):
         """Inflating t_end should mismatch the max pick end."""
@@ -378,7 +496,9 @@ class TestValidateWarmstart:
         t_e = sol.order_assignments[o_target][3]
         bad_sol = _patch_order(sol, o_target, end=t_e + 999)
         violations = validate_warmstart(bad_sol, sol.pick_events, handles)
-        assert any("End" in v for v in violations), f"Expected end mismatch, got: {violations}"
+        assert any("End" in v for v in violations), (
+            f"Expected end mismatch, got: {violations}"
+        )
 
     # --- Check 4: lane fill order symmetry ---
 
@@ -393,8 +513,9 @@ class TestValidateWarmstart:
         bad_sol = copy.copy(sol)
         bad_sol.order_assignments = bad_assignments
         violations = validate_warmstart(bad_sol, sol.pick_events, handles)
-        assert any("Symmetry (A)" in v for v in violations), \
+        assert any("Symmetry (A)" in v for v in violations), (
             f"Expected symmetry (A) violation, got: {violations}"
+        )
 
     # --- Check 6: order completeness ---
 
@@ -405,8 +526,9 @@ class TestValidateWarmstart:
         bad_sol = _drop_order(sol, o_drop)
         bad_pe = {k: v for k, v in sol.pick_events.items() if k[0] != o_drop}
         violations = validate_warmstart(bad_sol, bad_pe, handles)
-        assert any(str(o_drop) in v and "not assigned" in v for v in violations), \
+        assert any(str(o_drop) in v and "not assigned" in v for v in violations), (
             f"Expected completeness violation for order {o_drop}, got: {violations}"
+        )
 
     # --- Check 7: lane no-overlap ---
 
@@ -421,8 +543,9 @@ class TestValidateWarmstart:
         a[o1] = (S[0], L[0], 50, 150)
         bad_sol.order_assignments = a
         violations = validate_warmstart(bad_sol, sol.pick_events, handles)
-        assert any("Lane overlap" in v for v in violations), \
+        assert any("Lane overlap" in v for v in violations), (
             f"Expected lane overlap violation, got: {violations}"
+        )
 
     # --- Check 8: pickface no-overlap ---
 
@@ -438,7 +561,8 @@ class TestValidateWarmstart:
         # (use a SKU index that doesn't exist in handles["K"] to avoid U-overflow check)
         fake_sku = max(K) + 999
         overlap_ev = BinEvent(
-            sku=fake_sku, copy_id=0,
+            sku=fake_sku,
+            copy_id=0,
             fetch_start=orig.fetch_start,
             fetch_end=orig.fetch_end,
             presence_start=orig.presence_start,
@@ -448,8 +572,9 @@ class TestValidateWarmstart:
         )
         bad_sol = _append_bin_event(sol, s0, overlap_ev)
         violations = validate_warmstart(bad_sol, sol.pick_events, handles)
-        assert any("Pickface overlap" in v for v in violations), \
+        assert any("Pickface overlap" in v for v in violations), (
             f"Expected pickface overlap violation, got: {violations}"
+        )
 
     # --- Check 9: bin timing consistency ---
 
@@ -460,11 +585,13 @@ class TestValidateWarmstart:
         evts = sol.bin_events.get(s0, [])
         if not evts:
             pytest.skip("No bin events at station 0")
-        bad_sol = _patch_bin_event(sol, s0, 0,
-                                   presence_start=evts[0].presence_start + 5)
+        bad_sol = _patch_bin_event(
+            sol, s0, 0, presence_start=evts[0].presence_start + 5
+        )
         violations = validate_warmstart(bad_sol, sol.pick_events, handles)
-        assert any("presence_start" in v for v in violations), \
+        assert any("presence_start" in v for v in violations), (
             f"Expected timing inconsistency, got: {violations}"
+        )
 
     # --- Check 10: block concurrency ---
 
@@ -484,8 +611,10 @@ class TestValidateWarmstart:
         # Create a block that overlaps orig's [fetch_start, return_end) by 1 tick
         t = orig.fetch_start + 1
         overlap_ev = BinEvent(
-            sku=k, copy_id=99,
-            fetch_start=t, fetch_end=t + rt[k],
+            sku=k,
+            copy_id=99,
+            fetch_start=t,
+            fetch_end=t + rt[k],
             presence_start=t + rt[k],
             presence_end=t + rt[k] + p[k],
             return_start=t + rt[k] + p[k],
@@ -493,8 +622,9 @@ class TestValidateWarmstart:
         )
         bad_sol = _append_bin_event(sol, s0, overlap_ev)
         violations = validate_warmstart(bad_sol, sol.pick_events, handles)
-        assert any("Block concurrency" in v for v in violations), \
+        assert any("Block concurrency" in v for v in violations), (
             f"Expected block concurrency violation, got: {violations}"
+        )
 
     # --- Check 11: MoveCap ---
 
@@ -503,8 +633,9 @@ class TestValidateWarmstart:
         S, L, K, O, orders_req, rt, rt_ret, p, N = _small_v5_instance()
         sol = run_sgc(S, L, K, O, orders_req, rt, rt_ret, p, N, horizon=2000)
         # Build handles with move_cap=2
-        _, handles = _build_handles(S, L, K, O, orders_req, rt, rt_ret, p, N,
-                                    move_cap=2)
+        _, handles = _build_handles(
+            S, L, K, O, orders_req, rt, rt_ret, p, N, move_cap=2
+        )
         s0 = S[0]
         k0 = K[0]
         # Add 3 bin events all starting at the same time -> 3 concurrent fetches
@@ -512,8 +643,10 @@ class TestValidateWarmstart:
         for i in range(3):
             t = 80000
             extra = BinEvent(
-                sku=k0, copy_id=i,
-                fetch_start=t, fetch_end=t + rt[k0],
+                sku=k0,
+                copy_id=i,
+                fetch_start=t,
+                fetch_end=t + rt[k0],
                 presence_start=t + rt[k0],
                 presence_end=t + rt[k0] + p[k0],
                 return_start=t + rt[k0] + p[k0],
@@ -521,13 +654,15 @@ class TestValidateWarmstart:
             )
             bad_sol = _append_bin_event(bad_sol, s0, extra)
         violations = validate_warmstart(bad_sol, bad_sol.pick_events, handles)
-        assert any("MoveCap" in v for v in violations), \
+        assert any("MoveCap" in v for v in violations), (
             f"Expected MoveCap violation, got: {violations}"
+        )
 
 
 # ============================================================
 # [P2-HE] Heuristic edge-case tests
 # ============================================================
+
 
 class TestHeuristicEdgeCases:
     """Edge cases for the SGC heuristic: tight constraints, degenerate inputs."""
@@ -535,34 +670,44 @@ class TestHeuristicEdgeCases:
     def test_movecap_1_serializes_fetches(self):
         """With move_cap=1, no two moves may be concurrent; validate_solution must pass."""
         sol, S, L, K, O, orders_req, rt, rt_ret, p, N = _run_small(
-            stations=1, lanes=2, orders=5, skus=4, seed=3,
-            horizon=5000, move_cap=1,
+            stations=1,
+            lanes=2,
+            orders=5,
+            skus=4,
+            seed=3,
+            horizon=5000,
+            move_cap=1,
         )
         assert sol.feasible, "Heuristic should find a feasible solution with move_cap=1"
         violations = validate_solution(
-            sol, S, L, K, O, orders_req, rt, rt_ret, p, N, 5000, move_cap=1)
+            sol, S, L, K, O, orders_req, rt, rt_ret, p, N, 5000, move_cap=1
+        )
         assert violations == [], f"Violations: {violations}"
 
     def test_bin_copy_exhaustion(self):
         """With N[k]=1 for all SKUs, orders must queue for bins; no concurrency violation."""
         S, L, K, O, orders_req, rt, rt_ret, p, N = _small_v5_instance(
-            stations=1, lanes=2, orders=4, skus=2, seed=5)
+            stations=1, lanes=2, orders=4, skus=2, seed=5
+        )
         N_one = {k: 1 for k in K}
         sol = run_sgc(S, L, K, O, orders_req, rt, rt_ret, p, N_one, horizon=5000)
         assert sol.feasible, "Should be feasible even with single bin copies"
         violations = validate_solution(
-            sol, S, L, K, O, orders_req, rt, rt_ret, p, N_one, 5000)
+            sol, S, L, K, O, orders_req, rt, rt_ret, p, N_one, 5000
+        )
         assert violations == [], f"Violations with N[k]=1: {violations}"
 
     def test_pick_events_cover_all_assignments(self):
         """For every assigned (o, s, k), pick_events must have an entry."""
         sol, S, L, K, O, orders_req, rt, rt_ret, p, N = _run_small(
-            stations=2, lanes=2, orders=8, skus=5, seed=11)
+            stations=2, lanes=2, orders=8, skus=5, seed=11
+        )
         assert sol.feasible
         for o, (s_a, ln_a, t_s, t_e) in sol.order_assignments.items():
             for k in orders_req[o]:
                 assert (o, s_a, k) in sol.pick_events, (
-                    f"Missing pick_event for (o={o}, s={s_a}, k={k})")
+                    f"Missing pick_event for (o={o}, s={s_a}, k={k})"
+                )
 
     def test_bin_events_timing_valid(self):
         """Every BinEvent must have internally consistent timing fields."""
@@ -572,18 +717,21 @@ class TestHeuristicEdgeCases:
             for be in sol.bin_events.get(s, []):
                 k = be.sku
                 assert be.fetch_end == be.presence_start, (
-                    f"S{s} SKU {k}: fetch_end {be.fetch_end} != presence_start {be.presence_start}")
+                    f"S{s} SKU {k}: fetch_end {be.fetch_end} != presence_start {be.presence_start}"
+                )
                 assert be.presence_end == be.return_start, (
-                    f"S{s} SKU {k}: presence_end {be.presence_end} != return_start {be.return_start}")
+                    f"S{s} SKU {k}: presence_end {be.presence_end} != return_start {be.return_start}"
+                )
                 assert be.fetch_end - be.fetch_start == rt[k], (
-                    f"S{s} SKU {k}: fetch duration {be.fetch_end - be.fetch_start} != rt={rt[k]}")
+                    f"S{s} SKU {k}: fetch duration {be.fetch_end - be.fetch_start} != rt={rt[k]}"
+                )
                 assert be.return_end - be.return_start == rt_ret[k], (
-                    f"S{s} SKU {k}: return duration {be.return_end - be.return_start} != rt_ret={rt_ret[k]}")
+                    f"S{s} SKU {k}: return duration {be.return_end - be.return_start} != rt_ret={rt_ret[k]}"
+                )
 
     def test_tight_horizon(self):
         """With horizon=1, the solution is infeasible or all order ends are within horizon."""
-        sol, S, L, K, O, orders_req, rt, rt_ret, p, N = _run_small(
-            horizon=1)
+        sol, S, L, K, O, orders_req, rt, rt_ret, p, N = _run_small(horizon=1)
         if sol.feasible:
             for o, (s, ln, t_s, t_e) in sol.order_assignments.items():
                 assert t_e <= 1, f"Order {o} ends at {t_e} which exceeds horizon=1"
@@ -592,10 +740,12 @@ class TestHeuristicEdgeCases:
     def test_many_orders_lane_usage(self):
         """20 orders across 4 lanes should yield a valid solution."""
         sol, S, L, K, O, orders_req, rt, rt_ret, p, N = _run_small(
-            stations=1, lanes=4, orders=20, skus=8, seed=1, horizon=8000)
+            stations=1, lanes=4, orders=20, skus=8, seed=1, horizon=8000
+        )
         assert sol.feasible
         violations = validate_solution(
-            sol, S, L, K, O, orders_req, rt, rt_ret, p, N, 8000)
+            sol, S, L, K, O, orders_req, rt, rt_ret, p, N, 8000
+        )
         assert violations == [], f"Violations: {violations}"
 
     def test_single_sku_n1_serialized(self):
@@ -610,30 +760,35 @@ class TestHeuristicEdgeCases:
         N = {0: 1}
         sol = run_sgc(S, L, K, O, orders_req, rt, rt_ret, p, N, horizon=5000)
         violations = validate_solution(
-            sol, S, L, K, O, orders_req, rt, rt_ret, p, N, 5000)
+            sol, S, L, K, O, orders_req, rt, rt_ret, p, N, 5000
+        )
         assert violations == [], f"Single-SKU N=1 violations: {violations}"
 
     def test_every_pick_covered_by_exactly_one_bin_event(self):
         """Every (o, s, k) pick event must be covered by exactly one BinEvent presence."""
         sol, S, L, K, O, orders_req, rt, rt_ret, p, N = _run_small(
-            stations=1, lanes=2, orders=7, skus=4, seed=0)
+            stations=1, lanes=2, orders=7, skus=4, seed=0
+        )
         assert sol.feasible
         for (o, s_sel, k), (ps, pe) in sol.pick_events.items():
             covering = [
-                be for be in sol.bin_events.get(s_sel, [])
+                be
+                for be in sol.bin_events.get(s_sel, [])
                 if be.sku == k and be.presence_start <= ps and pe <= be.presence_end
             ]
             assert len(covering) == 1, (
-                f"Order {o} SKU {k} at S{s_sel} covered by {len(covering)} bin events (expected 1)")
+                f"Order {o} SKU {k} at S{s_sel} covered by {len(covering)} bin events (expected 1)"
+            )
 
     def test_validate_solution_passes_multi_station(self):
         """Multi-station run should satisfy all 7 checks in validate_solution."""
         sol, S, L, K, O, orders_req, rt, rt_ret, p, N = _run_small(
-            stations=3, lanes=2, orders=20, skus=8, seed=7,
-            horizon=5000, move_cap=4)
+            stations=3, lanes=2, orders=20, skus=8, seed=7, horizon=5000, move_cap=4
+        )
         assert sol.feasible
         violations = validate_solution(
-            sol, S, L, K, O, orders_req, rt, rt_ret, p, N, 5000, move_cap=4)
+            sol, S, L, K, O, orders_req, rt, rt_ret, p, N, 5000, move_cap=4
+        )
         assert violations == [], f"Multi-station violations: {violations}"
 
 
@@ -641,13 +796,18 @@ class TestHeuristicEdgeCases:
 # [P1-10] End-to-end SGC test
 # ============================================================
 
+
 class TestEndToEnd:
     @staticmethod
     def _generate_default():
         """Generate the default small test instance (seed=42)."""
         S, L, K, orders_req, rt, p, N = gen_v5(
-            num_stations=1, lanes_per_station=2, num_orders=7,
-            num_skus=5, seed=42, pick_touch_time=4,
+            num_stations=1,
+            lanes_per_station=2,
+            num_orders=7,
+            num_skus=5,
+            seed=42,
+            pick_touch_time=4,
         )
         rt_ret = dict(rt)
         O = sorted(orders_req.keys())
@@ -655,10 +815,11 @@ class TestEndToEnd:
 
     def test_feasible_and_valid(self):
         S, L, K, O, orders_req, rt, rt_ret, p, N = self._generate_default()
-        sol = run_sgc(S, L, K, O, orders_req, rt, rt_ret, p, N,
-                      horizon=2000)
+        sol = run_sgc(S, L, K, O, orders_req, rt, rt_ret, p, N, horizon=2000)
         assert sol.feasible
-        violations = validate_solution(sol, S, L, K, O, orders_req, rt, rt_ret, p, N, 2000)
+        violations = validate_solution(
+            sol, S, L, K, O, orders_req, rt, rt_ret, p, N, 2000
+        )
         assert violations == [], f"Violations: {violations}"
 
     def test_all_orders_assigned(self):
@@ -673,54 +834,79 @@ class TestEndToEnd:
 
     def test_with_movecap(self):
         S, L, K, O, orders_req, rt, rt_ret, p, N = self._generate_default()
-        sol = run_sgc(S, L, K, O, orders_req, rt, rt_ret, p, N,
-                      horizon=2000, move_cap=2)
+        sol = run_sgc(
+            S, L, K, O, orders_req, rt, rt_ret, p, N, horizon=2000, move_cap=2
+        )
         assert sol.feasible
-        violations = validate_solution(sol, S, L, K, O, orders_req, rt, rt_ret, p, N,
-                                       2000, move_cap=2)
+        violations = validate_solution(
+            sol, S, L, K, O, orders_req, rt, rt_ret, p, N, 2000, move_cap=2
+        )
         assert violations == [], f"Violations: {violations}"
 
     def test_multi_station(self):
         S, L, K, orders_req, rt, p, N = gen_v5(
-            num_stations=2, lanes_per_station=2, num_orders=7,
-            num_skus=5, seed=42, pick_touch_time=4,
+            num_stations=2,
+            lanes_per_station=2,
+            num_orders=7,
+            num_skus=5,
+            seed=42,
+            pick_touch_time=4,
         )
         rt_ret = dict(rt)
         O = sorted(orders_req.keys())
-        sol = run_sgc(S, L, K, O, orders_req, rt, rt_ret, p, N,
-                      horizon=2000, move_cap=3)
+        sol = run_sgc(
+            S, L, K, O, orders_req, rt, rt_ret, p, N, horizon=2000, move_cap=3
+        )
         assert sol.feasible
-        violations = validate_solution(sol, S, L, K, O, orders_req, rt, rt_ret, p, N,
-                                       2000, move_cap=3)
+        violations = validate_solution(
+            sol, S, L, K, O, orders_req, rt, rt_ret, p, N, 2000, move_cap=3
+        )
         assert violations == [], f"Violations: {violations}"
 
     def test_medium_instance(self):
         S, L, K, orders_req, rt, p, N = gen_v5(
-            num_stations=3, lanes_per_station=3, num_orders=40,
-            num_skus=20, seed=42, pick_touch_time=4,
+            num_stations=3,
+            lanes_per_station=3,
+            num_orders=40,
+            num_skus=20,
+            seed=42,
+            pick_touch_time=4,
         )
         rt_ret = dict(rt)
         O = sorted(orders_req.keys())
-        sol = run_sgc(S, L, K, O, orders_req, rt, rt_ret, p, N,
-                      horizon=10000, move_cap=4)
+        sol = run_sgc(
+            S, L, K, O, orders_req, rt, rt_ret, p, N, horizon=10000, move_cap=4
+        )
         assert sol.feasible
-        violations = validate_solution(sol, S, L, K, O, orders_req, rt, rt_ret, p, N,
-                                       10000, move_cap=4)
+        violations = validate_solution(
+            sol, S, L, K, O, orders_req, rt, rt_ret, p, N, 10000, move_cap=4
+        )
         assert violations == [], f"Violations: {violations}"
 
     def test_validate_warmstart_no_cp_violations(self):
         """After SGC, validate_warmstart should find no real constraint violations."""
         S, L, K, orders_req, rt, p, N = gen_v5(
-            num_stations=2, lanes_per_station=2, num_orders=10,
-            num_skus=6, seed=5, pick_touch_time=4,
+            num_stations=2,
+            lanes_per_station=2,
+            num_orders=10,
+            num_skus=6,
+            seed=5,
+            pick_touch_time=4,
         )
         rt_ret = dict(rt)
         O = sorted(orders_req.keys())
         sol = run_sgc(S, L, K, O, orders_req, rt, rt_ret, p, N, horizon=2000)
         assert sol.feasible
         _, handles = build_model(
-            S, L, K, orders_req, rt, p,
-            rt_return=rt_ret, horizon=2000, N=N,
+            S,
+            L,
+            K,
+            orders_req,
+            rt,
+            p,
+            rt_return=rt_ret,
+            horizon=2000,
+            N=N,
         )
         violations = validate_warmstart(sol, sol.pick_events, handles)
         # Only Symmetry(A) raw-lane warnings are acceptable; inject_warmstart remaps them.
@@ -730,27 +916,42 @@ class TestEndToEnd:
     def test_inject_warmstart_accepted_by_cp(self):
         """CP Optimizer should accept the inject_warmstart output as a valid starting point."""
         S, L, K, orders_req, rt, p, N = gen_v5(
-            num_stations=1, lanes_per_station=2, num_orders=5,
-            num_skus=4, seed=0, pick_touch_time=4,
+            num_stations=1,
+            lanes_per_station=2,
+            num_orders=5,
+            num_skus=4,
+            seed=0,
+            pick_touch_time=4,
         )
         rt_ret = dict(rt)
         O = sorted(orders_req.keys())
         sol = run_sgc(S, L, K, O, orders_req, rt, rt_ret, p, N, horizon=2000)
         assert sol.feasible
         mdl, handles = build_model(
-            S, L, K, orders_req, rt, p,
-            rt_return=rt_ret, horizon=2000, N=N,
+            S,
+            L,
+            K,
+            orders_req,
+            rt,
+            p,
+            rt_return=rt_ret,
+            horizon=2000,
+            N=N,
         )
         sp = inject_warmstart(sol, sol.pick_events, mdl, handles)
         mdl.set_starting_point(sp)
         cp_sol = mdl.solve(
-            Workers=1, TimeLimit=5, LogVerbosity="Quiet",
+            Workers=1,
+            TimeLimit=5,
+            LogVerbosity="Quiet",
             solve_with_search_next=False,
         )
         assert cp_sol is not None
         status = cp_sol.get_solve_status()
         # "Unknown" means timeout with no solution found — still acceptable (no crash or rejection).
-        assert status in ("Feasible", "Optimal", "Unknown"), f"Unexpected CP status: {status}"
+        assert status in ("Feasible", "Optimal", "Unknown"), (
+            f"Unexpected CP status: {status}"
+        )
 
 
 if __name__ == "__main__":

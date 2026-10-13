@@ -10,32 +10,11 @@ from autostore_heuristic import (
     Solution,
     commit_plan,
     earliest_feasible_fetch,
+    find_pick_slot,
     find_shared_bin,
     init_state,
     validate_solution,
 )
-
-
-def is_capacity_available(
-    existing_intervals: list[tuple[int, int]], p_start: int, p_end: int, pick_cap: int
-) -> bool:
-    events = [(p_start, 1), (p_end, -1)]
-    for s, e in existing_intervals:
-        # Only evaluate intervals that actually overlap with the proposed window
-        if max(s, p_start) < min(e, p_end):
-            events.append((s, 1))
-            events.append((e, -1))
-
-    # Sort chronologically. If times match, process ends (-1) before starts (+1)
-    events.sort(key=lambda x: (x[0], x[1]))
-
-    concurrent_picks = 0
-    for time_tick, change in events:
-        concurrent_picks += change
-        if concurrent_picks > pick_cap:
-            return False
-
-    return True
 
 
 def build_sku_order_index(orders_req: dict[int, list[int]]) -> dict[int, set[int]]:
@@ -114,32 +93,29 @@ def gap_filling_plan_order_at_station(
     local_intervals = list(state.pickface_intervals[s])
 
     for k in skus_sorted:
-        shared = find_shared_bin(state.station_bin_events[s], k, t_cursor, p)
+        shared, pick_start = find_shared_bin(
+            state.station_bin_events[s], k, t_cursor, p, pick_cap
+        )
         if shared is None:
             for ev in new_bin_events:
                 if ev.sku == k:
-                    start = max(t_cursor, ev.presence_start)
-                    if start + p[k] <= ev.presence_end:
-                        shared = ev
-                        break
+                    earliest = max(t_cursor, ev.presence_start)
+                    if earliest + p[k] <= ev.presence_end:
+                        slot = find_pick_slot(
+                            ev.pick_intervals, earliest, p[k], ev.presence_end, pick_cap
+                        )
+                        if slot is not None:
+                            shared = ev
+                            pick_start = slot
+                            break
 
         if shared is not None:
-            pick_start = max(t_cursor, shared.presence_start)
             pick_end = pick_start + p[k]
-
-            # Verify the newly proposed interval doesn't breach hand capacity
-            if is_capacity_available(
-                shared.pick_intervals, pick_start, pick_end, pick_cap
-            ):
-                t_cursor = pick_end
-                pick_times_dict[k] = (pick_start, pick_end)
-                shared_picks.append((k, shared, pick_end))
-                # Tentatively add it so subsequent SKUs in this order see the updated load
-                shared.pick_intervals.append((pick_start, pick_end))
-                continue
-            else:
-                # Capacity exceeded at this time-tick; reject sharing and force a new bin fetch
-                shared = None
+            shared.pick_intervals.append((pick_start, pick_end))
+            t_cursor = pick_end
+            pick_times_dict[k] = (pick_start, pick_end)
+            shared_picks.append((k, shared, pick_end))
+            continue
 
         desired_presence = max(t_cursor, rt[k])
 
@@ -379,7 +355,16 @@ def run_rdi_sgc(instance, *args, **kwargs) -> Solution:
     batch_start_time = kwargs.get("batch_start_time", 0)
 
     state = init_state(
-        S, L, K, N, horizon, move_cap, exo_lanes, exo_blocks, exo_moves, batch_start_time
+        S,
+        L,
+        K,
+        N,
+        horizon,
+        move_cap,
+        exo_lanes,
+        exo_blocks,
+        exo_moves,
+        batch_start_time,
     )
 
     demand_count = defaultdict(int)

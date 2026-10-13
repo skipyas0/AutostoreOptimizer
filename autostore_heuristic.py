@@ -249,28 +249,107 @@ def static_priority_sort(orders_req: dict[int, list[int]], O: list[int]) -> list
     return sorted(O, key=sharing_degree, reverse=False)
 
 
+# ------ [P1-1.5] is_capacity_available ------
+
+
+def is_capacity_available(
+    existing_intervals: list[tuple[int, int]], p_start: int, p_end: int, pick_cap: int
+) -> bool:
+    """Check whether adding [p_start, p_end) would exceed pick_cap concurrent picks."""
+    events = [(p_start, 1), (p_end, -1)]
+    for s, e in existing_intervals:
+        # Only evaluate intervals that actually overlap with the proposed window
+        if max(s, p_start) < min(e, p_end):
+            events.append((s, 1))
+            events.append((e, -1))
+
+    # Sort chronologically. If times match, process ends (-1) before starts (+1)
+    events.sort(key=lambda x: (x[0], x[1]))
+
+    concurrent_picks = 0
+    for _time_tick, change in events:
+        concurrent_picks += change
+        if concurrent_picks > pick_cap:
+            return False
+
+    return True
+
+
+def find_pick_slot(
+    existing_intervals: list[tuple[int, int]],
+    earliest_start: int,
+    duration: int,
+    presence_end: int,
+    pick_cap: int,
+) -> int | None:
+    """Find earliest start >= earliest_start where a pick of `duration` fits
+    within `presence_end` without exceeding `pick_cap` at any time tick.
+
+    Returns the feasible pick_start or None if no such slot exists.
+    """
+    candidate = earliest_start
+    while candidate + duration <= presence_end:
+        if is_capacity_available(
+            existing_intervals, candidate, candidate + duration, pick_cap
+        ):
+            return candidate
+        # Slide past the earliest interval end that overlaps our candidate window
+        next_candidate = presence_end
+        for s, e in existing_intervals:
+            if max(s, candidate) < min(e, candidate + duration):
+                next_candidate = min(next_candidate, e)
+        if next_candidate <= candidate:
+            break  # no progress — should not happen
+        candidate = next_candidate
+    return None
+
+
 # ------ [P1-2] find_shared_bin ------
 
 
 def find_shared_bin(
-    station_bin_events: list[BinEvent], k: int, t_cursor: int, p: dict[int, int]
-) -> BinEvent | None:
-    """Find an existing BinEvent at a station for SKU k whose presence covers t_cursor."""
-    # We can use a bin even if it arrives AFTER t_cursor (we just wait for it).
-    # We prefer the earliest-starting feasible bin that can fit us.
+    station_bin_events: list[BinEvent],
+    k: int,
+    t_cursor: int,
+    p: dict[int, int],
+    pick_cap: int | None = None,
+) -> tuple[BinEvent | None, int | None]:
+    """Find an existing BinEvent for SKU k whose presence can cover a pick.
+
+    When pick_cap is provided, also ensures the pick fits without exceeding
+    hand capacity — sliding the pick_start later within the same bin presence
+    if needed, rather than rejecting the shared bin outright.
+
+    Returns (bin_event, pick_start) or (None, None).
+    """
     best_ev = None
     best_start = float("inf")
 
     for ev in station_bin_events:
-        if ev.sku == k:
-            # Can we fit a pick of duration? Not passed here, but let's assume caller checks fit.
-            start = max(t_cursor, ev.presence_start)
-            # Check if the pick fits within the bin presence
-            if start + p[k] <= ev.presence_end:
-                if start < best_start:
-                    best_ev = ev
-                    best_start = start
-    return best_ev
+        if ev.sku != k:
+            continue
+
+        earliest = max(t_cursor, ev.presence_start)
+        if earliest + p[k] > ev.presence_end:
+            continue
+
+        if pick_cap is not None:
+            slot = find_pick_slot(
+                ev.pick_intervals, earliest, p[k], ev.presence_end, pick_cap
+            )
+            if slot is None:
+                continue
+            candidate_start = slot
+        else:
+            candidate_start = earliest
+
+        if candidate_start < best_start:
+            best_ev = ev
+            best_start = candidate_start
+
+    if best_ev is None:
+        return (None, None)
+    return (best_ev, best_start)
 
 
 # ------ [P1-3] earliest_feasible_fetch ------
@@ -371,7 +450,9 @@ def plan_order_at_station(
     for k in skus_sorted:
         # --- Try shared bin first ---
         # 1. Look in existing bin events from prior orders
-        shared = find_shared_bin(state.station_bin_events[s], k, t_cursor, p)
+        shared, pick_start = find_shared_bin(
+            state.station_bin_events[s], k, t_cursor, p
+        )
 
         # 2. Look in bin events created by *this* order
         if shared is None:
@@ -380,12 +461,13 @@ def plan_order_at_station(
                     start = max(t_cursor, ev.presence_start)
                     if start + p[k] <= ev.presence_end:
                         shared = ev
+                        pick_start = start
                         break
 
         if shared is not None:
-            pick_start = max(t_cursor, shared.presence_start)
             pick_end = pick_start + p[k]
 
+            shared.pick_intervals.append((pick_start, pick_end))
             t_cursor = pick_end
             pick_times_dict[k] = (pick_start, pick_end)
             shared_picks.append((k, shared, pick_end))
@@ -545,16 +627,16 @@ def init_state(
     """Build initial HeuristicState respecting locked resources and start time."""
     lane_free = {(s, ln): batch_start_time for s in S for ln in L}
     pickface_free = {s: batch_start_time for s in S}
-    
+
     move_da = DifferenceArray(horizon)
     if exo_moves:
         for st, en in exo_moves:
-            st = max(0, min(horizon-1, int(st)))
-            en = max(0, min(horizon-1, int(en)))
+            st = max(0, min(horizon - 1, int(st)))
+            en = max(0, min(horizon - 1, int(en)))
             if st < en:
                 move_da.add_move(st, en)
     move_da.build_prefix()
-    
+
     bin_pools = {k: BinCopyPool(k, N[k]) for k in K}
     for pool in bin_pools.values():
         pool._heap = [(batch_start_time, i) for i in range(pool.n_copies)]
@@ -575,7 +657,9 @@ def init_state(
     if exo_lanes:
         for (s, ln), intervals in exo_lanes.items():
             if (s, ln) in lane_intervals:
-                lane_intervals[(s, ln)] = sorted([(st, en) for st, en in intervals if st < horizon])
+                lane_intervals[(s, ln)] = sorted(
+                    [(st, en) for st, en in intervals if st < horizon]
+                )
 
     return HeuristicState(
         lane_free=lane_free,
