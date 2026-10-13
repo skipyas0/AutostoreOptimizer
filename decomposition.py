@@ -589,6 +589,77 @@ def solve_2d_decomposition_spatial_first(instance, n_time_batches=5):
 
     return stitch_heuristic_solutions(subsolutions)
 
+def solve_rl_decomposition(instance, weights_path="rl_agent_weights_multicomponent_rew3.pth", device=None):
+    import torch
+    from rl_order_assignment import OrderGraphGNN, OrderAssignmentAgent
+    from instance import Instance
+    from heuristic_rdi_sgc import run_rdi_sgc
+    if device is None:
+        if torch.backends.mps.is_available():
+            device = torch.device("mps")
+        elif torch.cuda.is_available():
+            device = torch.device("cuda")
+        else:
+            device = torch.device("cpu")
+    hidden_dim = 64
+    mlp_hidden = 128
+    max_stations = 20
+    
+    gnn = OrderGraphGNN(hidden_dim=hidden_dim, num_layers=2)
+    agent = OrderAssignmentAgent(gnn, hidden_dim=hidden_dim, max_stations=max_stations, mlp_hidden=mlp_hidden).to(device)
+    try:
+        agent.load_state_dict(torch.load(weights_path, map_location=device))
+        print(f"Loaded RL weights from {weights_path} to {device}")
+    except FileNotFoundError:
+        print(f"Warning: {weights_path} not found. Using untrained RL agent.")
+        
+    agent.eval()
+    hetero_data = instance.create_order_graph().to(device)
+    instance_stats = {
+        'num_stations': len(instance.S),
+        'total_used_skus': instance.stats['used_skus'],
+        'movecap': instance.movecap
+    }
+    
+    order_num_skus = torch.tensor([len(instance.orders_req[o]) for o in instance.O], dtype=torch.float, device=device)
+    
+    with torch.no_grad():
+        actions, _, _ = agent(hetero_data, instance_stats, order_num_skus)
+        
+    station_assignments = {s: [] for s in range(len(instance.S))}
+    for o_idx, s_idx in enumerate(actions):
+        s_idx = min(s_idx, len(instance.S) - 1)
+        station_assignments[s_idx].append(instance.O[o_idx])
+        
+    subsolutions = []
+    print("6")
+    for i, s_idx in enumerate(instance.S):
+        assigned_orders = station_assignments[i]
+        print(f"Solving station {s_idx} with {len(assigned_orders)} orders...")
+        if not assigned_orders:
+            continue
+            
+        per_station_movecap = instance.movecap // len(instance.S) if instance.movecap else None
+        
+        subinstance = Instance(
+            [s_idx],
+            instance.L,
+            instance.K,
+            {o: instance.orders_req[o] for o in assigned_orders},
+            instance.rt,
+            instance.p,
+            instance.N,
+            per_station_movecap,
+            instance.seed,
+            instance.rt_ret,
+            instance.pickcap,
+        )
+        
+        heur_sol = run_rdi_sgc(subinstance, horizon=50000, batch_start_time=0)
+        if heur_sol:
+            subsolutions.append(heur_sol)
+            
+    return stitch_heuristic_solutions(subsolutions)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -673,7 +744,7 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--decomposition-type",
-        choices=["temporal", "spatial", "2d_temporal", "2d_spatial"],
+        choices=["temporal", "spatial", "2d_temporal", "2d_spatial", "rl"],
     )
 
     parser.add_argument("--pick", type=int, default=4, help="Pick touch time")
@@ -765,6 +836,9 @@ if __name__ == "__main__":
 
     elif decomp == "2d_temporal":
         stitched_sol = solve_2d_decomposition(instance, n_time_batches=n_batches_2d)
+        
+    elif decomp == "rl":
+        stitched_sol = solve_rl_decomposition(instance)
     else:
         raise ValueError
 

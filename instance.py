@@ -1,7 +1,11 @@
+from itertools import product
+from manim.animation import transform_matching_parts
+from collections import defaultdict
 import pickle
 from typing import Any
-
 import numpy as np
+from torch_geometric.data import HeteroData
+import torch
 
 from constants import PARAM_LEVELS, REFERENCE_CONFIG
 from jaccard_similarity import (
@@ -24,7 +28,7 @@ class Instance:
         movecap: int,
         seed: int,
         rt_ret: dict[int, int] | None = None,
-        pickcap: int = 2,
+        pickcap: int = 1,
     ):
         self.S = S
         self.L = L
@@ -37,6 +41,17 @@ class Instance:
         self._movecap = movecap
         self._pickcap = pickcap
         self._seed = seed
+
+        all_skus = np.concatenate(
+            [np.array(reqs) for reqs in self._orders_requirements.values()]
+        )
+        self.unique_skus, self.sku_freq_vals = np.unique(all_skus, return_counts=True)
+
+        self.sku_to_orders_map = defaultdict(list)
+        for o, req in self.orders_requirements.items():
+            for k in req:
+                self.sku_to_orders_map[k].append(o)
+
         self.stats = self.get_statistics()
         self.features = self.get_features()
 
@@ -91,28 +106,26 @@ class Instance:
         # Convert to numpy arrays for vectorized operations
         order_sizes = np.array([len(v) for v in self._orders_requirements.values()])
         rt_vals = np.array(list(self.rt.values()))
+        rt_ret_vals = np.array(list(self.rt_ret.values()))
         p_vals = np.array(list(self.p.values()))
         n_vals = np.array(list(self.N.values()))
 
         # SKU frequency across orders (demand for SKUs) via flat array
-        all_skus = np.concatenate(
-            [np.array(reqs) for reqs in self._orders_requirements.values()]
-        )
-        unique_skus, sku_freq_vals = np.unique(all_skus, return_counts=True)
+        
 
         # Order time intensities (how long would unparallelized orders take)
-        rt2p = rt_vals * 2 + p_vals
+        rt2p = rt_vals + rt_ret_vals + p_vals
         order_times_list = np.array(
             [rt2p[list(reqs)].sum() for reqs in self._orders_requirements.values()]
         )
 
-        used_skus_mask = np.isin(np.array(self.K), unique_skus)
+        used_skus_mask = np.isin(np.array(self.K), self.unique_skus)
         used_skus = list(np.array(self.K)[used_skus_mask])
         unused_skus = len(self.K) - len(used_skus)
 
         # Pareto checks for top x% of SKUs
-        total_picks = sku_freq_vals.sum()
-        sku_freq_sorted = np.sort(sku_freq_vals)[::-1]  # descending
+        total_picks = self.sku_freq_vals.sum()
+        sku_freq_sorted = np.sort(self.sku_freq_vals)[::-1]  # descending
         cumsum = np.cumsum(sku_freq_sorted)
 
         percentages = [1, 5, 10, 20, 30, 40, 50, 75]
@@ -143,7 +156,7 @@ class Instance:
 
         # Supply (number of bins per SKU) and demand (number of orders per SKU)
         supply = n_vals[np.array(used_skus, dtype=int)]
-        demand = sku_freq_vals
+        demand = self.sku_freq_vals
 
         supply_demand_ratios = supply / demand
         supply_demand_ratio_min = float(supply_demand_ratios.min())
@@ -153,7 +166,7 @@ class Instance:
         supply_demand_ratio_stdev = float(np.sqrt(((supply - demand) ** 2).mean()))
 
         # Movecap
-        movecap_norm = self.movecap / 60
+        movecap_norm = (self.movecap / 100) if self.movecap is not None else 0.0
         movecap_norm_per_lane = movecap_norm / (len(self.S) * len(self.L))
 
         return {
@@ -193,14 +206,14 @@ class Instance:
             "n_mean": float(n_vals.mean()) if len(n_vals) else 0.0,
             "n_median": float(np.median(n_vals)) if len(n_vals) else 0.0,
             "n_stdev": float(n_vals.std(ddof=0)) if len(n_vals) else 0.0,
-            "sku_freq_min": float(sku_freq_vals.min()) if len(sku_freq_vals) else 0,
-            "sku_freq_max": float(sku_freq_vals.max()) if len(sku_freq_vals) else 0,
-            "sku_freq_mean": float(sku_freq_vals.mean()) if len(sku_freq_vals) else 0.0,
-            "sku_freq_median": float(np.median(sku_freq_vals))
-            if len(sku_freq_vals)
+            "sku_freq_min": float(demand.min()) if len(demand) else 0,
+            "sku_freq_max": float(demand.max()) if len(demand) else 0,
+            "sku_freq_mean": float(demand.mean()) if len(demand) else 0.0,
+            "sku_freq_median": float(np.median(demand))
+            if len(demand)
             else 0.0,
-            "sku_freq_stdev": float(sku_freq_vals.std(ddof=0))
-            if len(sku_freq_vals)
+            "sku_freq_stdev": float(demand.std(ddof=0))
+            if len(demand)
             else 0.0,
             "pareto_ratios": pareto_ratios,
             "avg_jaccard_weighted": avg_jaccard_w,
@@ -358,3 +371,132 @@ class Instance:
 
     def __len__(self):
         return 7
+
+    
+    def create_order_graph(self): 
+        from jaccard_similarity import build_similarity_matrix, compute_demand_count
+        
+        O = self.O
+        K = self.K
+        
+        o_to_idx = {o: i for i, o in enumerate(O)}
+        k_to_idx = {k: i for i, k in enumerate(K)}
+        
+        sim_weighted, sim_unweighted = build_similarity_matrix(
+            O, self.orders_req, self.rt, self.rt_ret, normalize=False
+        )
+        demand_count = compute_demand_count(self.orders_req, K)
+        
+        # Order features
+        order_features = []
+        for o in O:
+            reqs = self.orders_req[o]
+            num_items = len(reqs)
+            
+            overlaps_w = []
+            overlaps_unw = []
+            for other_o in O:
+                if o == other_o:
+                    continue
+                key = (o, other_o) if o < other_o else (other_o, o)
+                overlaps_w.append(sim_weighted[key])
+                overlaps_unw.append(sim_unweighted[key])
+                
+            overlaps_w = np.array(overlaps_w)
+            overlaps_unw = np.array(overlaps_unw)
+            
+            non_zero_overlap = (overlaps_unw > 0).sum()
+            avg_w = overlaps_w.mean() if len(overlaps_w) > 0 else 0.0
+            avg_unw = overlaps_unw.mean() if len(overlaps_unw) > 0 else 0.0
+            std_w = overlaps_w.std(ddof=0) if len(overlaps_w) > 0 else 0.0
+            std_unw = overlaps_unw.std(ddof=0) if len(overlaps_unw) > 0 else 0.0
+            
+            total_cycle_time = sum(self.rt[k] + self.p[k] + self.rt_ret[k] for k in reqs)
+            
+            order_features.append([
+                num_items,
+                non_zero_overlap,
+                avg_w,
+                avg_unw,
+                std_w,
+                std_unw,
+                total_cycle_time
+            ])
+            
+        order_x = torch.tensor(order_features, dtype=torch.float)
+        order_x = torch.log1p(order_x)
+        order_mean = order_x.mean(dim=0, keepdim=True)
+        order_std = order_x.std(dim=0, keepdim=True)
+        order_std[order_std == 0] = 1.0
+        order_x = (order_x - order_mean) / order_std
+        
+        # Bin (SKU) features
+        bin_features = []
+        for k in K:
+            demand = demand_count.get(k, 0)
+            supply = self.N.get(k, 0)
+            sup_dem_ratio = supply / demand if demand > 0 else float(supply)
+            rt = self.rt.get(k, 0)
+            p = self.p.get(k, 0)
+            rt_ret = self.rt_ret.get(k, 0)
+            
+            bin_features.append([
+                demand,
+                supply,
+                sup_dem_ratio,
+                rt,
+                p,
+                rt_ret
+            ])
+            
+        bin_x = torch.tensor(bin_features, dtype=torch.float)
+        bin_x = torch.log1p(bin_x)
+        bin_mean = bin_x.mean(dim=0, keepdim=True)
+        bin_std = bin_x.std(dim=0, keepdim=True)
+        bin_std[bin_std == 0] = 1.0
+        bin_x = (bin_x - bin_mean) / bin_std
+        
+        # Global node features
+        global_features = [list(self.features.values())]
+        global_x = torch.tensor(global_features, dtype=torch.float)
+        
+        # Edges
+        order_bin_src = []
+        order_bin_dst = []
+        for o in O:
+            for k in self.orders_req[o]:
+                order_bin_src.append(o_to_idx[o])
+                order_bin_dst.append(k_to_idx[k])
+                
+        edge_index_order_bin = torch.tensor([order_bin_src, order_bin_dst], dtype=torch.long)
+        edge_index_bin_order = torch.tensor([order_bin_dst, order_bin_src], dtype=torch.long)
+        
+        edge_index_global_order = torch.tensor(
+            [[0] * len(O), list(range(len(O)))], dtype=torch.long
+        )
+        edge_index_order_global = torch.tensor(
+            [list(range(len(O))), [0] * len(O)], dtype=torch.long
+        )
+        
+        edge_index_global_bin = torch.tensor(
+            [[0] * len(K), list(range(len(K)))], dtype=torch.long
+        )
+        edge_index_bin_global = torch.tensor(
+            [list(range(len(K))), [0] * len(K)], dtype=torch.long
+        )
+        
+        data = HeteroData()
+        data['order'].x = order_x
+        data['bin'].x = bin_x
+        data['global'].x = global_x
+        
+        data['order', 'requires', 'bin'].edge_index = edge_index_order_bin
+        data['bin', 'required_by', 'order'].edge_index = edge_index_bin_order
+        
+        data['global', 'connected_to', 'order'].edge_index = edge_index_global_order
+        data['order', 'connected_to', 'global'].edge_index = edge_index_order_global
+        
+        data['global', 'connected_to', 'bin'].edge_index = edge_index_global_bin
+        data['bin', 'connected_to', 'global'].edge_index = edge_index_bin_global
+        
+        return data
