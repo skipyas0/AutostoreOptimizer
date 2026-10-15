@@ -50,23 +50,32 @@ def get_associated_indices(handles, solution, selection_result):
     active_s = set(selection_result.seed_stations)
     active_k = set(selection_result.seed_skus)
     active_e = set()
-
+    JUST_ADD_ALL_STATIONS = True
+    
+    if JUST_ADD_ALL_STATIONS:
+        active_s = set(handles["S"])
+        
     # Map SKUs to orders which need them and to stations these orders are mapped to:
     # Don't add to active_o now to avoid snowballing
     temp_o = set()
     for k in list(active_k):
         temp_o.update(handles["orders_demanding_sku"][k])
-    for o in list(temp_o):
-        s_assigned = get_assigned_station(handles, solution, o)
-        if s_assigned is not None:
-            active_s.add(s_assigned)
+    if not JUST_ADD_ALL_STATIONS:
+        for o in list(temp_o):
+            s_assigned = get_assigned_station(handles, solution, o)
+            if s_assigned is not None:
+                active_s.add(s_assigned)
 
     # Map orders to their required SKUs and assigned stations
     for o in list(active_o):
         active_k.update(handles["orders_req"][o])
-        s_assigned = get_assigned_station(handles, solution, o)
-        if s_assigned is not None:
-            active_s.add(s_assigned)
+        if not JUST_ADD_ALL_STATIONS:
+            s_assigned = get_assigned_station(handles, solution, o)
+            if s_assigned is not None:
+                active_s.add(s_assigned)
+
+
+
 
     # Add orders from first step now
     active_o.update(temp_o)
