@@ -17,7 +17,7 @@ def build_model(
     exo_blocks: dict = None,  # sku -> list of (start, end)
     exo_moves: list = None,  # list of (start, end) for F/R moves):
     batch_start_time: int = 0,
-    objective_func: str = "movecap",
+    objective_func: str = "makespan",
 ):
     """
     Intervals per (s,k,e):
@@ -281,7 +281,7 @@ def build_model(
         mdl.add(mdl.if_then(is_used[s] == 1, shift_len[s] == s_end - s_start))
         mdl.add(mdl.if_then(is_used[s] == 0, shift_len[s] == 0))
 
-    #     # Bind station_shift_cost: 0 if unused, max(300, shift_len[s]) if used
+        #     # Bind station_shift_cost: 0 if unused, max(300, shift_len[s]) if used
         mdl.add(mdl.if_then(is_used[s] == 0, station_shift_cost[s] == 0))
         mdl.add(
             mdl.if_then(
@@ -388,13 +388,23 @@ def build_model(
         station_span = mdl.interval_var(optional=True, name=f"station_span_{s}")
         mdl.add(mdl.span(station_span, [I_os[(o, s)] for o in O]))
         station_spans.append(station_span)
-        
-        sum_pick_durations = mdl.sum(mdl.size_of(P[(o, s, k, e)]) for o in O for k in orders_req[o] for e in range(U[k]))
+
+        sum_pick_durations = mdl.sum(
+            mdl.size_of(P[(o, s, k, e)])
+            for o in O
+            for k in orders_req[o]
+            for e in range(U[k])
+        )
         station_idles.append(mdl.length_of(station_span) - sum_pick_durations)
-        
-        pick_count = mdl.sum(mdl.presence_of(P[(o, s, k, e)]) for o in O for k in orders_req[o] for e in range(U[k]))
+
+        pick_count = mdl.sum(
+            mdl.presence_of(P[(o, s, k, e)])
+            for o in O
+            for k in orders_req[o]
+            for e in range(U[k])
+        )
         station_pick_counts.append(pick_count)
-        
+
     idle_time = mdl.sum(station_idles)
     max_picks = mdl.max(station_pick_counts)
 
