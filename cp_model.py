@@ -260,35 +260,35 @@ def build_model(
     # # (4) Fairness constraints with "Empty Station" Alternative
 
     # --- (A) Shift Length Fairness ---
-    # MIN_SHIFT_DURATION = 900  # 5-minute minimum block (ticks)
+    MIN_SHIFT_DURATION = 900  # 15-minute minimum block (ticks)
 
-    # is_used = {}
-    # shift_len = {}
-    # station_shift_cost = {}
+    is_used = {}
+    shift_len = {}
+    station_shift_cost = {}
 
-    # for s in S:
-    #     # Station is used (1) if at least one order is assigned to it, else (0)
-    #     is_used[s] = mdl.max([mdl.presence_of(I_os[(o, s)]) for o in O])
+    for s in S:
+        # Station is used (1) if at least one order is assigned to it, else (0)
+        is_used[s] = mdl.max([mdl.presence_of(I_os[(o, s)]) for o in O])
 
-    #     # Shift bounds (default values protect absent intervals from corrupting min/max)
-    #     s_start = mdl.min([mdl.start_of(I_os[(o, s)], horizon) for o in O])
-    #     s_end = mdl.max([mdl.end_of(I_os[(o, s)], 0) for o in O])
+        # Shift bounds (default values protect absent intervals from corrupting min/max)
+        s_start = mdl.min([mdl.start_of(I_os[(o, s)], horizon) for o in O])
+        s_end = mdl.max([mdl.end_of(I_os[(o, s)], 0) for o in O])
 
-    #     shift_len[s] = mdl.integer_var(0, horizon, name=f"shift_len_{s}")
-    #     station_shift_cost[s] = mdl.integer_var(0, horizon, name=f"shift_cost_{s}")
+        shift_len[s] = mdl.integer_var(0, horizon, name=f"shift_len_{s}")
+        station_shift_cost[s] = mdl.integer_var(0, horizon, name=f"shift_cost_{s}")
 
-    #     # Bind shift_len: strictly 0 if unused, (s_end - s_start) if used
-    #     mdl.add(mdl.if_then(is_used[s] == 1, shift_len[s] == s_end - s_start))
-    #     mdl.add(mdl.if_then(is_used[s] == 0, shift_len[s] == 0))
+        # Bind shift_len: strictly 0 if unused, (s_end - s_start) if used
+        mdl.add(mdl.if_then(is_used[s] == 1, shift_len[s] == s_end - s_start))
+        mdl.add(mdl.if_then(is_used[s] == 0, shift_len[s] == 0))
 
     #     # Bind station_shift_cost: 0 if unused, max(300, shift_len[s]) if used
-    #     mdl.add(mdl.if_then(is_used[s] == 0, station_shift_cost[s] == 0))
-    #     mdl.add(
-    #         mdl.if_then(
-    #             is_used[s] == 1,
-    #             station_shift_cost[s] == mdl.max(MIN_SHIFT_DURATION, shift_len[s]),
-    #         )
-    #     )
+        mdl.add(mdl.if_then(is_used[s] == 0, station_shift_cost[s] == 0))
+        mdl.add(
+            mdl.if_then(
+                is_used[s] == 1,
+                station_shift_cost[s] == mdl.max(MIN_SHIFT_DURATION, shift_len[s]),
+            )
+        )
 
     # # Calculate max and min lengths (ignoring empty stations by adding horizon to their min)
     # max_len = mdl.max([shift_len[s] for s in S])
@@ -365,10 +365,8 @@ def build_model(
                 mdl.add(mdl.end_of(I_os[(o, s)]) <= horizon)
 
     # --- objective (station wages) ---
-    # total_wages = mdl.sum(station_shift_cost[s] for s in S)
+    total_wages = mdl.sum(station_shift_cost[s] for s in S)
     # Optional tie-breaker: prioritize lower makespan among equal-wage schedules
-    # total_obj = total_wages
-    # mdl.minimize(total_obj)
 
     # --- objective (makespan over station windows) ---
     per_order_end = [mdl.max([mdl.end_of(I_os[(o, s)]) for s in S]) for o in O]
@@ -405,7 +403,7 @@ def build_model(
     mdl.add_kpi(total_flow_time, "total_flow_time")
     mdl.add_kpi(idle_time, "idle_time")
     mdl.add_kpi(max_picks, "max_picks")
-
+    mdl.add_kpi(total_wages, "station_wages")
     if objective_func == "bin_fetches":
         mdl.minimize(num_bin_fetches)
     elif objective_func == "makespan":
@@ -416,6 +414,8 @@ def build_model(
         mdl.minimize(idle_time)
     elif objective_func == "max_picks":
         mdl.minimize(max_picks)
+    elif objective_func == "total_wages":
+        mdl.minimize(total_wages)
     else:
         raise ValueError(f"Unknown objective function: {objective_func}")
 

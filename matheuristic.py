@@ -167,6 +167,8 @@ class Solver:
                 self.cycling_schedule.append("idle_time")
             elif phase == 'p':
                 self.cycling_schedule.append("max_picks")
+            elif phase == 'w':
+                self.cycling_schedule.append("total_wages")
             else:
                 raise ValueError(phase)
             
