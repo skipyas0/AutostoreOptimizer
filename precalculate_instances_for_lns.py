@@ -109,6 +109,7 @@ def precalculate_config(config):
                 log_output=cp_log,
                 solve_with_search_next=True,
                 RandomSeed=seed,
+                Workers=config["workers"],
             )
             cp_log.flush()
 
@@ -172,7 +173,11 @@ def main():
         "--time-limit", type=int, default=3600, help="CP solver time limit in seconds"
     )
     parser.add_argument(
-        "--gen-seed", type=int, default=42, help="Random seed for data generation"
+        "--gen-seeds",
+        type=int,
+        nargs="+",
+        default=[42],
+        help="List of random seeds for data generation",
     )
     parser.add_argument(
         "--cp-seeds",
@@ -254,11 +259,11 @@ def main():
     parser.add_argument("--max-bins", type=int, default=8)
 
     parser.add_argument("--grid-depth", type=int, default=16)
-
+    parser.add_argument("--workers", type=int, default=1)
     args = parser.parse_args()
 
     TIME_LIMIT = args.time_limit
-    GEN_SEED = args.gen_seed
+    GEN_SEEDS = args.gen_seeds
     CP_SEEDS = args.cp_seeds
     STATIONS = args.stations
     LANES = args.lanes
@@ -267,7 +272,8 @@ def main():
     MOVECAPS = args.movecaps
 
     total = (
-        len(CP_SEEDS)
+        len(GEN_SEEDS)
+        * len(CP_SEEDS)
         * len(STATIONS)
         * len(LANES)
         * len(SKUS)
@@ -280,10 +286,12 @@ def main():
         f"Will be done at: {(dt.datetime.now() + dt.timedelta(seconds=total * TIME_LIMIT)).strftime('%d.%m.%Y %H:%M:%S')}"
     )
     print(
-        f"Precalculating configs: {TIME_LIMIT=} {GEN_SEED=} {CP_SEEDS=} {STATIONS=} {LANES=} {SKUS=} {ORDERS=} {MOVECAPS=}"
+        f"Precalculating configs: {TIME_LIMIT=} {GEN_SEEDS=} {CP_SEEDS=} {STATIONS=} {LANES=} {SKUS=} {ORDERS=} {MOVECAPS=}"
     )
 
-    for s, l, k, o, m in product(STATIONS, LANES, SKUS, ORDERS, MOVECAPS):
+    for gen_seed, s, l, k, o, m in product(
+        GEN_SEEDS, STATIONS, LANES, SKUS, ORDERS, MOVECAPS
+    ):
         config = {
             "stations": s,
             "lanes": l,
@@ -300,12 +308,13 @@ def main():
             "bin_model": args.bin_model,
             "max_bins": args.max_bins,
             "grid_depth": args.grid_depth,
-            "gen_seed": GEN_SEED,
+            "gen_seed": gen_seed,
             "cp_seeds": CP_SEEDS,
             "horizon": 10000,
             "alpha": 1.0,
             "beta": 1.0,
             "time_limit": TIME_LIMIT,
+            "workers": args.workers,
         }
 
         print("This config:", config)
