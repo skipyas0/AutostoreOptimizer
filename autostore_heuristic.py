@@ -45,7 +45,8 @@ class OrderPlan:
     start: int
     end: int
     bin_events: list[BinEvent]  # new bin events created
-    shared_picks: list[tuple[int, BinEvent, int]]  # (sku, bin_event, pick_end)
+    # (sku, bin_event, pick_start, pick_end, new_return_start, new_return_end)
+    shared_picks: list[tuple[int, BinEvent, int, int, int, int]]
     score: float = float("inf")
     pick_times: dict[int, tuple[int, int]] = field(
         default_factory=dict
@@ -127,8 +128,9 @@ class DifferenceArray:
         duration: int,
         cap: int,
         pending_moves: list[tuple[int, int]],
+        removed_moves: list[tuple[int, int]] | None = None,
     ) -> int:
-        """Like delay_for_movecap but also accounts for uncommitted pending moves."""
+        """Like delay_for_movecap but also accounts for uncommitted pending/removed moves."""
         if cap is None:
             return t_start
         if self._dirty:
@@ -140,6 +142,10 @@ class DifferenceArray:
             ok = True
             for i in range(t, t + duration):
                 total = self.prefix[i]
+                if removed_moves:
+                    for rs, re in removed_moves:
+                        if rs <= i < re:
+                            total -= 1
                 for ms, me in pending_moves:
                     if ms <= i < me:
                         total += 1
@@ -171,10 +177,10 @@ class BinCopyPool:
         return self._heap[0]
 
     def commit(self, copy_id: int, return_end: int) -> None:
-        """Update copy_id's availability to return_end after committing a bin event."""
+        """Update copy_id's availability to max(current, return_end) after committing."""
         for i, (t, cid) in enumerate(self._heap):
             if cid == copy_id:
-                self._heap[i] = (return_end, copy_id)
+                self._heap[i] = (max(t, return_end), copy_id)
                 heapq.heapify(self._heap)
                 return
         raise ValueError(f"copy_id {copy_id} not found in pool for SKU {self.sku}")
@@ -307,52 +313,172 @@ def find_pick_slot(
 # ------ [P1-2] find_shared_bin ------
 
 
+def _can_extend_bin_event(
+    ev: BinEvent,
+    station: int,
+    req_presence_end: int,
+    state: HeuristicState,
+    rt_ret: dict[int, int],
+    horizon: int,
+    local_pickface_intervals: list[tuple[int, int]],
+    pending_moves: list[tuple[int, int]],
+    pending_copies: dict[int, list[tuple[int, int]]],
+    curr_pres_end: int,
+    curr_ret_end: int,
+    removed_moves: list[tuple[int, int]] | None = None,
+) -> tuple[int, int] | None:
+    """Check if `ev` can extend its presence_end to at least `req_presence_end`.
+    Returns (new_return_start, new_return_end) or None if infeasible.
+    """
+    k = ev.sku
+    ret_dur = rt_ret[k]
+
+    # Build effective pending/removed moves excluding ev's current return move
+    eff_pending = [
+        (ms, me) for (ms, me) in pending_moves if not (ms == curr_pres_end and me == curr_ret_end)
+    ]
+    eff_removed = list(removed_moves) if removed_moves else []
+    if ev in state.station_bin_events[station]:
+        orig_ret = (ev.return_start, ev.return_end)
+        if orig_ret not in eff_removed:
+            eff_removed.append(orig_ret)
+
+    new_ret_start = req_presence_end
+    if state.move_cap is not None:
+        new_ret_start = state.move_da.delay_for_movecap_with_pending(
+            req_presence_end, ret_dur, state.move_cap, eff_pending, eff_removed
+        )
+
+    new_ret_end = new_ret_start + ret_dur
+    if new_ret_end > horizon:
+        return None
+
+    # Check pickface no-overlap for the extended presence [ev.presence_start, new_ret_start)
+    for iv_s, iv_e in local_pickface_intervals:
+        if iv_s == ev.presence_start and iv_e == curr_pres_end:
+            continue
+        if max(ev.presence_start, iv_s) < min(new_ret_start, iv_e):
+            return None
+
+    # Check that no subsequent bin event using the same (sku, copy_id) starts fetching before new_ret_end
+    for s_other, ev_list in state.station_bin_events.items():
+        for other_ev in ev_list:
+            if other_ev is not ev and other_ev.sku == k and other_ev.copy_id == ev.copy_id:
+                if other_ev.fetch_start >= ev.return_end and other_ev.fetch_start < new_ret_end:
+                    return None
+    for pcid, p_ret_end in pending_copies.get(k, []):
+        if pcid == ev.copy_id:
+            return None
+
+    return (new_ret_start, new_ret_end)
+
+
 def find_shared_bin(
     station_bin_events: list[BinEvent],
     k: int,
     t_cursor: int,
     p: dict[int, int],
     pick_cap: int | None = None,
-) -> tuple[BinEvent | None, int | None]:
-    """Find an existing BinEvent for SKU k whose presence can cover a pick.
+    state: HeuristicState | None = None,
+    station: int | None = None,
+    rt_ret: dict[int, int] | None = None,
+    horizon: int | None = None,
+    local_pickface_intervals: list[tuple[int, int]] | None = None,
+    pending_moves: list[tuple[int, int]] | None = None,
+    pending_copies: dict[int, list[tuple[int, int]]] | None = None,
+    temp_pick_intervals: dict[int, list[tuple[int, int]]] | None = None,
+    temp_bounds: dict[int, tuple[int, int]] | None = None,
+    rt: dict[int, int] | None = None,
+    removed_moves: list[tuple[int, int]] | None = None,
+) -> tuple[BinEvent | None, int | None, int | None, int | None]:
+    """Find an existing BinEvent for SKU k whose presence can cover a pick,
+    extending presence_end if necessary and feasible.
 
-    When pick_cap is provided, also ensures the pick fits without exceeding
-    hand capacity — sliding the pick_start later within the same bin presence
-    if needed, rather than rejecting the shared bin outright.
-
-    Returns (bin_event, pick_start) or (None, None).
+    Returns (bin_event, pick_start, new_return_start, new_return_end) or (None, None, None, None).
     """
     best_ev = None
     best_start = float("inf")
+    best_ret_start = None
+    best_ret_end = None
+
+    max_wait = rt[k] if (rt is not None and k in rt) else (rt_ret[k] if (rt_ret is not None and k in rt_ret) else 25)
 
     for ev in station_bin_events:
         if ev.sku != k:
             continue
 
+        ev_id = id(ev)
+        ev_picks = (
+            temp_pick_intervals[ev_id]
+            if (temp_pick_intervals is not None and ev_id in temp_pick_intervals)
+            else ev.pick_intervals
+        )
+        curr_pres_end, curr_ret_end = (
+            temp_bounds[ev_id]
+            if (temp_bounds is not None and ev_id in temp_bounds)
+            else (ev.presence_end, ev.return_end)
+        )
+
         earliest = max(t_cursor, ev.presence_start)
-        if earliest + p[k] > ev.presence_end:
+        if earliest > t_cursor + max_wait:
             continue
 
-        if pick_cap is not None:
-            slot = find_pick_slot(
-                ev.pick_intervals, earliest, p[k], ev.presence_end, pick_cap
-            )
-            if slot is None:
+        # 1. Try fitting inside current presence window [ev.presence_start, curr_pres_end)
+        if earliest + p[k] <= curr_pres_end:
+            if pick_cap is not None:
+                slot = find_pick_slot(ev_picks, earliest, p[k], curr_pres_end, pick_cap)
+            else:
+                slot = earliest
+            if slot is not None and slot <= t_cursor + max_wait and slot < best_start:
+                best_ev = ev
+                best_start = slot
+                best_ret_start = curr_pres_end
+                best_ret_end = curr_ret_end
                 continue
-            candidate_start = slot
-        else:
-            candidate_start = earliest
 
-        if candidate_start < best_start:
-            best_ev = ev
-            best_start = candidate_start
+        # 2. Try extending presence window if picker is ready by curr_pres_end (no dead air)
+        if (
+            earliest <= curr_pres_end
+            and state is not None
+            and station is not None
+            and rt_ret is not None
+            and horizon is not None
+            and local_pickface_intervals is not None
+            and pending_moves is not None
+            and pending_copies is not None
+        ):
+            ext_limit = min(horizon - rt_ret[k], curr_pres_end + p[k])
+            if earliest + p[k] <= ext_limit:
+                if pick_cap is not None:
+                    slot = find_pick_slot(ev_picks, earliest, p[k], ext_limit, pick_cap)
+                else:
+                    slot = earliest
+                if slot is not None and slot <= curr_pres_end and slot < best_start:
+                    req_pres_end = max(curr_pres_end, slot + p[k])
+                    ext_res = _can_extend_bin_event(
+                        ev,
+                        station,
+                        req_pres_end,
+                        state,
+                        rt_ret,
+                        horizon,
+                        local_pickface_intervals,
+                        pending_moves,
+                        pending_copies,
+                        curr_pres_end,
+                        curr_ret_end,
+                        removed_moves=removed_moves,
+                    )
+                    if ext_res is not None:
+                        new_ret_s, new_ret_e = ext_res
+                        best_ev = ev
+                        best_start = slot
+                        best_ret_start = new_ret_s
+                        best_ret_end = new_ret_e
 
     if best_ev is None:
-        return (None, None)
-    return (best_ev, best_start)
-
-
-# ------ [P1-3] earliest_feasible_fetch ------
+        return (None, None, None, None)
+    return (best_ev, best_start, best_ret_start, best_ret_end)
 
 
 def earliest_feasible_fetch(
@@ -365,6 +491,7 @@ def earliest_feasible_fetch(
     pending_moves: list[tuple[int, int]],
     pending_copies: dict[int, list[tuple[int, int]]],
     horizon: int,
+    removed_moves: list[tuple[int, int]] | None = None,
 ) -> tuple[int, int]:
     """Find earliest fetch start for SKU k at station s, respecting all constraints.
 
@@ -393,8 +520,15 @@ def earliest_feasible_fetch(
     # Step 3: delay for MoveCap (fetch move occupies [t_start, t_start + rt[k]))
     if state.move_cap is not None:
         t_start = state.move_da.delay_for_movecap_with_pending(
-            t_start, rt[k], state.move_cap, pending_moves
+            t_start, rt[k], state.move_cap, pending_moves, removed_moves
         )
+
+    if t_start + rt[k] + rt_ret[k] > horizon:
+        raise ValueError(
+            f"SKU {k} infeasible: fetch start {t_start} exceeds horizon {horizon}"
+        )
+
+    return t_start, copy_id
 
     if t_start + rt[k] + rt_ret[k] > horizon:
         raise ValueError(
@@ -420,6 +554,7 @@ def plan_order_at_station(
     ALPHA: float,
     BETA: float,
     demand_count: dict[int, int],
+    pick_cap: int | None = None,
 ) -> OrderPlan | None:
     """Tentatively schedule order o at station s. Returns OrderPlan or None if infeasible."""
     L_at_s = [ln for (ss, ln) in state.lane_free if ss == s]
@@ -442,35 +577,73 @@ def plan_order_at_station(
     current_station_free = state.pickface_free[s]
 
     new_bin_events: list[BinEvent] = []
-    shared_picks: list[tuple[int, int, int]] = []
+    # (sku, bin_event, pick_start, pick_end, new_return_start, new_return_end)
+    shared_picks: list[tuple[int, BinEvent, int, int, int, int]] = []
     pending_moves: list[tuple[int, int]] = []
+    removed_moves: list[tuple[int, int]] = []
     pending_copies: dict[int, list[tuple[int, int]]] = defaultdict(list)
     pick_times_dict: dict[int, tuple[int, int]] = {}
 
+    local_intervals = list(state.pickface_intervals[s])
+    temp_pick_intervals: dict[int, list[tuple[int, int]]] = {}
+    temp_bounds: dict[int, tuple[int, int]] = {}
+
     for k in skus_sorted:
         # --- Try shared bin first ---
-        # 1. Look in existing bin events from prior orders
-        shared, pick_start = find_shared_bin(
-            state.station_bin_events[s], k, t_cursor, p
+        shared, pick_start, new_ret_start, new_ret_end = find_shared_bin(
+            state.station_bin_events[s] + new_bin_events,
+            k,
+            t_cursor,
+            p,
+            pick_cap=pick_cap,
+            state=state,
+            station=s,
+            rt_ret=rt_ret,
+            horizon=horizon,
+            local_pickface_intervals=local_intervals,
+            pending_moves=pending_moves,
+            pending_copies=pending_copies,
+            temp_pick_intervals=temp_pick_intervals,
+            temp_bounds=temp_bounds,
+            rt=rt,
+            removed_moves=removed_moves,
         )
-
-        # 2. Look in bin events created by *this* order
-        if shared is None:
-            for ev in new_bin_events:
-                if ev.sku == k:
-                    start = max(t_cursor, ev.presence_start)
-                    if start + p[k] <= ev.presence_end:
-                        shared = ev
-                        pick_start = start
-                        break
 
         if shared is not None:
             pick_end = pick_start + p[k]
+            ev_id = id(shared)
+            if ev_id not in temp_pick_intervals:
+                temp_pick_intervals[ev_id] = list(shared.pick_intervals)
+            temp_pick_intervals[ev_id].append((pick_start, pick_end))
 
-            shared.pick_intervals.append((pick_start, pick_end))
+            old_pres_end, old_ret_end = (
+                temp_bounds[ev_id]
+                if ev_id in temp_bounds
+                else (shared.presence_end, shared.return_end)
+            )
+            temp_bounds[ev_id] = (new_ret_start, new_ret_end)
+
+            if new_ret_start > old_pres_end:
+                for idx_iv, (iv_s, iv_e) in enumerate(local_intervals):
+                    if iv_s == shared.presence_start and iv_e == old_pres_end:
+                        local_intervals[idx_iv] = (shared.presence_start, new_ret_start)
+                        break
+                local_intervals.sort(key=lambda x: x[0])
+                current_station_free = max(current_station_free, new_ret_start)
+
+                if (old_pres_end, old_ret_end) in pending_moves:
+                    pending_moves.remove((old_pres_end, old_ret_end))
+                elif shared in state.station_bin_events[s]:
+                    orig_ret = (shared.return_start, shared.return_end)
+                    if orig_ret not in removed_moves:
+                        removed_moves.append(orig_ret)
+                pending_moves.append((new_ret_start, new_ret_end))
+
             t_cursor = pick_end
             pick_times_dict[k] = (pick_start, pick_end)
-            shared_picks.append((k, shared, pick_end))
+            shared_picks.append(
+                (k, shared, pick_start, pick_end, new_ret_start, new_ret_end)
+            )
             continue
 
         # --- New bin fetch ---
@@ -490,6 +663,7 @@ def plan_order_at_station(
                 pending_moves,
                 pending_copies,
                 horizon,
+                removed_moves=removed_moves,
             )
         except ValueError:
             return None
@@ -509,7 +683,11 @@ def plan_order_at_station(
         # Check return move fits under MoveCap
         if state.move_cap is not None:
             return_delayed = state.move_da.delay_for_movecap_with_pending(
-                return_start, rt_ret[k], state.move_cap, pending_moves
+                return_start,
+                rt_ret[k],
+                state.move_cap,
+                pending_moves,
+                removed_moves=removed_moves,
             )
             if return_delayed != return_start:
                 return_start = return_delayed
@@ -531,8 +709,11 @@ def plan_order_at_station(
             return_start=return_start,
             return_end=return_end,
             orders_served=[o],
+            pick_intervals=[(pick_start, pick_end)],
         )
         new_bin_events.append(ev)
+        local_intervals.append((presence_start, presence_end))
+        local_intervals.sort(key=lambda x: x[0])
         pending_moves.append((t_fetch, fetch_end))
         pending_moves.append((return_start, return_end))
         pending_copies[k].append((copy_id, return_end))
@@ -583,8 +764,34 @@ def commit_plan(plan: OrderPlan, state: HeuristicState) -> None:
     state.lane_intervals[(s, ln)].append((plan.start, plan.end))
     state.lane_intervals[(s, ln)].sort(key=lambda x: x[0])
 
-    for k, shared_ev, pick_end in plan.shared_picks:
+    for (
+        k,
+        shared_ev,
+        pick_start,
+        pick_end,
+        new_ret_start,
+        new_ret_end,
+    ) in plan.shared_picks:
         shared_ev.orders_served.append(plan.order)
+        shared_ev.pick_intervals.append((pick_start, pick_end))
+        shared_ev.pick_intervals.sort(key=lambda x: x[0])
+
+        if new_ret_start > shared_ev.return_start:
+            if shared_ev not in plan.bin_events:
+                state.move_da.remove_move(shared_ev.return_start, shared_ev.return_end)
+                state.move_da.add_move(new_ret_start, new_ret_end)
+            shared_ev.presence_end = new_ret_start
+            shared_ev.return_start = new_ret_start
+            shared_ev.return_end = new_ret_end
+            state.bin_pools[k].commit(shared_ev.copy_id, new_ret_end)
+
+    state.pickface_intervals[s] = sorted(
+        (ev.presence_start, ev.presence_end) for ev in state.station_bin_events[s]
+    )
+    state.pickface_free[s] = max(
+        (ev.presence_end for ev in state.station_bin_events[s]),
+        default=state.pickface_free[s],
+    )
 
     state.move_da.build_prefix()
 
@@ -685,8 +892,13 @@ def run_sgc(instance, *args, **kwargs) -> Solution:
         BETA = kwargs.get("BETA", args[3] if len(args) > 3 else 0.0)
         rt_ret = kwargs.get("rt_ret", args[4] if len(args) > 4 else None)
 
+    restrict_stations_by_workload: bool = kwargs.get(
+        "restrict_stations_by_workload", kwargs.get("load_balanced_stations", False)
+    )
+
     S, L, K, orders_req, rt, p, N = instance
     move_cap = instance.movecap
+    pick_cap = getattr(instance, "pickcap", None)
     O = instance.O
     if "rt_ret" not in locals() or rt_ret is None:
         rt_ret = instance.rt_ret
@@ -703,11 +915,26 @@ def run_sgc(instance, *args, **kwargs) -> Solution:
     order_assignments: dict[int, tuple[int, int, int, int]] = {}
     pick_events_map: dict[tuple[int, int, int], tuple[int, int]] = {}
     failed_orders: list[int] = []
+    station_workload: dict[int, float] = {s: 0.0 for s in S}
 
     for o in sorted_orders:
         best_plan: OrderPlan | None = None
 
-        for s in S:
+        if restrict_stations_by_workload:
+            avg_workload = sum(station_workload.values()) / max(len(S), 1)
+            sorted_stations = sorted(S, key=lambda s: (station_workload[s], s))
+            cand_stations = [
+                s for s in sorted_stations if station_workload[s] <= avg_workload
+            ]
+            if not cand_stations:
+                cand_stations = sorted_stations[:1]
+            cand_set = set(cand_stations)
+            remaining_stations = [s for s in sorted_stations if s not in cand_set]
+        else:
+            cand_stations = S
+            remaining_stations = []
+
+        for s in cand_stations:
             plan = plan_order_at_station(
                 o,
                 s,
@@ -721,9 +948,32 @@ def run_sgc(instance, *args, **kwargs) -> Solution:
                 ALPHA,
                 BETA,
                 demand_count,
+                pick_cap=pick_cap,
             )
             if plan is not None and (best_plan is None or plan.score < best_plan.score):
                 best_plan = plan
+
+        if best_plan is None and remaining_stations:
+            for s in remaining_stations:
+                plan = plan_order_at_station(
+                    o,
+                    s,
+                    state,
+                    orders_req,
+                    rt,
+                    rt_ret,
+                    p,
+                    N,
+                    horizon,
+                    ALPHA,
+                    BETA,
+                    demand_count,
+                    pick_cap=pick_cap,
+                )
+                if plan is not None and (
+                    best_plan is None or plan.score < best_plan.score
+                ):
+                    best_plan = plan
 
         if best_plan is not None:
             commit_plan(best_plan, state)
@@ -735,6 +985,9 @@ def run_sgc(instance, *args, **kwargs) -> Solution:
             )
             for k, times in best_plan.pick_times.items():
                 pick_events_map[(o, best_plan.station, k)] = times
+            station_workload[best_plan.station] += sum(
+                p.get(k, 0) for k in orders_req[o]
+            )
         else:
             failed_orders.append(o)
 
@@ -837,9 +1090,9 @@ def build_viz_handles(
     # copy making multiple visits does not overwrite earlier F/B/R dict entries.
     # (copy_id is reused across visits; we need a collision-free key for the viz dicts.)
     visit_counters: dict[tuple[int, int], int] = defaultdict(int)
-    visit_idx_lookup: dict[
-        tuple[int, int, int], int
-    ] = {}  # (s, k, presence_start) -> visit_idx
+    visit_idx_lookup: dict[tuple[int, int, int], int] = (
+        {}
+    )  # (s, k, presence_start) -> visit_idx
 
     # Order windows: I_os and I_os_lane
     for o in O:
@@ -1007,6 +1260,8 @@ def validate_solution(
         move_cap = kwargs.get("move_cap", args[1] if len(args) > 1 else None)
         rt_ret = kwargs.get("rt_ret", args[2] if len(args) > 2 else None)
 
+    pick_cap = kwargs.get("pick_cap", getattr(instance, "pickcap", None))
+
     S, L, K, orders_req, rt, p, N = instance
     O = instance.O
     if rt_ret is None:
@@ -1127,6 +1382,34 @@ def validate_solution(
                     break
             if not covered:
                 violations.append(f"Order {o} missing pick for SKU {k} at station {s}")
+
+    # 9. PickCap not exceeded on any BinEvent
+    if pick_cap is not None and solution.pick_events:
+        for s in S:
+            for ev in solution.bin_events.get(s, []):
+                k = ev.sku
+                ev_picks = []
+                for o_srv in ev.orders_served:
+                    pe_tuple = solution.pick_events.get((o_srv, s, k))
+                    if pe_tuple is not None:
+                        ps, pe = pe_tuple
+                        if ev.presence_start <= ps and pe <= ev.presence_end:
+                            ev_picks.append((ps, pe))
+                if len(ev_picks) <= pick_cap:
+                    continue
+                sweep = []
+                for ps, pe in ev_picks:
+                    sweep.append((ps, +1))
+                    sweep.append((pe, -1))
+                sweep.sort(key=lambda x: (x[0], x[1]))
+                concurrent = 0
+                for t, delta in sweep:
+                    concurrent += delta
+                    if concurrent > pick_cap:
+                        violations.append(
+                            f"PickCap violation at S{s} SKU {k}: {concurrent} > {pick_cap} at t={t}"
+                        )
+                        break
 
     return violations
 

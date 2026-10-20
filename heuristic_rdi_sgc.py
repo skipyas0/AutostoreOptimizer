@@ -79,44 +79,94 @@ def gap_filling_plan_order_at_station(
     best_lane = min(L_at_s, key=lambda ln: state.lane_free[(s, ln)])
     t_order_start = state.lane_free[(s, best_lane)]
 
-    skus_sorted = sorted(
+    remaining_skus = sorted(
         orders_req[o], key=lambda k: demand_count.get(k, 0), reverse=True
     )
     t_cursor = t_order_start
 
     new_bin_events: list[BinEvent] = []
-    shared_picks: list[tuple[int, BinEvent, int]] = []
+    # (sku, bin_event, pick_start, pick_end, new_return_start, new_return_end)
+    shared_picks: list[tuple[int, BinEvent, int, int, int, int]] = []
     pending_moves: list[tuple[int, int]] = []
+    removed_moves: list[tuple[int, int]] = []
     pending_copies: dict[int, list[tuple[int, int]]] = defaultdict(list)
     pick_times_dict: dict[int, tuple[int, int]] = {}
 
     local_intervals = list(state.pickface_intervals[s])
+    temp_pick_intervals: dict[int, list[tuple[int, int]]] = {}
+    temp_bounds: dict[int, tuple[int, int]] = {}
 
-    for k in skus_sorted:
-        shared, pick_start = find_shared_bin(
-            state.station_bin_events[s], k, t_cursor, p, pick_cap
-        )
-        if shared is None:
-            for ev in new_bin_events:
-                if ev.sku == k:
-                    earliest = max(t_cursor, ev.presence_start)
-                    if earliest + p[k] <= ev.presence_end:
-                        slot = find_pick_slot(
-                            ev.pick_intervals, earliest, p[k], ev.presence_end, pick_cap
-                        )
-                        if slot is not None:
-                            shared = ev
-                            pick_start = slot
-                            break
+    candidate_bins = state.station_bin_events[s]
 
-        if shared is not None:
+    while remaining_skus:
+        # 1. Dynamic Shared-First Check: see if any remaining SKU can share an existing bin
+        best_shared_k = None
+        best_shared_res = (None, float("inf"), None, None)
+
+        for k_cand in remaining_skus:
+            sh_ev, p_start, n_rs, n_re = find_shared_bin(
+                candidate_bins + new_bin_events,
+                k_cand,
+                t_cursor,
+                p,
+                pick_cap,
+                state=state,
+                station=s,
+                rt_ret=rt_ret,
+                horizon=horizon,
+                local_pickface_intervals=local_intervals,
+                pending_moves=pending_moves,
+                pending_copies=pending_copies,
+                temp_pick_intervals=temp_pick_intervals,
+                temp_bounds=temp_bounds,
+                rt=rt,
+                removed_moves=removed_moves,
+            )
+            if sh_ev is not None and p_start < best_shared_res[1]:
+                best_shared_k = k_cand
+                best_shared_res = (sh_ev, p_start, n_rs, n_re)
+
+        if best_shared_k is not None:
+            k = best_shared_k
+            remaining_skus.remove(k)
+            shared, pick_start, new_ret_start, new_ret_end = best_shared_res
             pick_end = pick_start + p[k]
-            shared.pick_intervals.append((pick_start, pick_end))
+            ev_id = id(shared)
+            if ev_id not in temp_pick_intervals:
+                temp_pick_intervals[ev_id] = list(shared.pick_intervals)
+            temp_pick_intervals[ev_id].append((pick_start, pick_end))
+
+            old_pres_end, old_ret_end = (
+                temp_bounds[ev_id]
+                if ev_id in temp_bounds
+                else (shared.presence_end, shared.return_end)
+            )
+            temp_bounds[ev_id] = (new_ret_start, new_ret_end)
+
+            if new_ret_start > old_pres_end:
+                for idx_iv, (iv_s, iv_e) in enumerate(local_intervals):
+                    if iv_s == shared.presence_start and iv_e == old_pres_end:
+                        local_intervals[idx_iv] = (shared.presence_start, new_ret_start)
+                        break
+                local_intervals.sort(key=lambda x: x[0])
+
+                if (old_pres_end, old_ret_end) in pending_moves:
+                    pending_moves.remove((old_pres_end, old_ret_end))
+                elif shared in state.station_bin_events[s]:
+                    orig_ret = (shared.return_start, shared.return_end)
+                    if orig_ret not in removed_moves:
+                        removed_moves.append(orig_ret)
+                pending_moves.append((new_ret_start, new_ret_end))
+
             t_cursor = pick_end
             pick_times_dict[k] = (pick_start, pick_end)
-            shared_picks.append((k, shared, pick_end))
+            shared_picks.append(
+                (k, shared, pick_start, pick_end, new_ret_start, new_ret_end)
+            )
             continue
 
+        # 2. No shared bin available: pick highest-demand remaining SKU and fetch a new bin
+        k = remaining_skus.pop(0)
         desired_presence = max(t_cursor, rt[k])
 
         while True:
@@ -134,6 +184,7 @@ def gap_filling_plan_order_at_station(
                     pending_moves,
                     pending_copies,
                     horizon,
+                    removed_moves=removed_moves,
                 )
             except ValueError:
                 return None
@@ -155,7 +206,11 @@ def gap_filling_plan_order_at_station(
 
             if state.move_cap is not None:
                 return_delayed = state.move_da.delay_for_movecap_with_pending(
-                    return_start, rt_ret[k], state.move_cap, pending_moves
+                    return_start,
+                    rt_ret[k],
+                    state.move_cap,
+                    pending_moves,
+                    removed_moves=removed_moves,
                 )
                 if return_delayed != return_start:
                     return_start = return_delayed
@@ -186,9 +241,7 @@ def gap_filling_plan_order_at_station(
             return_start=return_start,
             return_end=return_end,
             orders_served=[o],
-            pick_intervals=[
-                (pick_start, pick_end)
-            ],  # Initialize with the triggering pick
+            pick_intervals=[(pick_start, pick_end)],
         )
         new_bin_events.append(ev)
         pending_moves.append((t_fetch, fetch_end))
@@ -199,7 +252,10 @@ def gap_filling_plan_order_at_station(
         (ps for ps, pe in pick_times_dict.values()), default=t_order_start
     )
     order_end = max((pe for ps, pe in pick_times_dict.values()), default=t_order_start)
-    score = ALPHA * order_end + BETA * (order_end - order_start)
+
+    # Reward shared picks by subtracting 50% of the saved retrieval + pick time
+    move_savings = sum(rt[k_sh] + p[k_sh] for (k_sh, *_rest) in shared_picks)
+    score = ALPHA * order_end + BETA * (order_end - order_start) - 0.5 * move_savings
 
     return OrderPlan(
         order=o,
@@ -333,6 +389,116 @@ def compute_dirty_set(
     return dirty & unscheduled
 
 
+def update_cached_scores_incrementally(
+    committed_order: int,
+    committed_plan: OrderPlan,
+    S: list[int],
+    state: HeuristicState,
+    orders_req: dict[int, list[int]],
+    sku_order_index: dict[int, set[int]],
+    cached_scores: dict[int, InsertionScores],
+    unscheduled: set[int],
+    rt: dict[int, int],
+    rt_ret: dict[int, int],
+    p: dict[int, int],
+    N: dict[int, int],
+    horizon: int,
+    ALPHA: float,
+    BETA: float,
+    demand_count: dict[int, int],
+    regret_k: int,
+    pick_cap: int,
+    use_lazy: bool,
+) -> None:
+    committed_station = committed_plan.station
+
+    # Orders that share an SKU with committed_order may be affected on ALL stations (due to BinCopyPool)
+    all_stations_dirty: set[int] = set()
+    if use_lazy:
+        for k in orders_req[committed_order]:
+            if k in sku_order_index:
+                all_stations_dirty.update(sku_order_index[k])
+    else:
+        all_stations_dirty = set(unscheduled)
+
+    # Collect move intervals committed or extended by committed_plan (for MoveCap overlap checks)
+    committed_moves: list[tuple[int, int]] = []
+    if state.move_cap is not None:
+        for ev in committed_plan.bin_events:
+            committed_moves.append((ev.fetch_start, ev.fetch_end))
+            committed_moves.append((ev.return_start, ev.return_end))
+        for _k, sh_ev, _ps, _pe, new_rs, new_re in committed_plan.shared_picks:
+            committed_moves.append((sh_ev.return_start, sh_ev.return_end))
+            committed_moves.append((new_rs, new_re))
+
+    for o in unscheduled:
+        c = cached_scores[o]
+        if not use_lazy or o in all_stations_dirty:
+            stations_to_update = S
+        else:
+            # Always update committed_station for every unscheduled order!
+            # This guarantees best_score, second_score, and regret are never stale,
+            # and lets orders discover newly created shared bins at committed_station.
+            stations_to_update = [committed_station]
+            if state.move_cap is not None and committed_moves:
+                for s in S:
+                    if s == committed_station:
+                        continue
+                    st_plan = c.station_plans.get(s)
+                    if st_plan is None:
+                        continue
+                    overlap = False
+                    for ev in st_plan.bin_events:
+                        for ms, me in committed_moves:
+                            if max(ev.fetch_start, ms) < min(ev.fetch_end, me) or max(
+                                ev.return_start, ms
+                            ) < min(ev.return_end, me):
+                                overlap = True
+                                break
+                        if overlap:
+                            break
+                    if overlap:
+                        stations_to_update.append(s)
+
+        for s in stations_to_update:
+            plan = gap_filling_plan_order_at_station(
+                o,
+                s,
+                state,
+                orders_req,
+                rt,
+                rt_ret,
+                p,
+                N,
+                horizon,
+                ALPHA,
+                BETA,
+                demand_count,
+                pick_cap,
+            )
+            if plan is not None:
+                c.station_scores[s] = plan.score
+                c.station_plans[s] = plan
+            else:
+                c.station_scores[s] = float("inf")
+                c.station_plans[s] = None
+
+        feasible = sorted(
+            (score, s) for s, score in c.station_scores.items() if score < float("inf")
+        )
+        if not feasible:
+            c.best_score = float("inf")
+            c.second_score = float("inf")
+            c.best_station = -1
+            c.best_plan = None
+            c.regret = -1.0
+        else:
+            c.best_score, c.best_station = feasible[0]
+            c.second_score = feasible[1][0] if len(feasible) > 1 else float("inf")
+            c.best_plan = c.station_plans[c.best_station]
+            c.regret = compute_regret_k(c.station_scores, regret_k)
+
+
 def run_rdi_sgc(instance, *args, **kwargs) -> Solution:
 
     horizon = kwargs.get("horizon", args[0] if len(args) > 0 else 10000)
@@ -412,27 +578,40 @@ def run_rdi_sgc(instance, *args, **kwargs) -> Solution:
 
     while unscheduled:
         best_o = None
-        best_regret = -float("inf")
+        best_key = None
 
         for o in unscheduled:
             c = cached_scores[o]
-            r = c.regret
-            if r > best_regret:
-                best_regret = r
+            if c.best_plan is None:
+                continue
+
+            num_shared = len(c.best_plan.shared_picks)
+            # Combine regret with a best_score penalty (-0.35 * c.best_score) so RDI
+            # prioritizes orders that both have high regret AND land early/share bins,
+            # preventing runaway station imbalance (PI).
+            priority_val = (
+                c.regret - 0.35 * c.best_score
+                if c.regret < float("inf")
+                else float("inf")
+            )
+
+            if tiebreaker == "sharing_degree":
+                tb_val = sharing_degrees[o]
+            elif tiebreaker == "sum_rt_asc":
+                tb_val = -sum_rts[o]
+            else:
+                tb_val = -c.best_score
+
+            cand_key = (
+                priority_val,
+                num_shared,
+                sharing_degrees[o],
+                tb_val,
+                -c.best_score,
+            )
+            if best_key is None or cand_key > best_key:
+                best_key = cand_key
                 best_o = o
-            elif r == best_regret and best_o is not None:
-                if tiebreaker == "sharing_degree":
-                    # Priority to LOW sharing degree
-                    if sharing_degrees[o] < sharing_degrees[best_o]:
-                        best_o = o
-                elif tiebreaker == "sum_rt_asc":
-                    # Priority to LOW sum_rt
-                    if sum_rts[o] < sum_rts[best_o]:
-                        best_o = o
-                else:
-                    # Priority to HIGH best_score
-                    if c.best_score > cached_scores[best_o].best_score:
-                        best_o = o
 
         if best_o is None or cached_scores[best_o].best_plan is None:
             break  # Failed or infeasible
@@ -447,37 +626,27 @@ def run_rdi_sgc(instance, *args, **kwargs) -> Solution:
         if not unscheduled:
             break
 
-        if use_lazy:
-            dirty = compute_dirty_set(
-                best_o,
-                plan.station,
-                orders_req,
-                sku_index,
-                cached_scores,
-                unscheduled,
-                state,
-                plan,
-            )
-        else:
-            dirty = unscheduled
-
-        for o in dirty:
-            cached_scores[o] = score_order_insertions(
-                o,
-                S,
-                state,
-                orders_req,
-                rt,
-                rt_ret,
-                p,
-                N,
-                horizon,
-                ALPHA,
-                BETA,
-                demand_count,
-                regret_k,
-                pick_cap,
-            )
+        update_cached_scores_incrementally(
+            best_o,
+            plan,
+            S,
+            state,
+            orders_req,
+            sku_index,
+            cached_scores,
+            unscheduled,
+            rt,
+            rt_ret,
+            p,
+            N,
+            horizon,
+            ALPHA,
+            BETA,
+            demand_count,
+            regret_k,
+            pick_cap,
+            use_lazy,
+        )
 
     # Post-process results into a Solution object
     final_makespan = max((e for (_, _, _, e) in order_assignments.values()), default=0)
