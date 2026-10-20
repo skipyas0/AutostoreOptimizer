@@ -1,5 +1,3 @@
-from neighborhood_selection import strategy_random_orders
-from autostore_heuristic import validate_warmstart
 import argparse
 import datetime
 import json
@@ -7,14 +5,14 @@ import os
 from collections import defaultdict
 from contextlib import redirect_stdout
 
-from autostore_heuristic import BinEvent, Solution
+from autostore_heuristic import BinEvent, Solution, validate_warmstart
 from cp_model import build_model, inject_warmstart
 from datagen import generate_data
 from heuristic_rdi_sgc import run_rdi_sgc
 from instance import Instance
 from jaccard_similarity import build_similarity_matrix
 from matheuristic import load_instance
-from neighborhood_selection import strategy_similar_orders
+from neighborhood_selection import strategy_random_orders, strategy_similar_orders
 
 
 def extract_exo_state(sol, handles, overlap_threshold=0):
@@ -65,26 +63,28 @@ def extract_exo_state(sol, handles, overlap_threshold=0):
 
 def validate_exo_constraints(heur_sol, exo_lanes, exo_blocks, exo_moves, handles):
     violations = []
-    
+
     # 1. Lane overlaps
     for o, (s_a, ln_a, t_s, t_e) in heur_sol.order_assignments.items():
         if (s_a, ln_a) in exo_lanes:
-            for (st, en) in exo_lanes[(s_a, ln_a)]:
+            for st, en in exo_lanes[(s_a, ln_a)]:
                 if max(t_s, st) < min(t_e, en):
-                    violations.append(f"Exo Lane overlap: Order {o} [{t_s},{t_e}) overlaps with exo block [{st},{en}) at S{s_a} L{ln_a}")
-                    
+                    violations.append(
+                        f"Exo Lane overlap: Order {o} [{t_s},{t_e}) overlaps with exo block [{st},{en}) at S{s_a} L{ln_a}"
+                    )
+
     # 2. Block concurrency
     N_map = handles.get("N", {})
     for k in handles.get("K", []):
         blocks = []
         if k in exo_blocks:
-            for (st, en) in exo_blocks[k]:
+            for st, en in exo_blocks[k]:
                 blocks.append((st, en, "exo"))
         for s in handles.get("S", []):
             for be in heur_sol.bin_events.get(s, []):
                 if be.sku == k:
                     blocks.append((be.fetch_start, be.return_end, f"heur_S{s}"))
-                    
+
         sweep = []
         for bs, be_end, label in blocks:
             sweep.append((bs, +1, label))
@@ -94,9 +94,11 @@ def validate_exo_constraints(heur_sol, exo_lanes, exo_blocks, exo_moves, handles
         for t, delta, label in sweep:
             concurrent += delta
             if concurrent > N_map.get(k, 1):
-                violations.append(f"Exo Block concurrency SKU {k}: {concurrent} > N[{k}]={N_map.get(k,1)} at t={t}")
+                violations.append(
+                    f"Exo Block concurrency SKU {k}: {concurrent} > N[{k}]={N_map.get(k, 1)} at t={t}"
+                )
                 break
-                
+
     # 3. MoveCap
     mc = handles.get("move_cap")
     if mc is not None:
@@ -116,9 +118,11 @@ def validate_exo_constraints(heur_sol, exo_lanes, exo_blocks, exo_moves, handles
         for t, delta in sweep:
             concurrent += delta
             if concurrent > mc:
-                violations.append(f"Exo MoveCap violation: {concurrent} > {mc} at t={t}")
+                violations.append(
+                    f"Exo MoveCap violation: {concurrent} > {mc} at t={t}"
+                )
                 break
-                
+
     return violations
 
 
@@ -227,6 +231,7 @@ def stitch_heuristic_solutions(sols):
         pick_events=pick_events,
     )
 
+
 def create_random_partitions(instance, n_partitions=5):
     order_set = set(instance.O)
 
@@ -234,7 +239,8 @@ def create_random_partitions(instance, n_partitions=5):
     for i in range(n_partitions - 1):
         fake_handles = {"O": list(order_set)}
         selection_result = strategy_random_orders(
-            fake_handles, p=1 / (n_partitions - i), 
+            fake_handles,
+            p=1 / (n_partitions - i),
         )
         selected_orders = selection_result.seed_orders
         order_set -= selected_orders
@@ -242,6 +248,7 @@ def create_random_partitions(instance, n_partitions=5):
 
     partitions.append(order_set)
     return partitions
+
 
 def create_similarity_partitions(instance, n_partitions=5):
     weighted_jaccard_matrix, _ = build_similarity_matrix(
@@ -268,6 +275,34 @@ def create_similarity_partitions(instance, n_partitions=5):
     return partitions
 
 
+def distribute_movecap(
+    total_movecap: int | None,
+    n_stations: int,
+    workloads: list | None = None,
+) -> list[int | None]:
+    """
+    Distributes total_movecap across n_stations so that no unit of movecap is wasted.
+    If total_movecap % n_stations > 0, the remainder units (+1) are prioritized
+    to stations with the highest workloads (or the first stations if workloads are not given).
+    """
+    if total_movecap is None:
+        return [None] * n_stations
+    if n_stations <= 0:
+        return []
+
+    base = total_movecap // n_stations
+    rem = total_movecap % n_stations
+
+    if workloads is not None and len(workloads) == n_stations and rem > 0:
+        # Give +1 to the rem stations with highest workloads
+        bonus_indices = set(
+            sorted(range(n_stations), key=lambda idx: workloads[idx], reverse=True)[:rem]
+        )
+        return [base + (1 if i in bonus_indices else 0) for i in range(n_stations)]
+    else:
+        return [base + (1 if i < rem else 0) for i in range(n_stations)]
+
+
 def solve_station_decomposition(
     instance,
     exo_blocks_in=None,
@@ -277,7 +312,8 @@ def solve_station_decomposition(
 ):
     n_partitions = len(instance.S)
     partitions = create_random_partitions(instance, n_partitions)
-    per_station_movecap = instance.movecap // n_partitions if instance.movecap else None
+    workloads = [len(p) for p in partitions]
+    station_movecaps = distribute_movecap(instance.movecap, n_partitions, workloads)
 
     subsolutions = []
 
@@ -296,7 +332,7 @@ def solve_station_decomposition(
             instance.rt,
             instance.p,
             instance.N,
-            per_station_movecap,
+            station_movecaps[i],
             instance.seed,
             instance.rt_ret,
             instance.pickcap,
@@ -324,7 +360,13 @@ def solve_station_decomposition(
         )
         if heur_sol and heur_sol.feasible:
             v1 = validate_warmstart(heur_sol, heur_sol.pick_events, handles)
-            v2 = validate_exo_constraints(heur_sol, exo_lanes_in or {}, current_exo_blocks, exo_moves_in or [], handles)
+            v2 = validate_exo_constraints(
+                heur_sol,
+                exo_lanes_in or {},
+                current_exo_blocks,
+                exo_moves_in or [],
+                handles,
+            )
             if v1 or v2:
                 print(f"--- WARMSTART VIOLATIONS in station spatial batch {i} ---")
                 for v in v1 + v2:
@@ -422,7 +464,13 @@ def solve_time_decomposition(
         )
         if heur_sol and heur_sol.feasible:
             v1 = validate_warmstart(heur_sol, heur_sol.pick_events, handles)
-            v2 = validate_exo_constraints(heur_sol, current_exo_lanes, current_exo_blocks, current_exo_moves, handles)
+            v2 = validate_exo_constraints(
+                heur_sol,
+                current_exo_lanes,
+                current_exo_blocks,
+                current_exo_moves,
+                handles,
+            )
             if v1 or v2:
                 print(f"--- WARMSTART VIOLATIONS in batch {i} ---")
                 for v in v1 + v2:
@@ -430,7 +478,7 @@ def solve_time_decomposition(
                 print("---------------------------------------")
             else:
                 print(f"Warmstart for batch {i} is strictly feasible!")
-                
+
             sp = inject_warmstart(heur_sol, heur_sol.pick_events, submodel, handles)
             submodel.set_starting_point(sp)
         subsolution_cp = submodel.solve(LogVerbosity="Terse", TimeLimit=60)
@@ -552,7 +600,8 @@ def solve_2d_decomposition_spatial_first(instance, n_time_batches=5):
     """
     n_partitions = len(instance.S)
     spatial_partitions = create_random_partitions(instance, n_partitions)
-    per_station_movecap = instance.movecap // n_partitions if instance.movecap else None
+    workloads = [len(p) for p in spatial_partitions]
+    station_movecaps = distribute_movecap(instance.movecap, n_partitions, workloads)
 
     subsolutions = []
     current_exo_blocks = defaultdict(list)
@@ -567,7 +616,7 @@ def solve_2d_decomposition_spatial_first(instance, n_time_batches=5):
             instance.rt,
             instance.p,
             instance.N,
-            per_station_movecap,
+            station_movecaps[i],
             instance.seed,
             instance.rt_ret,
             instance.pickcap,
@@ -589,11 +638,20 @@ def solve_2d_decomposition_spatial_first(instance, n_time_batches=5):
 
     return stitch_heuristic_solutions(subsolutions)
 
-def solve_rl_decomposition(instance, weights_path="rl_agent_weights_multicomponent_rew3.pth", device=None):
+
+def solve_rl_decomposition(instance, weights_path="rl_agent_weights.pth", device=None):
     import torch
-    from rl_order_assignment import OrderGraphGNN, OrderAssignmentAgent
-    from instance import Instance
+
     from heuristic_rdi_sgc import run_rdi_sgc
+    from instance import Instance
+    from rl_order_assignment import (
+        OrderAssignmentAgent,
+        OrderGraphGNN,
+        StationOrderScorer,
+        precompute_instance_similarities,
+        rollout_station_order,
+    )
+
     if device is None:
         if torch.backends.mps.is_available():
             device = torch.device("mps")
@@ -601,46 +659,72 @@ def solve_rl_decomposition(instance, weights_path="rl_agent_weights_multicompone
             device = torch.device("cuda")
         else:
             device = torch.device("cpu")
-    hidden_dim = 64
-    mlp_hidden = 128
-    max_stations = 20
-    
-    gnn = OrderGraphGNN(hidden_dim=hidden_dim, num_layers=2)
-    agent = OrderAssignmentAgent(gnn, hidden_dim=hidden_dim, max_stations=max_stations, mlp_hidden=mlp_hidden).to(device)
+
+    checkpoint = None
     try:
-        agent.load_state_dict(torch.load(weights_path, map_location=device))
+        checkpoint = torch.load(weights_path, map_location=device)
         print(f"Loaded RL weights from {weights_path} to {device}")
     except FileNotFoundError:
         print(f"Warning: {weights_path} not found. Using untrained RL agent.")
-        
-    agent.eval()
-    hetero_data = instance.create_order_graph().to(device)
-    instance_stats = {
-        'num_stations': len(instance.S),
-        'total_used_skus': instance.stats['used_skus'],
-        'movecap': instance.movecap
-    }
-    
-    order_num_skus = torch.tensor([len(instance.orders_req[o]) for o in instance.O], dtype=torch.float, device=device)
-    
-    with torch.no_grad():
-        actions, _, _ = agent(hetero_data, instance_stats, order_num_skus)
-        
+
+    if checkpoint is not None and any(k.startswith("net.") for k in checkpoint.keys()):
+        feat_dim = checkpoint["net.0.weight"].shape[1]
+        hid_dim = checkpoint["net.0.weight"].shape[0]
+        model = StationOrderScorer(feature_dim=feat_dim, hidden_dim=hid_dim).to(device)
+        model.load_state_dict(checkpoint)
+        model.eval()
+
+        sim_unw, sim_w = precompute_instance_similarities(instance)
+        with torch.no_grad():
+            actions, _, _, _ = rollout_station_order(
+                instance, model, sim_unw, sim_w, device, deterministic=True
+            )
+    else:
+        hidden_dim = 64
+        mlp_hidden = 128
+        max_stations = 20
+
+        gnn = OrderGraphGNN(hidden_dim=hidden_dim, num_layers=2)
+        agent = OrderAssignmentAgent(
+            gnn, hidden_dim=hidden_dim, max_stations=max_stations, mlp_hidden=mlp_hidden
+        ).to(device)
+        if checkpoint is not None:
+            agent.load_state_dict(checkpoint)
+        agent.eval()
+
+        hetero_data = instance.create_order_graph().to(device)
+        instance_stats = {
+            "num_stations": len(instance.S),
+            "total_used_skus": instance.stats["used_skus"],
+            "movecap": instance.movecap,
+        }
+
+        order_num_skus = torch.tensor(
+            [len(instance.orders_req[o]) for o in instance.O],
+            dtype=torch.float,
+            device=device,
+        )
+
+        with torch.no_grad():
+            actions, _, _ = agent(hetero_data, instance_stats, order_num_skus, deterministic=True)
+
     station_assignments = {s: [] for s in range(len(instance.S))}
     for o_idx, s_idx in enumerate(actions):
         s_idx = min(s_idx, len(instance.S) - 1)
         station_assignments[s_idx].append(instance.O[o_idx])
-        
+
+    n_stations = len(instance.S)
+    workloads = [len(station_assignments[i]) for i in range(n_stations)]
+    station_movecaps = distribute_movecap(instance.movecap, n_stations, workloads)
+
     subsolutions = []
     print("6")
     for i, s_idx in enumerate(instance.S):
         assigned_orders = station_assignments[i]
-        print(f"Solving station {s_idx} with {len(assigned_orders)} orders...")
+        print(f"Solving station {s_idx} with {len(assigned_orders)} orders (movecap: {station_movecaps[i]})...")
         if not assigned_orders:
             continue
-            
-        per_station_movecap = instance.movecap // len(instance.S) if instance.movecap else None
-        
+
         subinstance = Instance(
             [s_idx],
             instance.L,
@@ -649,17 +733,18 @@ def solve_rl_decomposition(instance, weights_path="rl_agent_weights_multicompone
             instance.rt,
             instance.p,
             instance.N,
-            per_station_movecap,
+            station_movecaps[i],
             instance.seed,
             instance.rt_ret,
             instance.pickcap,
         )
-        
+
         heur_sol = run_rdi_sgc(subinstance, horizon=50000, batch_start_time=0)
         if heur_sol:
             subsolutions.append(heur_sol)
-            
+
     return stitch_heuristic_solutions(subsolutions)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -822,7 +907,7 @@ if __name__ == "__main__":
         ) = load_instance(None, instance_folder=f"precalculated_instances/{instance}")
 
     n_batches = max(args.orders // 50, 5)
-    n_batches_2d = min(args.orders // (50*args.stations), 5) 
+    n_batches_2d = min(args.orders // (50 * args.stations), 5)
     if decomp == "temporal":
         stitched_sol = solve_time_decomposition(instance, n_time_batches=n_batches)
 
@@ -836,7 +921,7 @@ if __name__ == "__main__":
 
     elif decomp == "2d_temporal":
         stitched_sol = solve_2d_decomposition(instance, n_time_batches=n_batches_2d)
-        
+
     elif decomp == "rl":
         stitched_sol = solve_rl_decomposition(instance)
     else:

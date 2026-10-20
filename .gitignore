@@ -26,3 +26,6 @@ decomposition_experiments
 patch_*.py
 media
 param_exp
+*.jpg
+*.pth
+*.json
