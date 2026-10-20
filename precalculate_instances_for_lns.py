@@ -7,7 +7,15 @@ import time
 from contextlib import redirect_stdout
 from itertools import product
 
-from autostore_heuristic import build_viz_handles, validate_solution, validate_warmstart
+# Suppress matplotlib font cache warnings
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/mpl_config")
+
+from autostore_heuristic import (
+    build_viz_handles,
+    run_sgc,
+    validate_solution,
+    validate_warmstart,
+)
 from cp_model import extract_and_print_solution
 import cpp_cp_model
 from datagen import generate_data
@@ -15,10 +23,96 @@ from heuristic_rdi_sgc import run_rdi_sgc
 from schedule_visualizer import plot_schedule, write_html
 
 
-def precalculate_config(config):
-    path = f"precalculated_instances/GEN{config['gen_seed']}-{config['stations']}-{config['lanes']}-{config['skus']}-{config['orders']}-{config['movecap']}"
+def solve_warmstart_heuristic(heuristic_name: str, instance, config: dict):
+    """
+    Solves the instance using the requested warm-starting heuristic.
+    Returns (heur_sol, heur_label).
+    """
+    h = heuristic_name.lower().replace("-", "_")
+    if h in (
+        "load_balanced_greedy",
+        "load_balanced_sgc",
+        "lb_sgc",
+        "lb_greedy",
+        "load_balancing_sgc",
+        "load_balancing_greedy",
+    ):
+        sol = run_sgc(
+            instance,
+            horizon=config.get("horizon", 10000),
+            move_cap=config.get("movecap"),
+            ALPHA=config.get("alpha", 1.0),
+            BETA=config.get("beta", 0.0),
+            pick_cap=instance.pickcap,
+            restrict_stations_by_workload=True,
+        )
+        return sol, "Load-Balanced SGC (Greedy)"
+    elif h in ("standard_greedy", "standard_sgc", "sgc", "greedy", "full_greedy"):
+        sol = run_sgc(
+            instance,
+            horizon=config.get("horizon", 10000),
+            move_cap=config.get("movecap"),
+            ALPHA=config.get("alpha", 1.0),
+            BETA=config.get("beta", 0.0),
+            pick_cap=instance.pickcap,
+            restrict_stations_by_workload=False,
+        )
+        return sol, "Standard SGC (Greedy)"
+    elif h in ("rdi_sgc", "rdi", "full_rdi"):
+        sol = run_rdi_sgc(
+            instance,
+            horizon=config.get("horizon", 10000),
+            move_cap=config.get("movecap"),
+            ALPHA=config.get("alpha", 1.0),
+            BETA=config.get("beta", 0.0),
+            pick_cap=instance.pickcap,
+        )
+        return sol, "RDI-SGC"
+    elif h in ("load_balanced_rdi", "lb_rdi"):
+        from decomposition import solve_load_balanced_station_decomposition
 
-    os.mkdir(path)
+        sol = solve_load_balanced_station_decomposition(instance)
+        return sol, "Load-Balanced RDI"
+    elif h in ("random_rdi", "random_partition_rdi"):
+        from decomposition import solve_station_decomposition
+
+        sol = solve_station_decomposition(
+            instance,
+            partition_method="random",
+        )
+        return sol, "Random-Partitioned RDI"
+    elif h in ("similarity_rdi", "similarity_partition_rdi"):
+        from decomposition import solve_station_decomposition
+
+        sol = solve_station_decomposition(
+            instance,
+            partition_method="similarity",
+        )
+        return sol, "Similarity-Partitioned RDI"
+    else:
+        raise ValueError(
+            f"Unknown heuristic '{heuristic_name}'. Available options: "
+            f"load_balanced_greedy, standard_greedy, rdi_sgc, "
+            f"load_balanced_rdi, random_rdi, similarity_rdi"
+        )
+
+
+def precalculate_config(config):
+    heur_name = config.get("heuristic", "load_balanced_greedy")
+    base_name = f"GEN{config['gen_seed']}-{config['stations']}-{config['lanes']}-{config['skus']}-{config['orders']}-{config['movecap']}"
+    path = f"precalculated_instances/{base_name}"
+    if os.path.exists(path):
+        cfg_file = f"{path}/config.json"
+        if os.path.exists(cfg_file):
+            try:
+                with open(cfg_file, "r") as f:
+                    existing_cfg = json.load(f)
+                if existing_cfg != config:
+                    path = f"precalculated_instances/{base_name}-{heur_name}"
+            except Exception:
+                pass
+
+    os.makedirs(path, exist_ok=True)
 
     with open(f"{path}/config.json", "w+") as f:
         json.dump(config, f)
@@ -52,32 +146,31 @@ def precalculate_config(config):
     )
 
     t0 = time.perf_counter()
-    heur_sol = run_rdi_sgc(
-        instance,
-        horizon=config["horizon"],
-        move_cap=config["movecap"],
-        ALPHA=config["alpha"],
-        BETA=config["beta"],
-        pick_cap=instance.pickcap,
-    )
+    heur_sol, heur_label = solve_warmstart_heuristic(heur_name, instance, config)
     elapsed = time.perf_counter() - t0
 
     violations = validate_solution(
         heur_sol, instance, horizon=config["horizon"], move_cap=config["movecap"]
     )
     violations.extend(validate_warmstart(heur_sol, heur_sol.pick_events, handles))
+    if violations:
+        print(
+            f"[!] Warning: Heuristic solution has {len(violations)} validation violation(s):"
+        )
+        for v in violations[:10]:
+            print(f"    - {v}")
 
     with open(f"{path}/heuristic_solution.pkl", "wb") as f:
         pickle.dump(heur_sol, f)
 
     with open(f"{path}/heuristic_summary.txt", "w+") as f:
         f.write(
-            f"RDI-SGC Heuristic Result | Feasible: {heur_sol.feasible} | Makespan: {heur_sol.makespan} | BinEvents: {heur_sol.total_moves // 2} | Time: {elapsed}"
+            f"{heur_label} Result | Feasible: {heur_sol.feasible} | Makespan: {heur_sol.makespan} | BinEvents: {heur_sol.total_moves // 2} | Time: {elapsed:.3f}s\n"
         )
 
     mock_sol, viz_handles = build_viz_handles(heur_sol, instance)
     fig = plot_schedule(mock_sol, viz_handles, show=False)
-    html_file = f"{path}/Heur-RDI_solution.html"
+    html_file = f"{path}/heuristic_solution.html"
     write_html(fig, html_file)
     print(f"\nWrote visualization to {html_file}")
 
@@ -125,36 +218,47 @@ def precalculate_config(config):
             if plot_schedule:
                 print("Exporting visualization...")
                 fig = plot_schedule(sol_cp, handles, show=False)
-                html_file = f"{path}/CP-RDI_solution_{seed}.html"
+                html_file = f"{path}/cp_solution_{seed}.html"
                 write_html(fig, html_file)
                 print(f"\nWrote visualization to {html_file}")
         else:
             print("No solution found by CP.")
 
-    os.mkdir(f"{path}/experiments")
+    os.makedirs(f"{path}/experiments", exist_ok=True)
     return path
 
 
 def check_if_precalculated(config, with_removal=False):
     ret = None
+    if not os.path.exists("precalculated_instances"):
+        return None
     for past in os.listdir("precalculated_instances"):
-        with open(f"precalculated_instances/{past}/config.json", "r") as f:
-            past_config = json.load(f)
-            if past_config == config:
-                if "experiments" in os.listdir(f"precalculated_instances/{past}"):
-                    print(f"Config {config} is already precalculated in {past}.")
-                    ret = f"precalculated_instances/{past}"
-                    break
-                elif with_removal:
-                    if (
-                        input("Found non-completed instance, remove and recalculate?")
-                        == "yes"
-                    ):
-                        shutil.rmtree(f"precalculated_instances/{past}")
-                    else:
-                        raise ValueError(
-                            "Incomplete instance but no recalculate on prompt"
-                        )
+        folder = f"precalculated_instances/{past}"
+        if not os.path.isdir(folder):
+            continue
+        cfg_file = f"{folder}/config.json"
+        if not os.path.exists(cfg_file):
+            continue
+        try:
+            with open(cfg_file, "r") as f:
+                past_config = json.load(f)
+        except Exception:
+            continue
+        if past_config == config:
+            if "experiments" in os.listdir(folder):
+                print(f"Config {config} is already precalculated in {past}.")
+                ret = folder
+                break
+            elif with_removal:
+                if (
+                    input("Found non-completed instance, remove and recalculate?")
+                    == "yes"
+                ):
+                    shutil.rmtree(folder)
+                else:
+                    raise ValueError(
+                        "Incomplete instance but no recalculate on prompt"
+                    )
     return ret
 
 
@@ -255,6 +359,22 @@ def main():
 
     parser.add_argument("--grid-depth", type=int, default=16)
     parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument(
+        "--heuristic",
+        type=str,
+        default="load_balanced_greedy",
+        choices=[
+            "load_balanced_greedy",
+            "load_balanced_sgc",
+            "standard_greedy",
+            "standard_sgc",
+            "rdi_sgc",
+            "load_balanced_rdi",
+            "random_rdi",
+            "similarity_rdi",
+        ],
+        help="Warm-starting heuristic to use (default: load_balanced_greedy)",
+    )
     args = parser.parse_args()
 
     TIME_LIMIT = args.time_limit
@@ -281,7 +401,7 @@ def main():
         f"Will be done at: {(dt.datetime.now() + dt.timedelta(seconds=total * TIME_LIMIT)).strftime('%d.%m.%Y %H:%M:%S')}"
     )
     print(
-        f"Precalculating configs: {TIME_LIMIT=} {GEN_SEEDS=} {CP_SEEDS=} {STATIONS=} {LANES=} {SKUS=} {ORDERS=} {MOVECAPS=}"
+        f"Precalculating configs: heuristic={args.heuristic} {TIME_LIMIT=} {GEN_SEEDS=} {CP_SEEDS=} {STATIONS=} {LANES=} {SKUS=} {ORDERS=} {MOVECAPS=}"
     )
 
     for gen_seed, s, l, k, o, m in product(
@@ -294,6 +414,7 @@ def main():
             "symmetry_breaking": True,
             "skus": k,
             "movecap": m,
+            "heuristic": args.heuristic,
             "order_dist": args.order_dist,
             "skew": args.skew,
             "rt_model": args.rt_model,
