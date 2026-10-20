@@ -275,6 +275,50 @@ def create_similarity_partitions(instance, n_partitions=5):
     return partitions
 
 
+def create_load_balanced_partitions(
+    instance, n_partitions=5, sort_descending=True
+):
+    """
+    Partitions orders across n_partitions by greedily assigning each order
+    to the station/partition with the lowest assigned workload
+    (sum of assigned orders' items' picking times).
+
+    Args:
+        instance: The problem Instance.
+        n_partitions: Number of stations/partitions.
+        sort_descending: If True, processes orders in descending order of workload
+            (LPT - Longest Processing Time first), providing standard greedy load balancing.
+            If False, processes orders in original instance order.
+    Returns:
+        List of sets of order IDs, one set per partition.
+    """
+    if n_partitions <= 0:
+        return []
+    if n_partitions == 1:
+        return [set(instance.O)]
+
+    station_workloads = [0.0] * n_partitions
+    partitions = [set() for _ in range(n_partitions)]
+
+    order_workloads = {
+        o: sum(instance.p.get(k, 0) for k in instance.orders_req[o])
+        for o in instance.O
+    }
+
+    if sort_descending:
+        sorted_orders = sorted(instance.O, key=lambda o: order_workloads[o], reverse=True)
+    else:
+        sorted_orders = list(instance.O)
+
+    for o in sorted_orders:
+        w = order_workloads[o]
+        min_idx = min(range(n_partitions), key=lambda idx: station_workloads[idx])
+        partitions[min_idx].add(o)
+        station_workloads[min_idx] += w
+
+    return partitions
+
+
 def distribute_movecap(
     total_movecap: int | None,
     n_stations: int,
@@ -309,10 +353,19 @@ def solve_station_decomposition(
     exo_lanes_in=None,
     exo_moves_in=None,
     batch_start_time=0,
+    partition_method="random",
 ):
     n_partitions = len(instance.S)
-    partitions = create_random_partitions(instance, n_partitions)
-    workloads = [len(p) for p in partitions]
+    if partition_method == "load_balanced":
+        partitions = create_load_balanced_partitions(instance, n_partitions)
+    elif partition_method == "similarity":
+        partitions = create_similarity_partitions(instance, n_partitions)
+    else:
+        partitions = create_random_partitions(instance, n_partitions)
+    workloads = [
+        sum(instance.p.get(k, 0) for o in p for k in instance.orders_req[o])
+        for p in partitions
+    ]
     station_movecaps = distribute_movecap(instance.movecap, n_partitions, workloads)
 
     subsolutions = []
@@ -393,6 +446,23 @@ def solve_station_decomposition(
 
     # Stitch solutions across stations
     return stitch_heuristic_solutions(subsolutions)
+
+
+def solve_load_balanced_station_decomposition(
+    instance,
+    exo_blocks_in=None,
+    exo_lanes_in=None,
+    exo_moves_in=None,
+    batch_start_time=0,
+):
+    return solve_station_decomposition(
+        instance,
+        exo_blocks_in=exo_blocks_in,
+        exo_lanes_in=exo_lanes_in,
+        exo_moves_in=exo_moves_in,
+        batch_start_time=batch_start_time,
+        partition_method="load_balanced",
+    )
 
 
 def solve_time_decomposition(
@@ -829,7 +899,7 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--decomposition-type",
-        choices=["temporal", "spatial", "2d_temporal", "2d_spatial", "rl"],
+        choices=["temporal", "spatial", "load_balanced", "2d_temporal", "2d_spatial", "rl"],
     )
 
     parser.add_argument("--pick", type=int, default=4, help="Pick touch time")
@@ -913,6 +983,9 @@ if __name__ == "__main__":
 
     elif decomp == "spatial":
         stitched_sol = solve_station_decomposition(instance)
+
+    elif decomp == "load_balanced":
+        stitched_sol = solve_load_balanced_station_decomposition(instance)
 
     elif decomp == "2d_spatial":
         stitched_sol = solve_2d_decomposition_spatial_first(

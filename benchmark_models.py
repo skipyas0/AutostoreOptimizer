@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
-Benchmark script to compare pretrained RL order-to-station assignment model checkpoints
+Benchmark script to compare pretrained RL order-to-station assignment model checkpoints (MLP/GNN)
 against:
   1. Random-partitioned RDI
   2. Similarity-partitioned RDI
-  3. Full RDI without decomposition
+  3. Load-balanced RDI
+  4. Full RDI without decomposition
+  5. Standard Full Greedy Heuristic (autostore_heuristic.py SGC)
+  6. Load-balanced Greedy Heuristic (autostore_heuristic.py SGC with restricted candidate stations)
 
 Instances are generated using the exact distribution and parameters from the RL training loop,
 with disjoint random seeds. Metrics reported are the exact components and reward formulations
@@ -12,7 +15,7 @@ from the RL environment, plus average solution times.
 
 Usage:
   .venv/bin/python benchmark_models.py
-  .venv/bin/python benchmark_models.py --checkpoints rl_agent_weights.pth rl_agent_weights_fixed_pickcap_shiftnm.pth --num-instances 10
+  .venv/bin/python benchmark_models.py --checkpoints rl_agent_weights_mlp_1200.pth --num-instances 10
 """
 
 import argparse
@@ -28,6 +31,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # Suppress matplotlib font cache warnings
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/mpl_config")
 import logging
+
 logging.getLogger("matplotlib").setLevel(logging.ERROR)
 
 import torch
@@ -37,8 +41,10 @@ code_dir = os.path.dirname(os.path.abspath(__file__))
 if code_dir not in sys.path:
     sys.path.insert(0, code_dir)
 
+from autostore_heuristic import run_sgc
 from datagen import generate_data
 from decomposition import (
+    create_load_balanced_partitions,
     create_random_partitions,
     create_similarity_partitions,
     distribute_movecap,
@@ -98,12 +104,12 @@ def generate_benchmark_instance(instance_idx: int, seed_base: int = 100000) -> I
     s = rng.randint(2, 12)
     l = rng.randint(3, 10)
     if s > 5:
-        o = rng.randint(2, 8) * 100
-        m = rng.randint(4, 8) * 10
+        o = rng.randint(2, 8) * 50
+        m = rng.randint(4, 8) * 5
         sku = rng.randint(8, 15) * 2000
     else:
-        o = rng.randint(2, 8) * 30
-        m = rng.randint(4, 8) * 5
+        o = rng.randint(2, 8) * 10
+        m = rng.randint(4, 8) * 2
         sku = rng.randint(8, 15) * 1000
 
     instance = generate_data(
@@ -141,20 +147,16 @@ def compute_metrics_from_station_results(
     num_stations = len(instance.S)
 
     # 1. Upper bound: robot fetch + return limit
-    upper_bound = (
-        sum(
-            instance.rt.get(k, 0) + instance.rt_ret.get(k, 0)
-            for o in instance.O
-            for k in instance.orders_req[o]
-        )
-        / max(instance.movecap, 1)
-    )
+    upper_bound = sum(
+        instance.rt.get(k, 0) + instance.rt_ret.get(k, 0)
+        for o in instance.O
+        for k in instance.orders_req[o]
+    ) / max(instance.movecap, 1)
 
     # 2. Lower bound: picker saturation bound
-    lower_bound = (
-        sum(instance.p.get(k, 0) for o in instance.O for k in instance.orders_req[o])
-        / max(num_stations, 1)
-    )
+    lower_bound = sum(
+        instance.p.get(k, 0) for o in instance.O for k in instance.orders_req[o]
+    ) / max(num_stations, 1)
 
     scale_estimate = (upper_bound + lower_bound) / 2
     scale_estimate = max(scale_estimate, 1e-6)
@@ -226,7 +228,11 @@ def evaluate_station_assignments(
         assigned_orders = station_assignments.get(i, [])
 
         # Workload W_k
-        w = sum(instance.p.get(k, 0) for o in assigned_orders for k in instance.orders_req[o])
+        w = sum(
+            instance.p.get(k, 0)
+            for o in assigned_orders
+            for k in instance.orders_req[o]
+        )
         W_k.append(float(w))
 
         if not assigned_orders:
@@ -257,7 +263,8 @@ def evaluate_station_assignments(
             Be_k.append(len(events))
             P_k.append(len(heur_sol.pick_events))
             rt_sum = sum(
-                be.fetch_end - be.fetch_start + be.return_end - be.return_start for be in events
+                be.fetch_end - be.fetch_start + be.return_end - be.return_start
+                for be in events
             )
             Rt_k.append(float(rt_sum))
         else:
@@ -275,7 +282,9 @@ def run_random_partition_rdi(instance: Instance) -> Dict[str, float]:
     t_partition = time.perf_counter() - t0
 
     station_assignments = {i: list(p) for i, p in enumerate(partitions)}
-    M_k, W_k, Be_k, P_k, Rt_k = evaluate_station_assignments(instance, station_assignments)
+    M_k, W_k, Be_k, P_k, Rt_k = evaluate_station_assignments(
+        instance, station_assignments
+    )
     t_total = time.perf_counter() - t0
 
     return compute_metrics_from_station_results(
@@ -289,7 +298,9 @@ def run_similarity_partition_rdi(instance: Instance) -> Dict[str, float]:
     t_partition = time.perf_counter() - t0
 
     station_assignments = {i: list(p) for i, p in enumerate(partitions)}
-    M_k, W_k, Be_k, P_k, Rt_k = evaluate_station_assignments(instance, station_assignments)
+    M_k, W_k, Be_k, P_k, Rt_k = evaluate_station_assignments(
+        instance, station_assignments
+    )
     t_total = time.perf_counter() - t0
 
     return compute_metrics_from_station_results(
@@ -297,11 +308,25 @@ def run_similarity_partition_rdi(instance: Instance) -> Dict[str, float]:
     )
 
 
-def run_full_rdi_no_decomposition(instance: Instance, horizon: int = 50000) -> Dict[str, float]:
+def run_load_balanced_partition_rdi(instance: Instance) -> Dict[str, float]:
     t0 = time.perf_counter()
-    heur_sol = run_rdi_sgc(instance, horizon=horizon, batch_start_time=0)
+    partitions = create_load_balanced_partitions(instance, len(instance.S))
+    t_partition = time.perf_counter() - t0
+
+    station_assignments = {i: list(p) for i, p in enumerate(partitions)}
+    M_k, W_k, Be_k, P_k, Rt_k = evaluate_station_assignments(
+        instance, station_assignments
+    )
     t_total = time.perf_counter() - t0
 
+    return compute_metrics_from_station_results(
+        instance, M_k, W_k, Be_k, P_k, Rt_k, t_total, partition_time=t_partition
+    )
+
+
+def _extract_monolithic_solution_metrics(
+    instance: Instance, heur_sol, t_total: float
+) -> Dict[str, float]:
     M_k = []
     W_k = []
     Be_k = []
@@ -311,13 +336,23 @@ def run_full_rdi_no_decomposition(instance: Instance, horizon: int = 50000) -> D
     if heur_sol and heur_sol.feasible:
         for s_idx in instance.S:
             assigned_orders = [
-                o for o, (s, ln, st, en) in heur_sol.order_assignments.items() if s == s_idx
+                o
+                for o, (s, ln, st, en) in heur_sol.order_assignments.items()
+                if s == s_idx
             ]
-            w = sum(instance.p.get(k, 0) for o in assigned_orders for k in instance.orders_req[o])
+            w = sum(
+                instance.p.get(k, 0)
+                for o in assigned_orders
+                for k in instance.orders_req[o]
+            )
             W_k.append(float(w))
 
             stn_makespan = max(
-                (en for o, (s, ln, st, en) in heur_sol.order_assignments.items() if s == s_idx),
+                (
+                    en
+                    for o, (s, ln, st, en) in heur_sol.order_assignments.items()
+                    if s == s_idx
+                ),
                 default=0.0,
             )
             M_k.append(float(stn_makespan))
@@ -332,7 +367,8 @@ def run_full_rdi_no_decomposition(instance: Instance, horizon: int = 50000) -> D
             P_k.append(stn_picks)
 
             rt_sum = sum(
-                be.fetch_end - be.fetch_start + be.return_end - be.return_start for be in events
+                be.fetch_end - be.fetch_start + be.return_end - be.return_start
+                for be in events
             )
             Rt_k.append(float(rt_sum))
     else:
@@ -346,6 +382,30 @@ def run_full_rdi_no_decomposition(instance: Instance, horizon: int = 50000) -> D
     return compute_metrics_from_station_results(
         instance, M_k, W_k, Be_k, P_k, Rt_k, t_total, partition_time=0.0
     )
+
+
+def run_full_rdi_no_decomposition(
+    instance: Instance, horizon: int = 50000
+) -> Dict[str, float]:
+    t0 = time.perf_counter()
+    heur_sol = run_rdi_sgc(instance, horizon=horizon, batch_start_time=0)
+    t_total = time.perf_counter() - t0
+    return _extract_monolithic_solution_metrics(instance, heur_sol, t_total)
+
+
+def run_full_greedy_heuristic(
+    instance: Instance,
+    horizon: int = 50000,
+    restrict_stations_by_workload: bool = False,
+) -> Dict[str, float]:
+    t0 = time.perf_counter()
+    heur_sol = run_sgc(
+        instance,
+        horizon=horizon,
+        restrict_stations_by_workload=restrict_stations_by_workload,
+    )
+    t_total = time.perf_counter() - t0
+    return _extract_monolithic_solution_metrics(instance, heur_sol, t_total)
 
 
 def run_rl_checkpoint_rdi(
@@ -387,7 +447,9 @@ def run_rl_checkpoint_rdi(
         s_idx = min(s_idx, len(instance.S) - 1)
         station_assignments[s_idx].append(instance.O[o_idx])
 
-    M_k, W_k, Be_k, P_k, Rt_k = evaluate_station_assignments(instance, station_assignments)
+    M_k, W_k, Be_k, P_k, Rt_k = evaluate_station_assignments(
+        instance, station_assignments
+    )
     t_total = time.perf_counter() - t0
 
     return compute_metrics_from_station_results(
@@ -472,6 +534,11 @@ def parse_args():
         help="Skip Full RDI (without decomposition) if speed is a concern on large instances.",
     )
     parser.add_argument(
+        "--skip-greedy",
+        action="store_true",
+        help="Skip Standard Greedy Heuristic (autostore_heuristic.py SGC) without decomposition.",
+    )
+    parser.add_argument(
         "--output-json",
         type=str,
         default="benchmark_results.json",
@@ -498,7 +565,9 @@ def main():
         if not checkpoints:
             print("[!] Warning: No .pth files found in current directory.")
         else:
-            print(f"[*] Auto-discovered {len(checkpoints)} checkpoint(s): {checkpoints}")
+            print(
+                f"[*] Auto-discovered {len(checkpoints)} checkpoint(s): {checkpoints}"
+            )
 
     # Load RL models
     loaded_models: Dict[str, OrderAssignmentAgent] = {}
@@ -520,16 +589,24 @@ def main():
         methods.append(model_name)
     methods.append("1. Random-partitioned RDI")
     methods.append("2. Similarity-partitioned RDI")
+    methods.append("3. Load-balanced RDI")
     if not args.skip_full_rdi:
-        methods.append("3. Full RDI (No Decomposition)")
+        methods.append("4. Full RDI (No Decomposition)")
+    if not args.skip_greedy:
+        methods.append("5. Standard Full Greedy (SGC)")
+        methods.append("6. Load-balanced Greedy (SGC)")
 
-    print(f"\n[*] Evaluating {len(methods)} method(s) across {args.num_instances} instance(s)...")
+    print(
+        f"\n[*] Evaluating {len(methods)} method(s) across {args.num_instances} instance(s)..."
+    )
 
     results_by_method: Dict[str, List[Dict[str, float]]] = defaultdict(list)
     detailed_history = []
 
     for inst_idx in range(args.num_instances):
-        print(f"\n>>> Instance {inst_idx + 1:02d}/{args.num_instances} (Seed: {args.seed_base + inst_idx})")
+        print(
+            f"\n>>> Instance {inst_idx + 1:02d}/{args.num_instances} (Seed: {args.seed_base + inst_idx})"
+        )
         instance = generate_benchmark_instance(inst_idx, seed_base=args.seed_base)
         print(
             f"    Specs: Stations={len(instance.S)}, Lanes={len(instance.L)}, "
@@ -588,19 +665,62 @@ def main():
         except Exception as e:
             print(f"    - {'2. Similarity-partitioned RDI':<32} | FAILED: {e}")
 
-        # 4. Full RDI without decomposition
+        # 4. Load-balanced RDI
+        try:
+            res_lb = run_load_balanced_partition_rdi(instance)
+            results_by_method["3. Load-balanced RDI"].append(res_lb)
+            inst_record["methods"]["3. Load-balanced RDI"] = res_lb
+            print(
+                f"    - {'3. Load-balanced RDI':<32} | Makespan: {res_lb['makespan']:6.0f} | "
+                f"Norm M: {res_lb['normalized_makespan']:7.4f} | Imbalance: {res_lb['avg_pick_imbalance']:7.2f} | "
+                f"Time: {res_lb['total_time']:6.2f}s"
+            )
+        except Exception as e:
+            print(f"    - {'3. Load-balanced RDI':<32} | FAILED: {e}")
+
+        # 5. Full RDI without decomposition
         if not args.skip_full_rdi:
             try:
                 res_full = run_full_rdi_no_decomposition(instance)
-                results_by_method["3. Full RDI (No Decomposition)"].append(res_full)
-                inst_record["methods"]["3. Full RDI (No Decomposition)"] = res_full
+                results_by_method["4. Full RDI (No Decomposition)"].append(res_full)
+                inst_record["methods"]["4. Full RDI (No Decomposition)"] = res_full
                 print(
-                    f"    - {'3. Full RDI (No Decomposition)':<32} | Makespan: {res_full['makespan']:6.0f} | "
+                    f"    - {'4. Full RDI (No Decomposition)':<32} | Makespan: {res_full['makespan']:6.0f} | "
                     f"Norm M: {res_full['normalized_makespan']:7.4f} | Imbalance: {res_full['avg_pick_imbalance']:7.2f} | "
                     f"Time: {res_full['total_time']:6.2f}s"
                 )
             except Exception as e:
-                print(f"    - {'3. Full RDI (No Decomposition)':<32} | FAILED: {e}")
+                print(f"    - {'4. Full RDI (No Decomposition)':<32} | FAILED: {e}")
+
+        # 6. Standard Full Greedy Heuristic (SGC) without decomposition
+        if not args.skip_greedy:
+            try:
+                res_greedy = run_full_greedy_heuristic(
+                    instance, restrict_stations_by_workload=False
+                )
+                results_by_method["5. Standard Full Greedy (SGC)"].append(res_greedy)
+                inst_record["methods"]["5. Standard Full Greedy (SGC)"] = res_greedy
+                print(
+                    f"    - {'5. Standard Full Greedy (SGC)':<32} | Makespan: {res_greedy['makespan']:6.0f} | "
+                    f"Norm M: {res_greedy['normalized_makespan']:7.4f} | Imbalance: {res_greedy['avg_pick_imbalance']:7.2f} | "
+                    f"Time: {res_greedy['total_time']:6.2f}s"
+                )
+            except Exception as e:
+                print(f"    - {'5. Standard Full Greedy (SGC)':<32} | FAILED: {e}")
+
+            try:
+                res_lb_greedy = run_full_greedy_heuristic(
+                    instance, restrict_stations_by_workload=True
+                )
+                results_by_method["6. Load-balanced Greedy (SGC)"].append(res_lb_greedy)
+                inst_record["methods"]["6. Load-balanced Greedy (SGC)"] = res_lb_greedy
+                print(
+                    f"    - {'6. Load-balanced Greedy (SGC)':<32} | Makespan: {res_lb_greedy['makespan']:6.0f} | "
+                    f"Norm M: {res_lb_greedy['normalized_makespan']:7.4f} | Imbalance: {res_lb_greedy['avg_pick_imbalance']:7.2f} | "
+                    f"Time: {res_lb_greedy['total_time']:6.2f}s"
+                )
+            except Exception as e:
+                print(f"    - {'6. Load-balanced Greedy (SGC)':<32} | FAILED: {e}")
 
         detailed_history.append(inst_record)
 
