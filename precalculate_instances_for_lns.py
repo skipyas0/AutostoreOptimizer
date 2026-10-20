@@ -8,12 +8,8 @@ from contextlib import redirect_stdout
 from itertools import product
 
 from autostore_heuristic import build_viz_handles, validate_solution, validate_warmstart
-from cp_model import (
-    ProgressCollector,
-    build_model,
-    extract_and_print_solution,
-    inject_warmstart,
-)
+from cp_model import extract_and_print_solution
+import cpp_cp_model
 from datagen import generate_data
 from heuristic_rdi_sgc import run_rdi_sgc
 from schedule_visualizer import plot_schedule, write_html
@@ -49,7 +45,7 @@ def precalculate_config(config):
     with open(f"{path}/instance_summary.txt", "w+") as f, redirect_stdout(f):
         instance.print_summary()
 
-    mdl, handles = build_model(
+    mdl, handles = cpp_cp_model.build_model(
         instance,
         add_symmetry_breaking=config["symmetry_breaking"],
         horizon=config["horizon"],
@@ -80,38 +76,37 @@ def precalculate_config(config):
         )
 
     mock_sol, viz_handles = build_viz_handles(heur_sol, instance)
-    fig = plot_schedule(mock_sol, viz_handles)
+    fig = plot_schedule(mock_sol, viz_handles, show=False)
     html_file = f"{path}/Heur-RDI_solution.html"
     write_html(fig, html_file)
     print(f"\nWrote visualization to {html_file}")
 
-    sp = inject_warmstart(heur_sol, heur_sol.pick_events, mdl, handles)
+    sp = cpp_cp_model.inject_warmstart(heur_sol, heur_sol.pick_events, mdl, handles)
 
     for seed in config["cp_seeds"]:
-        mdl, handles = build_model(
+        mdl, handles = cpp_cp_model.build_model(
             instance,
             add_symmetry_breaking=config["symmetry_breaking"],
             horizon=config["horizon"],
         )
 
-        history_listener = ProgressCollector()
+        history_listener = cpp_cp_model.ProgressCollector()
         mdl.add_solver_listener(history_listener)
 
         mdl.set_starting_point(sp)
 
-        with open(f"{path}/cplog_{seed}.txt", "w+") as cp_log:
-            print(
-                f"Solving CP Model with {config['time_limit']}s time limit and seed {seed}..."
-            )
-            sol_cp = mdl.solve(
-                TimeLimit=config["time_limit"],
-                LogVerbosity="Verbose",
-                log_output=cp_log,
-                solve_with_search_next=True,
-                RandomSeed=seed,
-                Workers=config["workers"],
-            )
-            cp_log.flush()
+        log_path = f"{path}/cplog_{seed}.txt"
+        print(
+            f"Solving CP Model with {config['time_limit']}s time limit and seed {seed} (C++ Backend)..."
+        )
+        sol_cp = mdl.solve(
+            time_limit=config["time_limit"],
+            workers=config["workers"],
+            random_seed=seed,
+            log_verbosity="Verbose",
+            log_filename=log_path,
+            collect_progress=True,
+        )
 
         if sol_cp:
             sol = sol_cp.get_solution()
@@ -129,7 +124,7 @@ def precalculate_config(config):
                 extract_and_print_solution(sol_cp, handles)
             if plot_schedule:
                 print("Exporting visualization...")
-                fig = plot_schedule(sol_cp, handles)
+                fig = plot_schedule(sol_cp, handles, show=False)
                 html_file = f"{path}/CP-RDI_solution_{seed}.html"
                 write_html(fig, html_file)
                 print(f"\nWrote visualization to {html_file}")

@@ -842,6 +842,7 @@ def inject_warmstart(solution, pick_events: dict, mdl, handles):
 class ProgressCollector(CpoSolverListener):
     """
     CP Optimizer listener that records every incumbent improvement.
+    Stores solution deltas to minimize memory footprint and avoid OOM.
 
     records = [
         {
@@ -849,6 +850,7 @@ class ProgressCollector(CpoSolverListener):
             "best": <current best objective>,
             "bound": <current best bound>,
             "gap": <relative gap>,
+            "delta": {var_name: {"present": bool, "start": int|None, "end": int|None, "size": int|None}, ...}
         },
         ...
     ]
@@ -858,11 +860,13 @@ class ProgressCollector(CpoSolverListener):
         super().__init__()
         self.records = []
         self.best_obj = None
+        self.current_sol = {}
 
     def result_found(self, solver, sres):
         """
         Called by CP Optimizer when a (new) solution is found.
         We only record strict improvements of the objective.
+        Only variables whose state changed relative to the previous solution are stored in delta.
         """
         try:
             if not sres.is_solution():
@@ -876,19 +880,81 @@ class ProgressCollector(CpoSolverListener):
                 )
                 return
 
-            sol_dict = build_solve_dict(sres)
-
             # Only keep strict improvements
             if (self.best_obj is None) or (obj < self.best_obj):
                 self.best_obj = obj
+                delta = {}
+                for var_sol in sres.get_all_var_solutions():
+                    val = var_sol.get_value()
+                    name = var_sol.get_name()
+                    if hasattr(val, "is_present"):
+                        pres = bool(val.is_present())
+                        cur_state = {
+                            "present": pres,
+                            "start": int(val.get_start()) if pres and val.get_start() is not None else None,
+                            "end": int(val.get_end()) if pres and val.get_end() is not None else None,
+                            "size": int(val.get_size()) if pres and hasattr(val, "get_size") and val.get_size() is not None else None,
+                        }
+                    elif isinstance(val, dict):
+                        pres = bool(val.get("present"))
+                        cur_state = {
+                            "present": pres,
+                            "start": int(val["start"]) if pres and val.get("start") is not None else None,
+                            "end": int(val["end"]) if pres and val.get("end") is not None else None,
+                            "size": int(val["size"]) if pres and val.get("size") is not None else None,
+                        }
+                    else:
+                        cur_state = val
+
+                    prev_state = self.current_sol.get(name)
+                    if prev_state != cur_state:
+                        delta[name] = cur_state
+                        self.current_sol[name] = cur_state
+
                 rec = {
                     "time": sres.get_solve_time(),
                     "best": obj,
                     "bound": sres.get_objective_bound(),
                     "gap": sres.get_objective_gap(),
-                    "sol": sol_dict,
+                    "delta": delta,
                 }
                 self.records.append(rec)
 
         except Exception as e:
             print("Exception in ProgressCollector.result_found:", e)
+
+    @property
+    def initial_solution(self):
+        return self.records[0]["delta"] if self.records else {}
+
+    @property
+    def deltas(self):
+        return [r["delta"] for r in self.records[1:]] if len(self.records) > 1 else []
+
+    def get_solution(self, index=-1):
+        """Reconstruct full solution dictionary at the given record index."""
+        if not self.records:
+            return None
+        if index < 0:
+            index = len(self.records) + index
+        sol = {}
+        for i in range(index + 1):
+            for k, v in self.records[i]["delta"].items():
+                if isinstance(v, dict):
+                    sol[k] = dict(v)
+                else:
+                    sol[k] = v
+        return sol
+
+    def reconstruct_solutions(self):
+        """Reconstruct full solution dictionaries for each record."""
+        current = {}
+        solutions = []
+        for rec in self.records:
+            for k, v in rec["delta"].items():
+                if isinstance(v, dict):
+                    current[k] = dict(v)
+                else:
+                    current[k] = v
+            solutions.append(dict(current))
+        return solutions

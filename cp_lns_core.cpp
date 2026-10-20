@@ -7,9 +7,135 @@
 #include <set>
 #include <map>
 #include <iostream>
+#include <fstream>
+#include <mutex>
 #include <optional>
 
 namespace py = pybind11;
+
+struct VarDelta {
+    bool present;
+    int start;
+    int end;
+    int size;
+};
+
+struct ProgressRecord {
+    double time;
+    double best;
+    double bound;
+    double gap;
+    std::unordered_map<std::string, VarDelta> delta;
+};
+
+class ProgressCollectorCallback : public IloCP::Callback {
+private:
+    std::mutex mutex_;
+    const std::unordered_map<std::string, IloIntervalVar>& vars_;
+    double best_obj_;
+    std::unordered_map<std::string, VarDelta> last_sol_;
+    std::vector<ProgressRecord> records_;
+
+public:
+    ProgressCollectorCallback(const std::unordered_map<std::string, IloIntervalVar>& vars)
+        : vars_(vars), best_obj_(1e30) {}
+
+    void clear() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        records_.clear();
+        last_sol_.clear();
+        best_obj_ = 1e30;
+    }
+
+    virtual void invoke(IloCP cp, IloCP::Callback::Reason reason) override {
+        if (reason == IloCP::Callback::Solution) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            double obj = 0.0;
+            try {
+                obj = cp.getObjValue();
+            } catch (...) {
+                return;
+            }
+            if (records_.empty() || obj < best_obj_) {
+                best_obj_ = obj;
+                ProgressRecord rec;
+                rec.time = cp.getInfo(IloCP::SolveTime);
+                rec.best = obj;
+                try {
+                    rec.bound = cp.getObjBound();
+                } catch (...) {
+                    rec.bound = 0.0;
+                }
+                try {
+                    rec.gap = cp.getObjGap();
+                } catch (...) {
+                    rec.gap = 0.0;
+                }
+
+                for (const auto& pair : vars_) {
+                    const std::string& name = pair.first;
+                    IloIntervalVar iv = pair.second;
+                    VarDelta cur;
+                    if (cp.isPresent(iv)) {
+                        cur.present = true;
+                        cur.start = cp.getStart(iv);
+                        cur.end = cp.getEnd(iv);
+                        cur.size = cp.getSize(iv);
+                    } else {
+                        cur.present = false;
+                        cur.start = -1;
+                        cur.end = -1;
+                        cur.size = -1;
+                    }
+
+                    auto it = last_sol_.find(name);
+                    if (it == last_sol_.end() ||
+                        it->second.present != cur.present ||
+                        it->second.start != cur.start ||
+                        it->second.end != cur.end ||
+                        it->second.size != cur.size) {
+                        rec.delta[name] = cur;
+                        last_sol_[name] = cur;
+                    }
+                }
+                records_.push_back(std::move(rec));
+            }
+        }
+    }
+
+    py::list get_records() const {
+        py::list py_records;
+        for (const auto& rec : records_) {
+            py::dict py_rec;
+            py_rec["time"] = rec.time;
+            py_rec["best"] = rec.best;
+            py_rec["bound"] = rec.bound;
+            py_rec["gap"] = rec.gap;
+            py::dict py_delta;
+            for (const auto& d : rec.delta) {
+                py::dict s;
+                s["present"] = d.second.present;
+                if (d.second.present) {
+                    s["start"] = d.second.start;
+                    s["end"] = d.second.end;
+                    s["size"] = d.second.size;
+                } else {
+                    s["start"] = py::none();
+                    s["end"] = py::none();
+                    s["size"] = py::none();
+                }
+                py_delta[d.first.c_str()] = s;
+            }
+            py_rec["delta"] = py_delta;
+            py_records.append(py_rec);
+        }
+        return py_records;
+    }
+
+    size_t size() const {
+        return records_.size();
+    }
+};
 
 class CpLnsModel {
 private:
@@ -19,6 +145,7 @@ private:
     std::unordered_map<std::string, IloIntervalVar> vars;
     std::unordered_map<std::string, std::vector<IloConstraint>> active_freeze_constraints;
     IloObjective makespan_obj;
+    std::unique_ptr<ProgressCollectorCallback> progress_collector;
 
     std::string make_key(const std::string& prefix, int o, int s) { return prefix + "[" + std::to_string(o) + "," + std::to_string(s) + "]"; }
     std::string make_key(const std::string& prefix, int o, int s, int ln) { return prefix + "[" + std::to_string(o) + "," + std::to_string(s) + "," + std::to_string(ln) + "]"; }
@@ -490,6 +617,7 @@ public:
             active_obj = makespan_obj;
         }
         model.add(active_obj);
+        progress_collector = std::make_unique<ProgressCollectorCallback>(vars);
     }
     
     void set_objective(const std::string& target) {
@@ -511,6 +639,7 @@ public:
     }
 
     ~CpLnsModel() {
+        progress_collector.reset();
         env.end();
     }
     
@@ -581,10 +710,30 @@ public:
         bulk_add.end();
     }
     
-    py::dict solve(double time_limit, int improvement_bound = -1, int workers = 1, std::string presolve = "Auto", std::string search_type = "Auto", bool only_first_sol = false) {
+    py::dict solve(double time_limit, int improvement_bound = -1, int workers = 1, std::string presolve = "Auto", std::string search_type = "Auto", bool only_first_sol = false, int random_seed = -1, std::string log_verbosity = "Quiet", const std::string& log_filename = "", bool collect_progress = false) {
         cp.setParameter(IloCP::TimeLimit, time_limit);
         cp.setParameter(IloCP::Workers, workers);
-        cp.setParameter(IloCP::LogVerbosity, IloCP::Quiet);
+        if (random_seed >= 0) {
+            cp.setParameter(IloCP::RandomSeed, random_seed);
+        }
+        if (log_verbosity == "Verbose") {
+            cp.setParameter(IloCP::LogVerbosity, IloCP::Verbose);
+        } else if (log_verbosity == "Terse") {
+            cp.setParameter(IloCP::LogVerbosity, IloCP::Terse);
+        } else if (log_verbosity == "Normal") {
+            cp.setParameter(IloCP::LogVerbosity, IloCP::Normal);
+        } else {
+            cp.setParameter(IloCP::LogVerbosity, IloCP::Quiet);
+        }
+
+        std::ofstream log_stream;
+        if (!log_filename.empty()) {
+            log_stream.open(log_filename);
+            if (log_stream.is_open()) {
+                cp.setOut(log_stream);
+                cp.setWarning(log_stream);
+            }
+        }
 
         if (presolve == "Off") {
             cp.setParameter(IloCP::Presolve, IloCP::Off);
@@ -626,7 +775,40 @@ public:
             model.add(impr_constr);
         }
         
-        bool found = cp.solve();
+        if (collect_progress) {
+            progress_collector->clear();
+            cp.addCallback(progress_collector.get());
+        }
+
+        bool found = false;
+        try {
+            found = cp.solve();
+        } catch (...) {
+            if (collect_progress) {
+                try { cp.removeCallback(progress_collector.get()); } catch (...) {}
+            }
+            if (log_stream.is_open()) {
+                log_stream.flush();
+                log_stream.close();
+                cp.setOut(env.getNullStream());
+                cp.setWarning(env.getNullStream());
+            }
+            if (improvement_bound != -1) {
+                try { model.remove(impr_constr); } catch (...) {}
+            }
+            throw;
+        }
+
+        if (collect_progress) {
+            cp.removeCallback(progress_collector.get());
+        }
+
+        if (log_stream.is_open()) {
+            log_stream.flush();
+            log_stream.close();
+            cp.setOut(env.getNullStream());
+            cp.setWarning(env.getNullStream());
+        }
         
         py::dict result;
         if (found) {
@@ -689,11 +871,17 @@ public:
             result["SolveTime"] = total_time - extraction_time;
         }
         
+        result["progress"] = collect_progress ? progress_collector->get_records() : py::list();
+
         if (improvement_bound != -1) {
             model.remove(impr_constr);
         }
         
         return result;
+    }
+
+    py::list get_progress_records() const {
+        return progress_collector->get_records();
     }
 
     void export_model(const std::string& filename) {
@@ -702,11 +890,28 @@ public:
 };
 
 PYBIND11_MODULE(cp_lns_core, m) {
-    py::class_<CpLnsModel>(m, "CpLnsModel")
+    py::class_<ProgressCollectorCallback>(m, "ProgressCollector")
+        .def("get_records", &ProgressCollectorCallback::get_records)
+        .def_property_readonly("records", &ProgressCollectorCallback::get_records)
+        .def("__len__", &ProgressCollectorCallback::size)
+        .def("clear", &ProgressCollectorCallback::clear);
+
+    py::class_<CpLnsModel>(m, "CpLnsModel", py::dynamic_attr())
         .def(py::init<std::vector<int>, std::vector<int>, std::vector<int>, std::map<int, std::vector<int>>, std::map<int, int>, std::map<int, int>, std::map<int, int>, std::optional<int>, std::optional<int>, std::map<int, int>, std::vector<int>, std::map<int, int>, int, bool, std::map<std::pair<int, int>, std::vector<std::pair<int, int>>>, std::map<int, std::vector<std::pair<int, int>>>, std::vector<std::pair<int, int>>, int, std::string>())
         .def("apply_warm_start", &CpLnsModel::apply_warm_start)
         .def("apply_delta_freezing", &CpLnsModel::apply_delta_freezing)
-        .def("solve", &CpLnsModel::solve, py::arg("time_limit"), py::arg("improvement_bound") = -1, py::arg("workers") = 1, py::arg("presolve") = "Auto", py::arg("search_type") = "Auto", py::arg("only_first_sol") = false)
+        .def("solve", &CpLnsModel::solve,
+             py::arg("time_limit"),
+             py::arg("improvement_bound") = -1,
+             py::arg("workers") = 1,
+             py::arg("presolve") = "Auto",
+             py::arg("search_type") = "Auto",
+             py::arg("only_first_sol") = false,
+             py::arg("random_seed") = -1,
+             py::arg("log_verbosity") = "Quiet",
+             py::arg("log_filename") = "",
+             py::arg("collect_progress") = false)
+        .def("get_progress_records", &CpLnsModel::get_progress_records)
         .def("export_model", &CpLnsModel::export_model, py::arg("filename"))
         .def("set_objective", &CpLnsModel::set_objective, py::arg("target"));
 }

@@ -177,9 +177,16 @@ class VisualLogger:
         self.inactive_start_idx = num_variables
 
         for var, idx in var_to_idx.items():
-            self.var_names[idx] = var.name if hasattr(var, "name") else var.get_name()
+            if hasattr(var, "name"):
+                self.var_names[idx] = var.name
+            elif hasattr(var, "get_name"):
+                self.var_names[idx] = var.get_name()
+            else:
+                self.var_names[idx] = str(var)
 
-            if hasattr(sp, "BooleanValue"):
+            if sp is None:
+                is_active = False
+            elif hasattr(sp, "BooleanValue"):
                 is_active = sp.BooleanValue(var.pres)
             else:
                 var_sol = sp.get_var_solution(var)
@@ -210,7 +217,7 @@ class VisualLogger:
         # f"Inactive groups: {len(self.inactive_groups)}, {random.sample(self.inactive_groups, 5)} {random.sample(self.var_names, 5)}"
         # )
 
-    def log_run_end(self, solution, handles):
+    def log_run_end(self, solution=None, handles=None):
         # 1. Store run data
         # Truncate data to actual completed iterations in case we stopped early (e.g., time limit)
         c_iters = self.completed_iterations
@@ -224,27 +231,32 @@ class VisualLogger:
 
         # 2. Extract metrics for logging
         run_time = time.perf_counter() - self.active_run_start
-        best_makespan = self.current_run_data["best"][-1]
+        best_makespan = (
+            self.current_run_data["best"][-1]
+            if len(self.current_run_data["best"]) > 0
+            else -1
+        )
 
-        logger.info("Exporting visualization...")
-        fig = plot_schedule(solution, handles, show=False)
-        html_file = f"{self.path}/run{self.current_run}-schedule.html"
-        write_html(fig, html_file)
-        logger.info(f"\nWrote visualization to {html_file}")
+        if solution is not None and handles is not None:
+            logger.info("Exporting visualization...")
+            fig = plot_schedule(solution, handles, show=False)
+            html_file = f"{self.path}/run{self.current_run}-schedule.html"
+            write_html(fig, html_file)
+            logger.info(f"\nWrote visualization to {html_file}")
 
-        sol_dict = {}
-        for var_sol in solution.get_all_var_solutions():
-            val = var_sol.get_value()
-            if hasattr(val, "is_present"):
-                sol_dict[var_sol.get_name()] = {
-                    "present": val.is_present(),
-                    "start": val.get_start() if val.is_present() else None,
-                    "end": val.get_end() if val.is_present() else None,
-                }
-            else:
-                sol_dict[var_sol.get_name()] = val
-        with open(f"{self.path}/run{self.current_run}-solution.pkl", "wb") as f:
-            pickle.dump(sol_dict, f)
+            sol_dict = {}
+            for var_sol in solution.get_all_var_solutions():
+                val = var_sol.get_value()
+                if hasattr(val, "is_present"):
+                    sol_dict[var_sol.get_name()] = {
+                        "present": val.is_present(),
+                        "start": val.get_start() if val.is_present() else None,
+                        "end": val.get_end() if val.is_present() else None,
+                    }
+                else:
+                    sol_dict[var_sol.get_name()] = val
+            with open(f"{self.path}/run{self.current_run}-solution.pkl", "wb") as f:
+                pickle.dump(sol_dict, f)
 
         # Attempt CP lookup — load all seeds and compute mean final best
         import glob
@@ -357,6 +369,16 @@ class VisualLogger:
         self.active_iteration_start = time.perf_counter()
         self.current_iteration = iteration
 
+    def log_iteration_end(self, status=None, best=None, cur=None):
+        if status is not None:
+            val = status.value if hasattr(status, "value") else status
+            self.add_stat_to_current("statuses", val)
+        if best is not None:
+            self.add_stat_to_current("best", best)
+        if cur is not None:
+            self.add_stat_to_current("current", cur)
+        return self.log_iteration()
+
     def log_iteration(self):
         curr_time = time.perf_counter()
 
@@ -428,7 +450,11 @@ class VisualLogger:
         unfrozen_skus = set()
         
         for var in to_optimize:
-            var_name = var.name if hasattr(var, "name") else var.get_name()
+            var_name = (
+                var.get_name()
+                if hasattr(var, "get_name")
+                else (var.name if hasattr(var, "name") else str(var))
+            )
             if var_name in self.var_name_to_idx:
                 var_idx = self.var_name_to_idx[var_name]
                 self.current_barcode[self.current_iteration, var_idx] = strategy_idx
@@ -839,6 +865,8 @@ class VisualLogger:
             bbox_inches="tight",
         )
         plt.close()
+
+    plot_distribution_of_times_per_status = plot_status_time_distributions
 
     def plot_solver_progress(self):
         if self.df.empty:
@@ -1972,6 +2000,22 @@ def reconstruct_solutions(initial_solution_or_data, deltas=None):
         return solutions
 
     if isinstance(initial_solution_or_data, list):
+        if (
+            len(initial_solution_or_data) > 0
+            and isinstance(initial_solution_or_data[0], dict)
+            and "delta" in initial_solution_or_data[0]
+        ):
+            current = {}
+            solutions = []
+            for rec in initial_solution_or_data:
+                delta = rec.get("delta", {})
+                for var_name, state in delta.items():
+                    if isinstance(state, dict):
+                        current[var_name] = copy.deepcopy(state)
+                    else:
+                        current[var_name] = state
+                solutions.append(copy.deepcopy(current))
+            return solutions
         return [
             reconstruct_solutions(run_data["initial_solution"], run_data.get("deltas", []))
             for run_data in initial_solution_or_data

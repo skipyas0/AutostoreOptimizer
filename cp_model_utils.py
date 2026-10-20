@@ -233,7 +233,7 @@ class MockIntervalVar:
         return self.name
 
     def is_present(self):
-        return self.present
+        return bool(self.present)
 
     def get_start(self):
         return self._start
@@ -254,6 +254,19 @@ class MockIntervalVar:
 
 class CppSolveResult:
     def __init__(self, result_dict):
+        if isinstance(result_dict, CppSolveResult):
+            self.result_dict = result_dict.result_dict
+            self.status = result_dict.status
+            self.objective = result_dict.objective
+            self.var_sols = result_dict.var_sols
+            self.total_time = result_dict.total_time
+            self.extraction_time = result_dict.extraction_time
+            self.solve_time = result_dict.solve_time
+            self.kpis = result_dict.kpis
+            self.progress = result_dict.progress
+            return
+
+        self.result_dict = result_dict
         self.status = result_dict.get("status", "Unknown")
         self.objective = result_dict.get("objective", None)
         self.var_sols = result_dict.get("var_solutions", {})
@@ -261,6 +274,43 @@ class CppSolveResult:
         self.extraction_time = result_dict.get("ExtractionTime", 0.0)
         self.solve_time = result_dict.get("SolveTime", 0.0)
         self.kpis = result_dict.get("kpis", {"makespan": self.objective})
+        self.progress = result_dict.get("progress", [])
+
+    def __bool__(self):
+        return self.status in ("Optimal", "Feasible")
+
+    def is_solution(self):
+        return self.status in ("Optimal", "Feasible")
+
+    def get_solution(self):
+        return self
+
+    def get_progress(self):
+        return self.progress
+
+    def get_objective_values(self):
+        return [self.objective] if self.objective is not None else []
+
+    def __getitem__(self, key):
+        return self.result_dict[key]
+
+    def __setitem__(self, key, value):
+        self.result_dict[key] = value
+
+    def __contains__(self, key):
+        return key in self.result_dict
+
+    def get(self, key, default=None):
+        return self.result_dict.get(key, default)
+
+    def keys(self):
+        return self.result_dict.keys()
+
+    def values(self):
+        return self.result_dict.values()
+
+    def items(self):
+        return self.result_dict.items()
 
     def get_kpis(self):
         return self.kpis
