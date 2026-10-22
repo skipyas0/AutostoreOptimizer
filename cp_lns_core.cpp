@@ -6,6 +6,7 @@
 #include <vector>
 #include <set>
 #include <map>
+#include <cmath>
 #include <iostream>
 #include <fstream>
 #include <mutex>
@@ -25,6 +26,7 @@ struct ProgressRecord {
     double best;
     double bound;
     double gap;
+    std::map<std::string, double> kpis;
     std::unordered_map<std::string, VarDelta> delta;
 };
 
@@ -32,13 +34,21 @@ class ProgressCollectorCallback : public IloCP::Callback {
 private:
     std::mutex mutex_;
     const std::unordered_map<std::string, IloIntervalVar>& vars_;
+    const std::map<std::string, IloIntExpr>& kpi_exprs_;
+    bool collect_deltas_;
     double best_obj_;
     std::unordered_map<std::string, VarDelta> last_sol_;
     std::vector<ProgressRecord> records_;
 
 public:
-    ProgressCollectorCallback(const std::unordered_map<std::string, IloIntervalVar>& vars)
-        : vars_(vars), best_obj_(1e30) {}
+    ProgressCollectorCallback(const std::unordered_map<std::string, IloIntervalVar>& vars,
+                              const std::map<std::string, IloIntExpr>& kpi_exprs,
+                              bool collect_deltas = true)
+        : vars_(vars), kpi_exprs_(kpi_exprs), collect_deltas_(collect_deltas), best_obj_(1e30) {}
+
+    void set_collect_deltas(bool collect_deltas) {
+        collect_deltas_ = collect_deltas;
+    }
 
     void clear() {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -72,30 +82,40 @@ public:
                     rec.gap = 0.0;
                 }
 
-                for (const auto& pair : vars_) {
-                    const std::string& name = pair.first;
-                    IloIntervalVar iv = pair.second;
-                    VarDelta cur;
-                    if (cp.isPresent(iv)) {
-                        cur.present = true;
-                        cur.start = cp.getStart(iv);
-                        cur.end = cp.getEnd(iv);
-                        cur.size = cp.getSize(iv);
-                    } else {
-                        cur.present = false;
-                        cur.start = -1;
-                        cur.end = -1;
-                        cur.size = -1;
+                for (const auto& kpi_pair : kpi_exprs_) {
+                    try {
+                        rec.kpis[kpi_pair.first] = cp.getValue(kpi_pair.second);
+                    } catch (...) {
+                        rec.kpis[kpi_pair.first] = std::nan("");
                     }
+                }
 
-                    auto it = last_sol_.find(name);
-                    if (it == last_sol_.end() ||
-                        it->second.present != cur.present ||
-                        it->second.start != cur.start ||
-                        it->second.end != cur.end ||
-                        it->second.size != cur.size) {
-                        rec.delta[name] = cur;
-                        last_sol_[name] = cur;
+                if (collect_deltas_) {
+                    for (const auto& pair : vars_) {
+                        const std::string& name = pair.first;
+                        IloIntervalVar iv = pair.second;
+                        VarDelta cur;
+                        if (cp.isPresent(iv)) {
+                            cur.present = true;
+                            cur.start = cp.getStart(iv);
+                            cur.end = cp.getEnd(iv);
+                            cur.size = cp.getSize(iv);
+                        } else {
+                            cur.present = false;
+                            cur.start = -1;
+                            cur.end = -1;
+                            cur.size = -1;
+                        }
+
+                        auto it = last_sol_.find(name);
+                        if (it == last_sol_.end() ||
+                            it->second.present != cur.present ||
+                            it->second.start != cur.start ||
+                            it->second.end != cur.end ||
+                            it->second.size != cur.size) {
+                            rec.delta[name] = cur;
+                            last_sol_[name] = cur;
+                        }
                     }
                 }
                 records_.push_back(std::move(rec));
@@ -111,6 +131,11 @@ public:
             py_rec["best"] = rec.best;
             py_rec["bound"] = rec.bound;
             py_rec["gap"] = rec.gap;
+            py::dict py_kpis;
+            for (const auto& k : rec.kpis) {
+                py_kpis[k.first.c_str()] = k.second;
+            }
+            py_rec["kpis"] = py_kpis;
             py::dict py_delta;
             for (const auto& d : rec.delta) {
                 py::dict s;
@@ -163,6 +188,7 @@ public:
     IloIntExpr total_flow_time_expr;
     IloIntExpr idle_time_expr;
     IloIntExpr max_picks_expr;
+    std::map<std::string, IloIntExpr> kpi_exprs;
 
     CpLnsModel(const std::vector<int>& S,
                const std::vector<int>& L,
@@ -604,6 +630,20 @@ public:
         idle_time_obj = IloMinimize(env, idle_time_expr);
         max_picks_expr = IloMax(pick_counts);
         max_picks_obj = IloMinimize(env, max_picks_expr);
+
+        // Expose the underlying expressions as model KPIs so that the value of every
+        // KPI can be queried for each intermediate (best-so-far) solution.
+        cp.addKPI(makespan_expr, "makespan");
+        cp.addKPI(bin_fetches_expr, "bin_fetches");
+        cp.addKPI(total_flow_time_expr, "total_flow_time");
+        cp.addKPI(idle_time_expr, "idle_time");
+        cp.addKPI(max_picks_expr, "max_picks");
+
+        kpi_exprs["makespan"] = makespan_expr;
+        kpi_exprs["bin_fetches"] = bin_fetches_expr;
+        kpi_exprs["total_flow_time"] = total_flow_time_expr;
+        kpi_exprs["idle_time"] = idle_time_expr;
+        kpi_exprs["max_picks"] = max_picks_expr;
         
         if (objective_func == "bin_fetches") {
             active_obj = bin_fetches_obj;
@@ -617,7 +657,7 @@ public:
             active_obj = makespan_obj;
         }
         model.add(active_obj);
-        progress_collector = std::make_unique<ProgressCollectorCallback>(vars);
+        progress_collector = std::make_unique<ProgressCollectorCallback>(vars, kpi_exprs);
     }
     
     void set_objective(const std::string& target) {
@@ -710,7 +750,7 @@ public:
         bulk_add.end();
     }
     
-    py::dict solve(double time_limit, int improvement_bound = -1, int workers = 1, std::string presolve = "Auto", std::string search_type = "Auto", bool only_first_sol = false, int random_seed = -1, std::string log_verbosity = "Quiet", const std::string& log_filename = "", bool collect_progress = false) {
+    py::dict solve(double time_limit, int improvement_bound = -1, int workers = 1, std::string presolve = "Auto", std::string search_type = "Auto", bool only_first_sol = false, int random_seed = -1, std::string log_verbosity = "Quiet", const std::string& log_filename = "", bool collect_progress = false, bool collect_deltas = true) {
         cp.setParameter(IloCP::TimeLimit, time_limit);
         cp.setParameter(IloCP::Workers, workers);
         if (random_seed >= 0) {
@@ -777,6 +817,7 @@ public:
         
         if (collect_progress) {
             progress_collector->clear();
+            progress_collector->set_collect_deltas(collect_deltas);
             cp.addCallback(progress_collector.get());
         }
 
@@ -910,7 +951,8 @@ PYBIND11_MODULE(cp_lns_core, m) {
              py::arg("random_seed") = -1,
              py::arg("log_verbosity") = "Quiet",
              py::arg("log_filename") = "",
-             py::arg("collect_progress") = false)
+             py::arg("collect_progress") = false,
+             py::arg("collect_deltas") = true)
         .def("get_progress_records", &CpLnsModel::get_progress_records)
         .def("export_model", &CpLnsModel::export_model, py::arg("filename"))
         .def("set_objective", &CpLnsModel::set_objective, py::arg("target"));

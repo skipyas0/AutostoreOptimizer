@@ -3,9 +3,11 @@ import json
 import os
 import pickle
 import random
+import time
 
 import tqdm
 from docplex.cp.solution import CpoSolveResult
+from docplex.cp.solver.cpo_callback import EVENT_SOLUTION, CpoCallback
 from loguru import logger
 
 import cp_model as docplex_model
@@ -31,6 +33,67 @@ from neighborhood_selection import (
 from precalculate_instances_for_lns import check_if_precalculated, precalculate_config
 
 random.seed(42)
+
+
+class IterationProgressCallback(CpoCallback):
+    """Records every improving solution found while solving a subproblem.
+
+    Used with the docplex backend to capture, per iteration, *when* each
+    (strictly improving) solution was discovered and the KPIs it achieved. This
+    information drives the choice of the iteration time limit and a target on the
+    number of discovered solutions. The callback must be ``reset`` before each
+    solve.
+
+    Records look like::
+
+        {"time": <seconds since solve start>, "best": <objective>, "kpis": {<kpi>: <value>}}
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.records = []
+        self.best_obj = None
+        self._start_time = None
+
+    def reset(self):
+        self.records = []
+        self.best_obj = None
+        self._start_time = time.perf_counter()
+
+    def invoke(self, solver, event, sres):
+        if event != EVENT_SOLUTION:
+            return
+        try:
+            if not sres.is_solution():
+                return
+            obj = sres.get_objective_value()
+        except Exception:
+            return
+
+        if obj is None:
+            return
+        # Only keep strict improvements (matches the C++ progress collector).
+        if self.best_obj is not None and obj >= self.best_obj:
+            return
+
+        if self._start_time is None:
+            self._start_time = time.perf_counter()
+
+        # Prefer the engine solve time (same basis as the C++ progress records),
+        # falling back to elapsed wall time if unavailable.
+        try:
+            discovery_time = float(sres.get_solve_time())
+        except (TypeError, ValueError, AttributeError):
+            discovery_time = time.perf_counter() - self._start_time
+
+        self.best_obj = obj
+        self.records.append(
+            {
+                "time": discovery_time,
+                "best": obj,
+                "kpis": dict(sres.get_kpis() or {}),
+            }
+        )
 
 
 def load_instance(instance_config=None, instance_folder=None):
@@ -133,9 +196,13 @@ def prepare_model_cpp(config, instance, heur_sol, objective_func):
                 "var_solutions": mock_sp.state_dict,
                 "kpis": {
                     "makespan": heur_sol.makespan,
-                    "bin_fetches": sum(len(events) for events in heur_sol.bin_events.values()),
-                    "total_flow_time": sum(end for s, ln, start, end in heur_sol.order_assignments.values())
-                }
+                    "bin_fetches": sum(
+                        len(events) for events in heur_sol.bin_events.values()
+                    ),
+                    "total_flow_time": sum(
+                        end for s, ln, start, end in heur_sol.order_assignments.values()
+                    ),
+                },
             }
         ),
     )
@@ -151,28 +218,28 @@ class Solver:
             instance_config,
         ) = load_instance(instance_config, instance_path)
         self.instance_config = instance_config
-        self.vlg = VisualLogger(instance_path, instance_config, experiment_config, self.instance)
+        self.vlg = VisualLogger(
+            instance_path, instance_config, experiment_config, self.instance
+        )
         self.severity = 1
         self.stagnation_count = 0
         self.experiment_config = experiment_config
         self.cycling_schedule = []
         for phase in self.experiment_config["cp_objective_phase_schedule"]:
-            if phase == 'm':
+            if phase == "m":
                 self.cycling_schedule.append("makespan")
-            elif phase == 'f':
+            elif phase == "f":
                 self.cycling_schedule.append("total_flow_time")
-            elif phase == 'b':
+            elif phase == "b":
                 self.cycling_schedule.append("bin_fetches")
-            elif phase == 'i':
+            elif phase == "i":
                 self.cycling_schedule.append("idle_time")
-            elif phase == 'p':
+            elif phase == "p":
                 self.cycling_schedule.append("max_picks")
-            elif phase == 'w':
+            elif phase == "w":
                 self.cycling_schedule.append("total_wages")
             else:
                 raise ValueError(phase)
-            
-
 
         self.cp_obj = experiment_config["cp_objective"]
         self.cycle_ix = self.cycling_schedule.index(self.cp_obj)
@@ -183,9 +250,8 @@ class Solver:
     def update_iteration_objective(self, mdl, target="makespan"):
         """Swaps the active objective function for the current LNS iteration."""
         if target == self.cp_obj:
-            return # already have the correct objective
+            return  # already have the correct objective
 
-            
         if self.experiment_config["backend"] == "docplex":
             # 1. Safely remove the current objective from the model
             current_obj = mdl.get_objective()
@@ -193,7 +259,9 @@ class Solver:
                 mdl.remove(current_obj)
 
             # 2. Inject the new target (assuming makespan_expr and fetches_expr are saved as class attributes)
-            logger.info(f"Changing objective to '{target}', cycle index {self.cycle_ix}")
+            logger.info(
+                f"Changing objective to '{target}', cycle index {self.cycle_ix}"
+            )
             if target == "makespan":
                 mdl.minimize(self.handles["makespan"])
                 self.cp_obj = "makespan"
@@ -212,7 +280,9 @@ class Solver:
             else:
                 raise ValueError(f"Unknown objective target: {target}")
         elif self.experiment_config["backend"] == "cpp":
-            logger.info(f"Changing objective to '{target}', cycle index {self.cycle_ix}")
+            logger.info(
+                f"Changing objective to '{target}', cycle index {self.cycle_ix}"
+            )
             mdl.set_objective(target)
             self.cp_obj = target
 
@@ -303,37 +373,66 @@ class Solver:
         return status
 
     def _log_kpis(self):
-        cur_kpis = self.current_solution.get_kpis() if getattr(self, "current_solution", None) else {}
-        best_kpis = self.best_solution.get_kpis() if getattr(self, "best_solution", None) else {}
-        
+        cur_kpis = (
+            self.current_solution.get_kpis()
+            if getattr(self, "current_solution", None)
+            else {}
+        )
+        best_kpis = (
+            self.best_solution.get_kpis()
+            if getattr(self, "best_solution", None)
+            else {}
+        )
+
         curr_fetches = cur_kpis.get("bin_fetches", -1)
         curr_flow = cur_kpis.get("total_flow_time", -1)
         curr_idle = cur_kpis.get("idle_time", -1)
         curr_picks = cur_kpis.get("max_picks", -1)
-        
-        if curr_fetches != -1 and (self.best_bin_fetches == -1 or curr_fetches < self.best_bin_fetches):
+
+        if curr_fetches != -1 and (
+            self.best_bin_fetches == -1 or curr_fetches < self.best_bin_fetches
+        ):
             self.best_bin_fetches = curr_fetches
-            
-        if curr_flow != -1 and (getattr(self, "best_total_flow_time", -1) == -1 or curr_flow < self.best_total_flow_time):
+
+        if curr_flow != -1 and (
+            getattr(self, "best_total_flow_time", -1) == -1
+            or curr_flow < self.best_total_flow_time
+        ):
             self.best_total_flow_time = curr_flow
 
-        if curr_idle != -1 and (getattr(self, "best_idle_time", -1) == -1 or curr_idle < getattr(self, "best_idle_time", -1)):
+        if curr_idle != -1 and (
+            getattr(self, "best_idle_time", -1) == -1
+            or curr_idle < getattr(self, "best_idle_time", -1)
+        ):
             self.best_idle_time = curr_idle
 
-        if curr_picks != -1 and (getattr(self, "best_max_picks", -1) == -1 or curr_picks < getattr(self, "best_max_picks", -1)):
+        if curr_picks != -1 and (
+            getattr(self, "best_max_picks", -1) == -1
+            or curr_picks < getattr(self, "best_max_picks", -1)
+        ):
             self.best_max_picks = curr_picks
-            
-        self.vlg.add_stat_to_current("current_makespan", cur_kpis.get("makespan", self.current_result))
+
+        self.vlg.add_stat_to_current(
+            "current_makespan", cur_kpis.get("makespan", self.current_result)
+        )
         self.vlg.add_stat_to_current("current_bin_fetches", curr_fetches)
         self.vlg.add_stat_to_current("current_total_flow_time", curr_flow)
         self.vlg.add_stat_to_current("current_idle_time", curr_idle)
         self.vlg.add_stat_to_current("current_max_picks", curr_picks)
-        
-        self.vlg.add_stat_to_current("best_makespan", best_kpis.get("makespan", self.best_result))
+
+        self.vlg.add_stat_to_current(
+            "best_makespan", best_kpis.get("makespan", self.best_result)
+        )
         self.vlg.add_stat_to_current("best_bin_fetches", self.best_bin_fetches)
-        self.vlg.add_stat_to_current("best_total_flow_time", getattr(self, "best_total_flow_time", -1))
-        self.vlg.add_stat_to_current("best_idle_time", getattr(self, "best_idle_time", -1))
-        self.vlg.add_stat_to_current("best_max_picks", getattr(self, "best_max_picks", -1))
+        self.vlg.add_stat_to_current(
+            "best_total_flow_time", getattr(self, "best_total_flow_time", -1)
+        )
+        self.vlg.add_stat_to_current(
+            "best_idle_time", getattr(self, "best_idle_time", -1)
+        )
+        self.vlg.add_stat_to_current(
+            "best_max_picks", getattr(self, "best_max_picks", -1)
+        )
         self.vlg.add_stat_to_current("cp_obj", self.cp_obj)
 
     def get_freeze_sets(self, to_optimize, old_freeze_constraints, strategy_results):
@@ -383,7 +482,10 @@ class Solver:
             )
         elif self.experiment_config["backend"] == "cpp":
             self.mdl, self.handles, sp = prepare_model_cpp(
-                self.instance_config, self.instance, self.heur_sol, self.experiment_config["cp_objective"]
+                self.instance_config,
+                self.instance,
+                self.heur_sol,
+                self.experiment_config["cp_objective"],
             )
 
         if (
@@ -421,13 +523,24 @@ class Solver:
             self.mdl, sp, self.experiment_config["backend"], self.handles
         )
 
+        # Listener/callback used to capture every solution discovered per subproblem.
+        if self.experiment_config["backend"] == "docplex":
+            self.progress_callback = IterationProgressCallback()
+            self.mdl.add_solver_callback(self.progress_callback)
+        else:
+            self.progress_callback = None
+
         self.severity = 1
         self.stagnation_count = 0
-        
+
         self.best_result = self.heur_sol.makespan
-        self.best_bin_fetches = sum(len(events) for events in self.heur_sol.bin_events.values())
-        self.best_total_flow_time = sum(end for s, ln, start, end in self.heur_sol.order_assignments.values())
-            
+        self.best_bin_fetches = sum(
+            len(events) for events in self.heur_sol.bin_events.values()
+        )
+        self.best_total_flow_time = sum(
+            end for s, ln, start, end in self.heur_sol.order_assignments.values()
+        )
+
         self.best_solution = sp
         self.current_solution = self.best_solution
         self.current_result = self.best_result
@@ -438,18 +551,26 @@ class Solver:
         old_freeze_constraints = []
 
         # start iterations
-        import time
         run_start_time = time.time()
         self.vlg.log_run_start(num_variables, var_to_idx, sp)
 
-        n_iters = self.experiment_config["iters"] if self.experiment_config["iters"] is not None else 999999 
+        n_iters = (
+            self.experiment_config["iters"]
+            if self.experiment_config["iters"] is not None
+            else 999999
+        )
         for i in range(n_iters):
             if self.experiment_config.get("time_limit") is not None:
                 elapsed = time.time() - run_start_time
-                if self.experiment_config["time_limit"] - elapsed < self.experiment_config["iter_time_limit"]:
-                    logger.info(f"Time limit reached ({elapsed:.1f}s / {self.experiment_config['time_limit']}s). Stopping iterations.")
+                if (
+                    self.experiment_config["time_limit"] - elapsed
+                    < self.experiment_config["iter_time_limit"]
+                ):
+                    logger.info(
+                        f"Time limit reached ({elapsed:.1f}s / {self.experiment_config['time_limit']}s). Stopping iterations."
+                    )
                     break
-                    
+
             self.vlg.log_iteration_start(i)
             if (
                 self.stagnation_count >= self.experiment_config["stagnation_th"]
@@ -527,7 +648,7 @@ class Solver:
 
             cycle_per = self.experiment_config["cp_objective_phase_duration"]
             if cycle_per > 0 and (i + 1) % cycle_per == 0:
-                self.cycle_ix = (self.cycle_ix+1) % len(self.cycling_schedule)
+                self.cycle_ix = (self.cycle_ix + 1) % len(self.cycling_schedule)
                 next_obj = self.cycling_schedule[self.cycle_ix]
                 self.update_iteration_objective(self.mdl, next_obj)
 
@@ -535,13 +656,25 @@ class Solver:
             if self.experiment_config["improvement_constr"]:
                 if self.cp_obj == "makespan":
                     impr_bound = int(self.current_result - 1)
-                elif self.cp_obj == "bin_fetches" and getattr(self, "best_bin_fetches", -1) != -1:
+                elif (
+                    self.cp_obj == "bin_fetches"
+                    and getattr(self, "best_bin_fetches", -1) != -1
+                ):
                     impr_bound = int(self.best_bin_fetches - 1)
-                elif self.cp_obj == "total_flow_time" and getattr(self, "best_total_flow_time", -1) != -1:
+                elif (
+                    self.cp_obj == "total_flow_time"
+                    and getattr(self, "best_total_flow_time", -1) != -1
+                ):
                     impr_bound = int(self.best_total_flow_time - 1)
-                elif self.cp_obj == "idle_time" and getattr(self, "best_idle_time", -1) != -1:
+                elif (
+                    self.cp_obj == "idle_time"
+                    and getattr(self, "best_idle_time", -1) != -1
+                ):
                     impr_bound = int(self.best_idle_time - 1)
-                elif self.cp_obj == "max_picks" and getattr(self, "best_max_picks", -1) != -1:
+                elif (
+                    self.cp_obj == "max_picks"
+                    and getattr(self, "best_max_picks", -1) != -1
+                ):
                     impr_bound = int(self.best_max_picks - 1)
 
             if self.experiment_config["backend"] == "docplex":
@@ -557,7 +690,7 @@ class Solver:
                 if getattr(self, "obj_constraint", None) is not None:
                     self.mdl.remove(self.obj_constraint)
                     self.obj_constraint = None
-                
+
                 if impr_bound != -1:
                     self.obj_constraint = self.mdl.add(
                         self.handles[self.cp_obj] <= impr_bound
@@ -575,7 +708,10 @@ class Solver:
                 if self.experiment_config.get("only_first_sol", False):
                     solve_kwargs["SolutionLimit"] = 1
 
+                # Reset before solving so we only keep solutions from this subproblem.
+                self.progress_callback.reset()
                 sol = self.mdl.solve(**solve_kwargs)
+                progress = self.progress_callback.records
             elif self.experiment_config["backend"] == "cpp":
                 self.vlg.log_freeze_constr(to_optimize, var_to_idx, strat_idx)
 
@@ -586,14 +722,18 @@ class Solver:
                     self.experiment_config["workers"],
                     self.experiment_config["presolve"],
                     self.experiment_config["search_type"],
-                    self.experiment_config.get("only_first_sol", False)
+                    self.experiment_config.get("only_first_sol", False),
+                    collect_progress=True,
+                    collect_deltas=False,
                 )
                 sol = CppSolveResult(result_dict)
+                progress = result_dict.get("progress") or []
             else:
                 raise ValueError(self.experiment_config["backend"])
 
             # log solution and run eps-greedy
             self.vlg.log_solve_time(sol)
+            self.vlg.log_discovered_solutions(progress)
             prev_solution = self.current_solution
             status = self.rrt_acceptance(sol, sol.get_solve_status())
 
@@ -603,7 +743,9 @@ class Solver:
             strategy_manager.current_solution = self.current_solution
 
             # log iteration end in VisualLogger
-            self.vlg.log_solution_delta(prev_solution, self.current_solution, to_optimize)
+            self.vlg.log_solution_delta(
+                prev_solution, self.current_solution, to_optimize
+            )
             self.vlg.log_iteration()
 
         # End of LNS loop: Validate the best solution found
@@ -737,7 +879,13 @@ if __name__ == "__main__":
         "--cp-objective",
         type=str,
         default="makespan",
-        choices=["makespan", "bin_fetches", "total_flow_time", "idle_time", "max_picks"],
+        choices=[
+            "makespan",
+            "bin_fetches",
+            "total_flow_time",
+            "idle_time",
+            "max_picks",
+        ],
         help="Objective function for the underlying CP model.",
     )
 
@@ -839,7 +987,7 @@ if __name__ == "__main__":
 
     # Check termination conditions
     il_set, tl_set = args.iters is not None, args.time_limit is not None
-    if (il_set and tl_set) or (not il_set and not tl_set) :
+    if (il_set and tl_set) or (not il_set and not tl_set):
         raise ValueError("Exactly one of '--iters' and '--time-limit' has to be set!")
 
     for instance in tqdm.tqdm(args.instances):
@@ -870,7 +1018,7 @@ if __name__ == "__main__":
             "default_percent": args.default_percent,
             "cp_objective": args.cp_objective,
             "cp_objective_phase_duration": args.cp_objective_phase_duration,
-            "cp_objective_phase_schedule": args.cp_objective_phase_schedule, 
+            "cp_objective_phase_schedule": args.cp_objective_phase_schedule,
             "render_video": args.render_video,
             "only_first_sol": args.only_first_sol,
         }

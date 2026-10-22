@@ -29,6 +29,67 @@ class Status(IntEnum):
     Infeasible = 9
 
 
+# KPIs recorded for every discovered solution (order used for reporting).
+KPI_ORDER = ("makespan", "bin_fetches", "total_flow_time", "idle_time", "max_picks")
+
+
+def _coerce_kpis(kpis):
+    """Normalize a raw KPI mapping into a plain ``{name: value}`` dict ordered by :data:`KPI_ORDER`."""
+    kpis = kpis or {}
+    clean = {}
+    for name in KPI_ORDER:
+        if name in kpis:
+            clean[name] = _coerce_kpi_value(kpis[name])
+    for name, value in kpis.items():
+        if name not in clean:
+            clean[str(name)] = _coerce_kpi_value(value)
+    return clean
+
+
+def _coerce_kpi_value(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return value
+
+
+def extract_discovered_solutions(progress):
+    """Normalize raw CP solver progress records into solution discovery entries.
+
+    Each returned entry describes a single (improving) solution that was found
+    while solving the current subproblem::
+
+        {"time": <seconds since solve start>, "kpis": {<kpi name>: <value>}}
+
+    An empty list is returned when the subproblem was infeasible/unknown or the
+    solver did not report any solution. Accepts either raw progress dicts (C++
+    backend) or ``CpoSolveResult``-like objects (docplex backend).
+    """
+    if not progress:
+        return []
+
+    discovered = []
+    for rec in progress:
+        if isinstance(rec, dict):
+            time_val = rec.get("time", rec.get("solve_time"))
+            kpis = rec.get("kpis")
+        else:
+            time_val = None
+            kpis = None
+            if hasattr(rec, "get_solve_time"):
+                time_val = rec.get_solve_time()
+            if hasattr(rec, "get_kpis"):
+                kpis = rec.get_kpis()
+
+        try:
+            time_val = float(time_val)
+        except (TypeError, ValueError):
+            time_val = -1.0
+
+        discovered.append({"time": time_val, "kpis": _coerce_kpis(kpis)})
+    return discovered
+
+
 def get_distinct_colors(n: int) -> list:
     """
     Returns a list of at least n visually distinct colors.
@@ -70,7 +131,9 @@ class LoguruStream:
 
 
 class VisualLogger:
-    def __init__(self, instance_folder, instance_config, experiment_config, instance=None):
+    def __init__(
+        self, instance_folder, instance_config, experiment_config, instance=None
+    ):
         self.experiment_timestamp = datetime.now().strftime("%d-%m-%Y_%H-%M-%S")
 
         self.instance = instance
@@ -131,7 +194,11 @@ class VisualLogger:
         )
         logger.info(f"Starting run #{self.current_run}")
 
-        iters = self.experiment_config["iters"] if self.experiment_config["iters"] is not None else 100000
+        iters = (
+            self.experiment_config["iters"]
+            if self.experiment_config["iters"] is not None
+            else 100000
+        )
 
         # Pre-allocate run data
         self.current_run_data = {
@@ -164,6 +231,8 @@ class VisualLogger:
             "strategy": np.full(iters, -1, dtype=np.int32),
             "unfrozen_orders": np.full(iters, None, dtype=object),
             "unfrozen_skus": np.full(iters, None, dtype=object),
+            "discovered_solutions": np.full(iters, None, dtype=object),
+            "num_discovered_solutions": np.full(iters, -1, dtype=np.int32),
         }
 
         self.current_barcode = np.full((iters, num_variables), -1, dtype=np.int8)
@@ -282,21 +351,21 @@ class VisualLogger:
             if cp_1hour_best > 0
             else 0
         )
-        
+
         if self.experiment_config.get("render_video", False):
             logger.info("Rendering Manim video...")
             try:
                 from manim_visualizer import LNSOptimizationScene
-                
+
                 frozen_vars = []
                 iters = self.experiment_config["iters"]
                 for it in range(iters):
                     frozen_in_it = []
                     for v_idx in range(self.num_variables):
-                        if self.current_barcode[it, v_idx] == -1: # frozen
+                        if self.current_barcode[it, v_idx] == -1:  # frozen
                             frozen_in_it.append(self.var_names[v_idx])
                     frozen_vars.append(frozen_in_it)
-                
+
                 objectives = self.current_run_data["best"]
                 makespans = self.current_run_data["current_makespan"]
                 fetches = self.current_run_data["current_bin_fetches"]
@@ -308,30 +377,53 @@ class VisualLogger:
                 statuses = self.current_run_data["statuses"]
                 strategies = self.current_run_data["strategy"]
                 total_iter_time = self.current_run_data["total_iter_time"]
-                strategy_names = [self.strategy_map.get(s, "Unknown") for s in strategies]
-                status_names = [Status(s).name if s > 0 else "Unknown" for s in statuses]
-                
+                strategy_names = [
+                    self.strategy_map.get(s, "Unknown") for s in strategies
+                ]
+                status_names = [
+                    Status(s).name if s > 0 else "Unknown" for s in statuses
+                ]
+
                 time_ticks = np.cumsum(total_iter_time)
                 cp_mean_traj, _, _, _ = self.get_cp_performance(time_ticks)
                 cp_traj = cp_mean_traj.tolist() if cp_mean_traj is not None else None
-                
+
                 init_makespan = objectives[0] if len(objectives) > 0 else 1
-                improvements = [((init_makespan - obj) / init_makespan * 100) if init_makespan > 0 else 0 for obj in objectives]
-                
+                improvements = [
+                    ((init_makespan - obj) / init_makespan * 100)
+                    if init_makespan > 0
+                    else 0
+                    for obj in objectives
+                ]
+
                 scene = LNSOptimizationScene(
                     instance=self.instance,
                     initial_solution=self.current_run_initial_solution,
                     deltas=self.current_run_deltas,
                     frozen_vars=frozen_vars,
-                    objectives=objectives.tolist() if isinstance(objectives, np.ndarray) else objectives,
+                    objectives=objectives.tolist()
+                    if isinstance(objectives, np.ndarray)
+                    else objectives,
                     improvements=improvements,
-                    makespans=makespans.tolist() if isinstance(makespans, np.ndarray) else makespans,
-                    fetches=fetches.tolist() if isinstance(fetches, np.ndarray) else fetches,
+                    makespans=makespans.tolist()
+                    if isinstance(makespans, np.ndarray)
+                    else makespans,
+                    fetches=fetches.tolist()
+                    if isinstance(fetches, np.ndarray)
+                    else fetches,
                     flows=flows.tolist() if isinstance(flows, np.ndarray) else flows,
-                    best_makespans=best_makespans.tolist() if isinstance(best_makespans, np.ndarray) else best_makespans,
-                    best_fetches=best_fetches.tolist() if isinstance(best_fetches, np.ndarray) else best_fetches,
-                    best_flows=best_flows.tolist() if isinstance(best_flows, np.ndarray) else best_flows,
-                    cp_objs=cp_objs.tolist() if isinstance(cp_objs, np.ndarray) else cp_objs,
+                    best_makespans=best_makespans.tolist()
+                    if isinstance(best_makespans, np.ndarray)
+                    else best_makespans,
+                    best_fetches=best_fetches.tolist()
+                    if isinstance(best_fetches, np.ndarray)
+                    else best_fetches,
+                    best_flows=best_flows.tolist()
+                    if isinstance(best_flows, np.ndarray)
+                    else best_flows,
+                    cp_objs=cp_objs.tolist()
+                    if isinstance(cp_objs, np.ndarray)
+                    else cp_objs,
                     statuses=status_names,
                     strategies=strategy_names,
                     cp_trajectory=cp_traj,
@@ -340,11 +432,14 @@ class VisualLogger:
                 logger.info("Manim video rendered successfully.")
             except Exception as e:
                 import traceback
+
                 error_trace = traceback.format_exc()
                 log_file = f"{self.path}/manim_error.log"
                 with open(log_file, "w") as f:
                     f.write(error_trace)
-                logger.error(f"Failed to render Manim video: {e}. Check {log_file} for traceback.")
+                logger.error(
+                    f"Failed to render Manim video: {e}. Check {log_file} for traceback."
+                )
 
         # 3. Clean Print
         logger.info(
@@ -410,12 +505,18 @@ class VisualLogger:
         status_val = self.current_run_data["statuses"][self.current_iteration]
         best_res = self.current_run_data["best"][self.current_iteration]
         curr_res = self.current_run_data["current"][self.current_iteration]
-        
-        curr_fetches = self.current_run_data["current_bin_fetches"][self.current_iteration]
-        curr_flow = self.current_run_data["current_total_flow_time"][self.current_iteration]
+
+        curr_fetches = self.current_run_data["current_bin_fetches"][
+            self.current_iteration
+        ]
+        curr_flow = self.current_run_data["current_total_flow_time"][
+            self.current_iteration
+        ]
         best_fetches = self.current_run_data["best_bin_fetches"][self.current_iteration]
-        best_flow = self.current_run_data["best_total_flow_time"][self.current_iteration]
-        
+        best_flow = self.current_run_data["best_total_flow_time"][
+            self.current_iteration
+        ]
+
         num_optimized = self.current_run_data["num_optimized"][self.current_iteration]
         strategy = self.current_run_data["strategy"][self.current_iteration]
         status_name = Status(status_val).name if status_val > 0 else "Unknown"
@@ -445,10 +546,10 @@ class VisualLogger:
     def log_freeze_constr(self, to_optimize, var_to_idx, strategy_idx):
         self.add_stat_to_current("constr_update_time", self.time_diff_with_overwrite())
         self.add_stat_to_current("num_optimized", len(to_optimize))
-        
+
         unfrozen_orders = set()
         unfrozen_skus = set()
-        
+
         for var in to_optimize:
             var_name = (
                 var.get_name()
@@ -458,7 +559,7 @@ class VisualLogger:
             if var_name in self.var_name_to_idx:
                 var_idx = self.var_name_to_idx[var_name]
                 self.current_barcode[self.current_iteration, var_idx] = strategy_idx
-                
+
             parts = var_name.split("[")
             if len(parts) == 2:
                 prefix = parts[0]
@@ -477,9 +578,21 @@ class VisualLogger:
                         unfrozen_skus.add(int(args[1]))
                 except (ValueError, IndexError):
                     pass
-                    
+
         self.add_stat_to_current("unfrozen_orders", unfrozen_orders)
         self.add_stat_to_current("unfrozen_skus", unfrozen_skus)
+
+    def log_discovered_solutions(self, progress):
+        """Record every solution found while solving the current subproblem.
+
+        Stores, per iteration, the list of discovered solutions together with the
+        time (seconds since solve start) at which each of them was found and their
+        KPIs. An empty list is stored when nothing was discovered (infeasible /
+        unknown / time limit hit without a solution).
+        """
+        discovered = extract_discovered_solutions(progress)
+        self.add_stat_to_current("discovered_solutions", discovered)
+        self.add_stat_to_current("num_discovered_solutions", len(discovered))
 
     def log_solve_time(self, sol, status=None):
         wall_solve_time = self.time_diff_with_overwrite()
@@ -521,7 +634,9 @@ class VisualLogger:
                 pres = bool(v.get("present"))
                 clean_dict[k] = {
                     "present": pres,
-                    "start": int(v["start"]) if pres and v.get("start") is not None else None,
+                    "start": int(v["start"])
+                    if pres and v.get("start") is not None
+                    else None,
                     "end": int(v["end"]) if pres and v.get("end") is not None else None,
                 }
             else:
@@ -532,7 +647,11 @@ class VisualLogger:
     def _extract_var_state(sol, var):
         if sol is None:
             return None
-        var_name = var.get_name() if hasattr(var, "get_name") else (var.name if hasattr(var, "name") else str(var))
+        var_name = (
+            var.get_name()
+            if hasattr(var, "get_name")
+            else (var.name if hasattr(var, "name") else str(var))
+        )
 
         if isinstance(sol, dict):
             val = sol.get(var_name)
@@ -540,8 +659,12 @@ class VisualLogger:
                 pres = bool(val.get("present"))
                 return {
                     "present": pres,
-                    "start": int(val["start"]) if pres and val.get("start") is not None else None,
-                    "end": int(val["end"]) if pres and val.get("end") is not None else None,
+                    "start": int(val["start"])
+                    if pres and val.get("start") is not None
+                    else None,
+                    "end": int(val["end"])
+                    if pres and val.get("end") is not None
+                    else None,
                 }
             return val
 
@@ -550,7 +673,9 @@ class VisualLogger:
             pres = bool(vs.get("present"))
             return {
                 "present": pres,
-                "start": int(vs["start"]) if pres and vs.get("start") is not None else None,
+                "start": int(vs["start"])
+                if pres and vs.get("start") is not None
+                else None,
                 "end": int(vs["end"]) if pres and vs.get("end") is not None else None,
             }
 
@@ -559,7 +684,9 @@ class VisualLogger:
             pres = bool(vs.get("present"))
             return {
                 "present": pres,
-                "start": int(vs["start"]) if pres and vs.get("start") is not None else None,
+                "start": int(vs["start"])
+                if pres and vs.get("start") is not None
+                else None,
                 "end": int(vs["end"]) if pres and vs.get("end") is not None else None,
             }
 
@@ -572,8 +699,12 @@ class VisualLogger:
                 pres = bool(val.is_present())
                 return {
                     "present": pres,
-                    "start": int(val.get_start()) if pres and val.get_start() is not None else None,
-                    "end": int(val.get_end()) if pres and val.get_end() is not None else None,
+                    "start": int(val.get_start())
+                    if pres and val.get_start() is not None
+                    else None,
+                    "end": int(val.get_end())
+                    if pres and val.get_end() is not None
+                    else None,
                 }
             return val
 
@@ -597,7 +728,11 @@ class VisualLogger:
             and to_optimize is not None
         ):
             for var in to_optimize:
-                var_name = var.get_name() if hasattr(var, "get_name") else (var.name if hasattr(var, "name") else str(var))
+                var_name = (
+                    var.get_name()
+                    if hasattr(var, "get_name")
+                    else (var.name if hasattr(var, "name") else str(var))
+                )
                 prev_val = self._extract_var_state(prev_solution, var)
                 if prev_val is None and var_name in self.current_solution_dict:
                     prev_val = self.current_solution_dict[var_name]
@@ -719,6 +854,7 @@ class VisualLogger:
         self.plot_strategy_footprints()
         self.plot_status_time_distributions()
         self.plot_kpis_interplay()
+        self.plot_discovered_solutions_distribution()
         logger.info(f"Experiment saved successfully to {self.path}")
 
     def get_solution_history_df(self, solution_history):
@@ -875,10 +1011,9 @@ class VisualLogger:
         plt.figure(figsize=(10, 6))
 
         # Align runs across iterations by forward-filling best values for runs that stopped early (e.g. due to time limit)
-        pivot_best = (
-            self.df.pivot(index="iteration", columns="run_id", values="best")
-            .ffill()
-        )
+        pivot_best = self.df.pivot(
+            index="iteration", columns="run_id", values="best"
+        ).ffill()
         iters = list(pivot_best.index)
 
         mean_best = pivot_best.mean(axis=1)
@@ -887,10 +1022,9 @@ class VisualLogger:
         # Cumulative time per run, forward-filled for stopped runs to avoid skewing
         if "cum_time" not in self.df.columns:
             self.df["cum_time"] = self.df.groupby("run_id")["total_iter_time"].cumsum()
-        pivot_time = (
-            self.df.pivot(index="iteration", columns="run_id", values="cum_time")
-            .ffill()
-        )
+        pivot_time = self.df.pivot(
+            index="iteration", columns="run_id", values="cum_time"
+        ).ffill()
         mean_time = pivot_time.mean(axis=1)
 
         # Plot Best Makespan on Iteration Axis
@@ -1008,7 +1142,9 @@ class VisualLogger:
         for r_id in run_ids:
             run_df = self.df[self.df["run_id"] == r_id].sort_values("cum_time")
             t_points = np.array([0.0] + run_df["cum_time"].tolist(), dtype=np.float64)
-            b_points = np.array([heuristic_makespan] + run_df["best"].tolist(), dtype=np.float64)
+            b_points = np.array(
+                [heuristic_makespan] + run_df["best"].tolist(), dtype=np.float64
+            )
 
             # Step function: for each t in time_grid, find last recorded value with time <= t
             indices = np.searchsorted(t_points, time_grid, side="right") - 1
@@ -1024,7 +1160,9 @@ class VisualLogger:
         )
 
         # Plot LNS Progress on Time Axis
-        plt.plot(time_grid, lns_mean, color="blue", label="Mean LNS Solution", linewidth=2)
+        plt.plot(
+            time_grid, lns_mean, color="blue", label="Mean LNS Solution", linewidth=2
+        )
         plt.fill_between(
             time_grid,
             lns_mean - lns_std,
@@ -1034,7 +1172,9 @@ class VisualLogger:
         )
 
         # CP Performance on the same time grid
-        cp_mean, cp_std, cp_final_mean, cp_final_std = self.get_cp_performance(time_grid)
+        cp_mean, cp_std, cp_final_mean, cp_final_std = self.get_cp_performance(
+            time_grid
+        )
 
         if cp_mean is not None:
             plt.plot(
@@ -1075,7 +1215,10 @@ class VisualLogger:
                 )
 
         # Overlay Severity Lines mapped to time
-        if "severity_increases" in self.df.columns and (self.df["severity_increases"] > 0).any():
+        if (
+            "severity_increases" in self.df.columns
+            and (self.df["severity_increases"] > 0).any()
+        ):
             sev_df = self.df[self.df["severity_increases"] > 0]
             sev_iters = sorted(sev_df["iteration"].unique())
             for i, siter in enumerate(sev_iters):
@@ -1147,45 +1290,45 @@ class VisualLogger:
     def plot_kpis_interplay(self):
         if self.df.empty:
             return
-            
+
         plt.figure(figsize=(10, 6))
-        
+
         gb = self.df.groupby("iteration")
         iters = list(gb.groups.keys())
-        
+
         mean_makespan = gb["current_makespan"].mean()
         mean_flow = gb["current_total_flow_time"].mean()
         mean_fetches = gb["current_bin_fetches"].mean()
-        
+
         # Replace missing or default values (-1) with NaN to ignore them in normalization
         mean_makespan = mean_makespan.replace(-1, np.nan)
         mean_flow = mean_flow.replace(-1, np.nan)
         mean_fetches = mean_fetches.replace(-1, np.nan)
-        
+
         def normalize(s):
             min_s, max_s = s.min(), s.max()
             if pd.isna(min_s) or pd.isna(max_s) or max_s == min_s:
                 # Fallback to zero if constant or missing
                 return pd.Series(0, index=s.index)
             return (s - min_s) / (max_s - min_s)
-            
+
         norm_makespan = normalize(mean_makespan)
         norm_flow = normalize(mean_flow)
         norm_fetches = normalize(mean_fetches)
-        
+
         plt.plot(iters, norm_makespan, color="blue", label="Makespan", linewidth=2)
         plt.plot(iters, norm_flow, color="green", label="Total Flow Time", linewidth=2)
         plt.plot(iters, norm_fetches, color="red", label="Bin Fetches", linewidth=2)
-        
+
         plt.title("Interplay of KPIs (Min-Max Normalized)", fontsize=14)
         plt.xlabel("Iteration", fontsize=12)
         plt.ylabel("Normalized Value [0, 1]", fontsize=12)
-        
+
         plt.ylim(-0.05, 1.05)
         plt.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
         plt.grid(True, alpha=0.3)
         plt.gcf().set_layout_engine("constrained")
-        
+
         plt.savefig(
             f"{self.path}/kpis_interplay.svg",
             format="svg",
@@ -1199,11 +1342,11 @@ class VisualLogger:
 
         # --- Strategy Statistics ---
         valid_df = self.df[self.df["strategy"] >= 0].copy()
-        
+
         # Calculate improvements based on the targeted cp_obj
         # An improvement is when the current value of cp_obj is strictly less than the previous iteration's current value
         improved_mask = pd.Series(False, index=valid_df.index)
-        
+
         # We need the previous values for all iterations, not just valid ones, so we compute on self.df
         for obj in self.df["cp_obj"].unique():
             if obj == "":
@@ -1211,35 +1354,38 @@ class VisualLogger:
             col_name = f"current_{obj}"
             if col_name in self.df.columns:
                 # True if the value decreased compared to the previous row
-                decreased = (self.df[col_name].diff() < 0)
+                decreased = self.df[col_name].diff() < 0
                 # Apply this only to rows where cp_obj was this objective
-                obj_mask = (self.df["cp_obj"] == obj)
-                improved_mask |= (decreased & obj_mask)
-        
+                obj_mask = self.df["cp_obj"] == obj
+                improved_mask |= decreased & obj_mask
+
         # Align improved_mask with valid_df
         valid_improved_mask = improved_mask.loc[valid_df.index]
-        
+
         usage_crosstab = pd.crosstab(valid_df["strategy"], valid_df["cp_obj"])
-        
+
         valid_improved = valid_df[valid_improved_mask]
         if not valid_improved.empty:
             success_crosstab = pd.crosstab(
-                valid_improved["strategy"], 
-                valid_improved["cp_obj"]
+                valid_improved["strategy"], valid_improved["cp_obj"]
             )
         else:
             success_crosstab = pd.DataFrame()
-            
-        success_crosstab = success_crosstab.reindex(index=usage_crosstab.index, columns=usage_crosstab.columns, fill_value=0)
-        
+
+        success_crosstab = success_crosstab.reindex(
+            index=usage_crosstab.index, columns=usage_crosstab.columns, fill_value=0
+        )
+
         all_objs = list(usage_crosstab.columns)
         all_strats = list(usage_crosstab.index)
-        
+
         strat_stats_str = "\n=== Strategy Statistics (Solution Changes / Uses) ===\n"
         headers = ["Strategy"] + all_objs + ["Total"]
-        strat_stats_str += f"{headers[0]:<40} | " + " | ".join(f"{h:<15}" for h in headers[1:]) + "\n"
+        strat_stats_str += (
+            f"{headers[0]:<40} | " + " | ".join(f"{h:<15}" for h in headers[1:]) + "\n"
+        )
         strat_stats_str += "-" * (40 + 3 + 18 * len(headers[1:]) - 3) + "\n"
-        
+
         for strat_id in all_strats:
             strat_name = self.strategy_map.get(strat_id, f"Strategy {strat_id}")
             row_str = f"{strat_name:<40} | "
@@ -1252,7 +1398,7 @@ class VisualLogger:
                 total_uses += u_count
                 cell_str = f"{s_count}/{u_count}"
                 row_str += f"{cell_str:^15} | "
-            
+
             cell_str_total = f"{total_success}/{total_uses}"
             row_str += f"{cell_str_total:^15}\n"
             strat_stats_str += row_str
@@ -1264,11 +1410,49 @@ class VisualLogger:
             f"Iterations per run: {self.experiment_config['iters']}\n"
             f"Overall Best Makespan: {best_overall}\n"
             f"Average Total Solve Time per run: {mean_solve_time:.2f}s\n"
+            f"{self._discovery_summary_str()}"
             f"{strat_stats_str}"
         )
 
         with open(f"{self.path}/summary.txt", "w") as f:
             f.write(summary)
+
+    def _discovery_summary_str(self):
+        """Human-readable statistics on the solutions discovered per subproblem."""
+        entries = self._collect_discovered_entries()
+        if not entries:
+            return "\n=== Solution Discovery Statistics ===\nNo solutions recorded.\n"
+
+        times = np.array([e.get("time", -1.0) for e in entries], dtype=float)
+        valid_times = times[times >= 0]
+        counts = np.array(
+            [
+                len(d) if d else 0
+                for d in self.df.get(
+                    "discovered_solutions", pd.Series(dtype=object)
+                ).values
+            ]
+        )
+        n_iters = len(counts)
+        n_empty = int((counts == 0).sum())
+
+        stats = (
+            f"\n=== Solution Discovery Statistics ===\n"
+            f"Iterations logged           : {n_iters}\n"
+            f"Iterations w/o any solution : {n_empty} "
+            f"({100 * n_empty / n_iters:.1f}%)\n"
+            f"Total solutions discovered  : {len(entries)}\n"
+            f"Solutions per iteration     : mean {counts.mean():.2f}, "
+            f"median {np.median(counts):.0f}, max {counts.max()}\n"
+        )
+        if valid_times.size > 0:
+            stats += (
+                f"Discovery time (s)          : mean {valid_times.mean():.3f}, "
+                f"median {np.median(valid_times):.3f}, "
+                f"p90 {np.percentile(valid_times, 90):.3f}, "
+                f"max {valid_times.max():.3f}\n"
+            )
+        return stats
 
     def plot_iter_statuses(self):
         # Filter out unknown/uninitialized statuses
@@ -1639,6 +1823,142 @@ class VisualLogger:
         )
         plt.close()
 
+    def _collect_discovered_entries(self):
+        """Flatten the per-iteration discovered solutions into a list of dicts."""
+        entries = []
+        if "discovered_solutions" not in self.df.columns:
+            return entries
+
+        for run_id, iteration, discovered in zip(
+            self.df["run_id"], self.df["iteration"], self.df["discovered_solutions"]
+        ):
+            if not discovered:
+                continue
+            for sol in discovered:
+                entry = {"run_id": run_id, "iteration": iteration}
+                entry.update(sol)
+                entries.append(entry)
+        return entries
+
+    def plot_discovered_solutions_distribution(self):
+        """Cumulative distribution of solutions and their discovery times.
+
+        Answers the question of how many solutions (and how quickly) the CP
+        solver finds within the per-iteration time limit, which is used to tune
+        ``iter_time_limit`` and the solution-count target.
+        """
+        entries = self._collect_discovered_entries()
+        if not entries:
+            return
+
+        times = np.array([e.get("time", -1.0) for e in entries], dtype=float)
+        valid_times = times[times >= 0]
+        per_iter_counts = np.array(
+            [
+                len(d) if d else 0
+                for d in self.df.get(
+                    "discovered_solutions", pd.Series(dtype=object)
+                ).values
+            ],
+            dtype=int,
+        )
+
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+        # --- Left: CDF of discovery times ---
+        ax = axes[0]
+        if valid_times.size > 0:
+            sorted_times = np.sort(valid_times)
+            cdf = np.arange(1, sorted_times.size + 1) / sorted_times.size
+            ax.plot(sorted_times, cdf, color="blue", linewidth=2)
+            ax.axvline(
+                valid_times.mean(),
+                color="red",
+                linestyle="--",
+                label=f"Mean = {valid_times.mean():.3f}s",
+            )
+            ax.axvline(
+                np.median(valid_times),
+                color="green",
+                linestyle=":",
+                label=f"Median = {np.median(valid_times):.3f}s",
+            )
+            ax.legend(loc="lower right")
+        ax.set_xlabel("Discovery Time (seconds into iteration)")
+        ax.set_ylabel("Cumulative Fraction of Discovered Solutions")
+        ax.set_title("CDF of Solution Discovery Times")
+        ax.grid(True, alpha=0.3)
+
+        # --- Right: histogram of solutions found per iteration ---
+        ax = axes[1]
+        if per_iter_counts.size > 0:
+            max_count = int(per_iter_counts.max())
+            bins = np.arange(-0.5, max_count + 1.5)
+            ax.hist(
+                per_iter_counts,
+                bins=bins,
+                color="#1f77b4",
+                edgecolor="black",
+                linewidth=0.5,
+            )
+            ax.axvline(
+                per_iter_counts.mean(),
+                color="red",
+                linestyle="--",
+                label=f"Mean = {per_iter_counts.mean():.2f}",
+            )
+            ax.legend(loc="upper right")
+        ax.set_xlabel("Solutions Found per Subproblem (iteration)")
+        ax.set_ylabel("Frequency (Count)")
+        ax.set_title("Distribution of Solutions Found per Subproblem")
+        ax.grid(True, alpha=0.3, axis="y")
+
+        fig.set_layout_engine("constrained")
+        plt.savefig(
+            f"{self.path}/discovered_solutions_distribution.svg",
+            format="svg",
+            bbox_inches="tight",
+        )
+        plt.close()
+
+        # --- Third figure: mean #solutions discovered vs. iteration time ---
+        if "total_iter_time" in self.df.columns and per_iter_counts.size == len(
+            self.df
+        ):
+            fig, ax = plt.subplots(figsize=(10, 6))
+            scatter_df = self.df[["total_iter_time"]].copy()
+            scatter_df["num_discovered_solutions"] = per_iter_counts
+            # Aggregate into time bins to show the trend without overplotting
+            bin_count = min(20, max(3, int(np.sqrt(len(scatter_df)))))
+            binned = pd.DataFrame()
+            if scatter_df["total_iter_time"].nunique() >= 2:
+                scatter_df["time_bin"] = pd.qcut(
+                    scatter_df["total_iter_time"], q=bin_count, duplicates="drop"
+                )
+                binned = scatter_df.groupby("time_bin", observed=True).agg(
+                    mean_time=("total_iter_time", "mean"),
+                    mean_sols=("num_discovered_solutions", "mean"),
+                )
+            if not binned.empty:
+                ax.plot(
+                    binned["mean_time"],
+                    binned["mean_sols"],
+                    marker="o",
+                    color="purple",
+                    linewidth=2,
+                )
+            ax.set_xlabel("Iteration Duration (seconds)")
+            ax.set_ylabel("Mean Solutions Discovered")
+            ax.set_title("Solutions Discovered vs. Iteration Duration")
+            ax.grid(True, alpha=0.3)
+            fig.set_layout_engine("constrained")
+            plt.savefig(
+                f"{self.path}/discovered_solutions_vs_iter_time.svg",
+                format="svg",
+                bbox_inches="tight",
+            )
+            plt.close()
+
     def plot_chronological_durations(self):
         if self.df.empty:
             return
@@ -1889,7 +2209,11 @@ class VisualLogger:
             for iter_idx, item in enumerate(run_deltas):
                 if isinstance(item, dict):
                     changed_count = len(item)
-                elif isinstance(item, tuple) and len(item) == 2 and isinstance(item[1], dict):
+                elif (
+                    isinstance(item, tuple)
+                    and len(item) == 2
+                    and isinstance(item[1], dict)
+                ):
                     changed_count = len(item[1])
                 else:
                     changed_count = 0
@@ -1909,7 +2233,9 @@ class VisualLogger:
             merged_df = self.df.copy()
             merged_df["changed_vars"] = 0
         else:
-            merged_df = pd.merge(self.df, diff_df, on=["run_id", "iteration"], how="left")
+            merged_df = pd.merge(
+                self.df, diff_df, on=["run_id", "iteration"], how="left"
+            )
             merged_df["changed_vars"] = (
                 merged_df["changed_vars"].fillna(0).astype("int32")
             )
@@ -1957,7 +2283,9 @@ class VisualLogger:
 
     def reconstruct_solutions(self, run_idx=0):
         """Reconstruct complete solution dicts for a specific run."""
-        if run_idx < len(self.all_run_initial_solutions) and run_idx < len(self.all_run_deltas):
+        if run_idx < len(self.all_run_initial_solutions) and run_idx < len(
+            self.all_run_deltas
+        ):
             return reconstruct_solutions(
                 self.all_run_initial_solutions[run_idx],
                 self.all_run_deltas[run_idx],
@@ -2017,7 +2345,9 @@ def reconstruct_solutions(initial_solution_or_data, deltas=None):
                 solutions.append(copy.deepcopy(current))
             return solutions
         return [
-            reconstruct_solutions(run_data["initial_solution"], run_data.get("deltas", []))
+            reconstruct_solutions(
+                run_data["initial_solution"], run_data.get("deltas", [])
+            )
             for run_data in initial_solution_or_data
         ]
 
@@ -2029,8 +2359,12 @@ def reconstruct_solutions(initial_solution_or_data, deltas=None):
             )
         if "runs" in initial_solution_or_data:
             return [
-                reconstruct_solutions(run_data["initial_solution"], run_data.get("deltas", []))
+                reconstruct_solutions(
+                    run_data["initial_solution"], run_data.get("deltas", [])
+                )
                 for run_data in initial_solution_or_data["runs"]
             ]
 
-    raise ValueError(f"Invalid input to reconstruct_solutions: {type(initial_solution_or_data)}")
+    raise ValueError(
+        f"Invalid input to reconstruct_solutions: {type(initial_solution_or_data)}"
+    )

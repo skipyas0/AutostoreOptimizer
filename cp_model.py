@@ -4,9 +4,7 @@ from collections import defaultdict
 from docplex.cp.model import CpoModel
 from docplex.cp.solver.solver_listener import CpoSolverListener
 
-from cp_model_utils import build_solve_dict
 from instance import Instance
-from autostore_heuristic import validate_warmstart
 
 
 def build_model(
@@ -850,6 +848,7 @@ class ProgressCollector(CpoSolverListener):
             "best": <current best objective>,
             "bound": <current best bound>,
             "gap": <relative gap>,
+            "kpis": {<kpi name>: <value>, ...},
             "delta": {var_name: {"present": bool, "start": int|None, "end": int|None, "size": int|None}, ...}
         },
         ...
@@ -891,17 +890,31 @@ class ProgressCollector(CpoSolverListener):
                         pres = bool(val.is_present())
                         cur_state = {
                             "present": pres,
-                            "start": int(val.get_start()) if pres and val.get_start() is not None else None,
-                            "end": int(val.get_end()) if pres and val.get_end() is not None else None,
-                            "size": int(val.get_size()) if pres and hasattr(val, "get_size") and val.get_size() is not None else None,
+                            "start": int(val.get_start())
+                            if pres and val.get_start() is not None
+                            else None,
+                            "end": int(val.get_end())
+                            if pres and val.get_end() is not None
+                            else None,
+                            "size": int(val.get_size())
+                            if pres
+                            and hasattr(val, "get_size")
+                            and val.get_size() is not None
+                            else None,
                         }
                     elif isinstance(val, dict):
                         pres = bool(val.get("present"))
                         cur_state = {
                             "present": pres,
-                            "start": int(val["start"]) if pres and val.get("start") is not None else None,
-                            "end": int(val["end"]) if pres and val.get("end") is not None else None,
-                            "size": int(val["size"]) if pres and val.get("size") is not None else None,
+                            "start": int(val["start"])
+                            if pres and val.get("start") is not None
+                            else None,
+                            "end": int(val["end"])
+                            if pres and val.get("end") is not None
+                            else None,
+                            "size": int(val["size"])
+                            if pres and val.get("size") is not None
+                            else None,
                         }
                     else:
                         cur_state = val
@@ -916,6 +929,7 @@ class ProgressCollector(CpoSolverListener):
                     "best": obj,
                     "bound": sres.get_objective_bound(),
                     "gap": sres.get_objective_gap(),
+                    "kpis": dict(sres.get_kpis() or {}),
                     "delta": delta,
                 }
                 self.records.append(rec)

@@ -1,16 +1,15 @@
 import os
-import sys
-import unittest
-import numpy as np
-import pandas as pd
-import tempfile
 import shutil
+import sys
+import tempfile
+import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from matheuristic_plots import (
-    VisualLogger,
     Status,
+    VisualLogger,
+    extract_discovered_solutions,
     get_distinct_colors,
 )
 
@@ -71,14 +70,90 @@ class TestMatheuristicPlotsColorPalettes(unittest.TestCase):
 
         # Test plot_strategy_footprints (previously used % 10 color cycling)
         vlg.plot_strategy_footprints()
-        expected_footprints_path = os.path.join(vlg.path, "strategy_footprints_run1.svg")
+        expected_footprints_path = os.path.join(
+            vlg.path, "strategy_footprints_run1.svg"
+        )
         self.assertTrue(os.path.exists(expected_footprints_path))
 
         # Test status distribution plots
         vlg.plot_distribution_of_times_per_status()
         vlg.plot_status_time_histogram()
-        self.assertTrue(os.path.exists(os.path.join(vlg.path, "status_time_distributions.svg")))
-        self.assertTrue(os.path.exists(os.path.join(vlg.path, "status_time_histogram.svg")))
+        self.assertTrue(
+            os.path.exists(os.path.join(vlg.path, "status_time_distributions.svg"))
+        )
+        self.assertTrue(
+            os.path.exists(os.path.join(vlg.path, "status_time_histogram.svg"))
+        )
+
+    def test_extract_discovered_solutions(self):
+        # No solutions -> empty list (covers infeasible/unknown subproblems)
+        self.assertEqual(extract_discovered_solutions(None), [])
+        self.assertEqual(extract_discovered_solutions([]), [])
+
+        # C++ backend raw progress dicts
+        records = [
+            {"time": 0.01, "best": 100, "kpis": {"makespan": 100, "bin_fetches": 3}},
+            {"time": 0.5, "best": 90, "kpis": {"makespan": 90, "bin_fetches": 3}},
+        ]
+        out = extract_discovered_solutions(records)
+        self.assertEqual(len(out), 2)
+        self.assertAlmostEqual(out[0]["time"], 0.01)
+        self.assertEqual(out[0]["kpis"]["makespan"], 100.0)
+        self.assertEqual(out[1]["kpis"]["bin_fetches"], 3.0)
+
+        # docplex backend CpoSolveResult-like objects
+        class FakeSolveResult:
+            def get_solve_time(self):
+                return 0.2
+
+            def get_kpis(self):
+                return {"makespan": 55, "idle_time": 12}
+
+        out = extract_discovered_solutions([FakeSolveResult()])
+        self.assertEqual(len(out), 1)
+        self.assertAlmostEqual(out[0]["time"], 0.2)
+        self.assertEqual(out[0]["kpis"], {"makespan": 55.0, "idle_time": 12.0})
+
+    def test_discovered_solutions_logging_and_plot(self):
+        num_iters = 6
+        vlg = VisualLogger(
+            instance_folder=self.test_dir,
+            instance_config={},
+            experiment_config={"runs": 1, "iters": num_iters, "time_limit": 1.0},
+        )
+        vlg.log_run_start(10, {f"var_{i}": i for i in range(10)}, None)
+
+        for i in range(num_iters):
+            vlg.log_iteration_start(i)
+            vlg.log_strategy("Strategy_0", 0)
+            if i == 0:
+                # Infeasible/unknown iteration -> empty list
+                vlg.log_discovered_solutions([])
+            else:
+                records = [
+                    {"time": 0.01 * j, "kpis": {"makespan": 100 - j}} for j in range(i)
+                ]
+                vlg.log_discovered_solutions(records)
+            vlg.log_iteration_end(Status.Feasible_New_Best, best=100 - i, cur=100)
+
+        vlg.log_run_end()
+
+        self.assertEqual(
+            vlg.df["num_discovered_solutions"].tolist(), [0, 1, 2, 3, 4, 5]
+        )
+        self.assertEqual(vlg.df["discovered_solutions"].iloc[0], [])
+
+        vlg.plot_discovered_solutions_distribution()
+        self.assertTrue(
+            os.path.exists(
+                os.path.join(vlg.path, "discovered_solutions_distribution.svg")
+            )
+        )
+        self.assertTrue(
+            os.path.exists(
+                os.path.join(vlg.path, "discovered_solutions_vs_iter_time.svg")
+            )
+        )
 
 
 if __name__ == "__main__":

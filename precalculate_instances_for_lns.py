@@ -256,9 +256,7 @@ def check_if_precalculated(config, with_removal=False):
                 ):
                     shutil.rmtree(folder)
                 else:
-                    raise ValueError(
-                        "Incomplete instance but no recalculate on prompt"
-                    )
+                    raise ValueError("Incomplete instance but no recalculate on prompt")
     return ret
 
 
