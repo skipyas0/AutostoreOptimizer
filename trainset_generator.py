@@ -7,34 +7,12 @@ import sys
 import numpy as np
 import pandas as pd
 
-from autostore_heuristic import solve_heuristic_instance as base_solve
 from datagen import generate_data
-from heuristic_ama_sgc import (
-    _compute_objective,
-    precompute_attributes,
-    run_sgc_parameterised,
-)
+from heuristics import run_sgc
+from heuristics.sgc import ALL_RULES, BIN_ATTRS, DIRECTIONS, ORDER_ATTRS  # noqa: F401
 
-ORDER_ATTRS = [
-    "sum_rt",
-    "order_size",
-    "sum_cycle",
-    "max_rt",
-    "sku_rarity",
-    "sku_contention",
-    "sharing_degree",
-    "min_copies",
-]
-BIN_ATTRS = ["rt", "p", "cycle", "demand_ratio", "copies", "demand"]
-DIRECTIONS = [True, False]
-
-# Pre-generate the 192 configs
-ALL_CONFIGS = []
-for oa in ORDER_ATTRS:
-    for od in DIRECTIONS:
-        for ba in BIN_ATTRS:
-            for bd in DIRECTIONS:
-                ALL_CONFIGS.append((oa, od, ba, bd))
+# The 192 (order_attr, order_desc, bin_attr, bin_desc) configurations (column order of the dataset)
+ALL_CONFIGS = [(o.attr, o.descending, b.attr, b.descending) for o, b in ALL_RULES]
 
 
 def _process_combo(cfg):
@@ -49,32 +27,15 @@ def _process_combo(cfg):
     )
     features = instance.get_features()
 
-    # Baseline score
-    res_base = base_solve({**cfg, "horizon": 10000}, return_raw=False)
-    baseline_score = res_base.get("objective_value", float("inf"))
-    if baseline_score is None:
-        baseline_score = float("inf")
+    # Baseline score (default SGC rules)
+    base = run_sgc(instance, horizon=10000)
+    baseline_score = float(base.makespan) if base.feasible else float("inf")
 
     # Evaluate all configurations
-    order_attrs, sku_attrs = precompute_attributes(instance)
     config_scores = []
-    for config in ALL_CONFIGS:
-        oa, od, ba, bd = config
-        sol = run_sgc_parameterised(
-            instance,
-            10000,
-            cfg["movecap"],
-            1.0,
-            0.0,
-            order_attrs,
-            sku_attrs,
-            oa,
-            od,
-            ba,
-            bd,
-        )
-        obj = _compute_objective(sol, 1.0, 0.0, instance.S)
-        config_scores.append(obj)
+    for order_rule, sku_rule in ALL_RULES:
+        sol = run_sgc(instance, horizon=10000, order_rule=order_rule, sku_rule=sku_rule)
+        config_scores.append(sol.objective(1.0, 0.0, instance.S))
 
     return {
         "features": features,

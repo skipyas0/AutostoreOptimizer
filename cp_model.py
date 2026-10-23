@@ -633,7 +633,7 @@ def inject_warmstart(solution, pick_events: dict, mdl, handles):
     Parameters
     ----------
     solution:
-        ``autostore_heuristic.Solution`` returned by ``run_sgc``.
+        ``heuristics.HeuristicSolution`` returned by any heuristic.
     pick_events:
         ``solution.pick_events`` — mapping ``(o, s, k) -> (pick_start, pick_end)``.
     mdl:

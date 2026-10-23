@@ -12,7 +12,7 @@ from loguru import logger
 
 import cp_model as docplex_model
 import cpp_cp_model
-from autostore_heuristic import validate_solution
+from heuristics import validate_solution
 from cp_model_utils import (
     CppSolveResult,
     cp_sol_to_solution,
@@ -758,7 +758,6 @@ class Solver:
                 final_solution,
                 self.instance,
                 horizon=self.instance_config["horizon"],
-                move_cap=self.instance_config["movecap"],
             )
         except KeyError:
             logger.error("Config doesn't have horizon or movecap field.")

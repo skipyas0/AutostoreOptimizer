@@ -1,6 +1,5 @@
-from itertools import product
-from manim.animation import transform_matching_parts
 from collections import defaultdict
+from functools import cached_property
 import pickle
 from typing import Any
 import numpy as np
@@ -62,6 +61,7 @@ class Instance:
     @orders_requirements.setter
     def orders_requirements(self, value: dict[int, list[int]]):
         self._orders_requirements = value
+        self._clear_cached()
 
     @property
     def orders_req(self) -> dict[int, list[int]]:
@@ -70,6 +70,7 @@ class Instance:
     @orders_req.setter
     def orders_req(self, value: dict[int, list[int]]):
         self._orders_requirements = value
+        self._clear_cached()
 
     @property
     def O(self) -> list[int]:
@@ -84,6 +85,7 @@ class Instance:
     @rt_ret.setter
     def rt_ret(self, value: dict[int, int]):
         self._rt_ret = value
+        self._clear_cached()
 
     @property
     def movecap(self) -> int:
@@ -96,6 +98,122 @@ class Instance:
     @property
     def seed(self) -> int:
         return self._seed
+
+    # ------------------------------------------------------------------
+    # Lazily precomputed attributes shared by the heuristics.
+    # cached_property stores the value in __dict__ on first access, so these
+    # also work for Instances unpickled from before they existed. The
+    # orders_req / rt_ret setters clear them.
+    # ------------------------------------------------------------------
+
+    _CACHED = (
+        "demand_count",
+        "req_sets",
+        "sharing_degree",
+        "sku_order_index",
+        "order_attrs",
+        "sku_attrs",
+    )
+
+    def _clear_cached(self) -> None:
+        for name in self._CACHED:
+            self.__dict__.pop(name, None)
+
+    @cached_property
+    def demand_count(self) -> dict[int, int]:
+        """SKU -> number of order lines requiring it (only SKUs that are used)."""
+        dc: dict[int, int] = defaultdict(int)
+        for req in self._orders_requirements.values():
+            for k in req:
+                dc[k] += 1
+        return dict(dc)
+
+    @cached_property
+    def req_sets(self) -> dict[int, set[int]]:
+        """Order -> set of required SKUs."""
+        return {o: set(req) for o, req in self._orders_requirements.items()}
+
+    @cached_property
+    def sharing_degree(self) -> dict[int, int]:
+        """Order -> number of OTHER orders sharing at least one SKU with it."""
+        O = self.O
+        rs = self.req_sets
+        return {
+            o: sum(1 for o2 in O if o2 != o and not rs[o].isdisjoint(rs[o2]))
+            for o in O
+        }
+
+    @cached_property
+    def sku_order_index(self) -> dict[int, set[int]]:
+        """SKU -> set of orders requiring it."""
+        idx: dict[int, set[int]] = {}
+        for o, skus in self._orders_requirements.items():
+            for k in skus:
+                idx.setdefault(k, set()).add(o)
+        return idx
+
+    @cached_property
+    def sku_attrs(self) -> dict[int, dict]:
+        """Per-SKU dispatching attributes (used SKUs only), see heuristics.sgc.BIN_ATTRS."""
+        dc = self.demand_count
+        rt, p, rt_ret, N = self.rt, self.p, self.rt_ret, self.N
+        return {
+            k: {
+                "rt": rt[k],
+                "p": p[k],
+                "cycle": rt[k] + p[k] + rt_ret[k],
+                "demand_ratio": dc[k] / max(N[k], 1),
+                "copies": N[k],
+                "demand": dc[k],
+            }
+            for k in dc
+        }
+
+    @cached_property
+    def order_attrs(self) -> dict[int, dict]:
+        """Per-order dispatching attributes, see heuristics.sgc.ORDER_ATTRS."""
+        dc = self.demand_count
+        rt, p, rt_ret, N = self.rt, self.p, self.rt_ret, self.N
+        sd = self.sharing_degree
+        out = {}
+        for o in self.O:
+            req = self._orders_requirements[o]
+            out[o] = {
+                "sum_rt": sum(rt[k] for k in req),
+                "order_size": len(req),
+                "sum_cycle": sum(rt[k] + p[k] + rt_ret[k] for k in req),
+                "max_rt": max((rt[k] for k in req), default=0),
+                "sku_rarity": sum(1.0 / max(dc[k], 1) for k in req),
+                "sku_contention": sum(dc[k] / max(N[k], 1) for k in req),
+                "sharing_degree": sd[o],
+                "min_copies": min((N[k] for k in req), default=1),
+            }
+        return out
+
+    def subinstance(
+        self,
+        orders,
+        stations: list[int] | None = None,
+        movecap: int | None | str = "same",
+    ) -> "Instance":
+        """Instance restricted to `orders` (iteration order kept) and optionally `stations`.
+
+        Lanes, SKUs, times, bin counts, seed and pickcap are shared with self;
+        movecap is kept unless given (None = uncapped).
+        """
+        return Instance(
+            list(stations) if stations is not None else self.S,
+            self.L,
+            self.K,
+            {o: self._orders_requirements[o] for o in orders},
+            self.rt,
+            self.p,
+            self.N,
+            self.movecap if movecap == "same" else movecap,
+            self.seed,
+            self.rt_ret,
+            self.pickcap,
+        )
 
     def get_statistics(self) -> dict[str, Any]:
         """Calculate and return key statistics about the instance."""

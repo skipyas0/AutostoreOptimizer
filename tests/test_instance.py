@@ -11,7 +11,7 @@ def test_instance_properties():
     p = {0: 4, 1: 4, 2: 4, 3: 4}
     N = {0: 1, 1: 1, 2: 2, 3: 2}
 
-    inst = Instance(S, L, K, orders_req, rt, p, N)
+    inst = Instance(S, L, K, orders_req, rt, p, N, movecap=None, seed=0)
 
     assert inst.S == S
     assert inst.L == L
@@ -45,7 +45,7 @@ def test_instance_statistics(capsys):
     p = {0: 4, 1: 4, 2: 4}
     N = {0: 1, 1: 2, 2: 3}
 
-    inst = Instance(S, L, K, orders_req, rt, p, N)
+    inst = Instance(S, L, K, orders_req, rt, p, N, movecap=None, seed=0)
     stats = inst.get_statistics()
 
     assert stats["num_stations"] == 1
@@ -79,7 +79,7 @@ def test_instance_custom_rt_ret():
     N = {0: 1, 1: 1}
     rt_ret = {0: 15, 1: 25}
 
-    inst = Instance(S, L, K, orders_req, rt, p, N, rt_ret=rt_ret)
+    inst = Instance(S, L, K, orders_req, rt, p, N, movecap=None, seed=0, rt_ret=rt_ret)
     assert inst.rt_ret == rt_ret
 
     # Test that modifying via setter works

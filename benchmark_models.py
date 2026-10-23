@@ -1,21 +1,30 @@
 #!/usr/bin/env python3
 """
-Benchmark script to compare pretrained RL order-to-station assignment model checkpoints (MLP/GNN)
-against:
-  1. Random-partitioned RDI
-  2. Similarity-partitioned RDI
-  3. Load-balanced RDI
-  4. Full RDI without decomposition
-  5. Standard Full Greedy Heuristic (autostore_heuristic.py SGC)
-  6. Load-balanced Greedy Heuristic (autostore_heuristic.py SGC with restricted candidate stations)
+Benchmark heuristics (and RL order-to-station assignment checkpoints) on instances
+drawn from the RL training distribution, with disjoint seeds.
 
-Instances are generated using the exact distribution and parameters from the RL training loop,
-with disjoint random seeds. Metrics reported are the exact components and reward formulations
-from the RL environment, plus average solution times.
+Every method is a ``Callable[[Instance], HeuristicSolution]``; metrics are computed
+from the returned solution by ``solution_metrics`` (RL-environment reward components
+plus timings). Default methods (same labels as before the heuristics refactor):
+
+  RL (<checkpoint>)                  RL assignment + per-station RDI
+  1. Random-partitioned RDI          heuristics: partitioned_rdi_random
+  2. Similarity-partitioned RDI      heuristics: partitioned_rdi_similarity
+  3. Load-balanced RDI               heuristics: partitioned_rdi_load_balanced
+  4. Full RDI (No Decomposition)     heuristics: rdi
+  5. Standard Full Greedy (SGC)      heuristics: sgc
+  6. Load-balanced Greedy (SGC)      heuristics: lb_sgc
+  7. Standard Piggyback SGC          heuristics: sgc_singles
+  8. Load-balanced Piggyback SGC     heuristics: lb_sgc_singles
+
+``--methods`` selects a subset by label number/registry name, or ``all`` to add
+EXTRA_METHODS (RDI tiebreakers, AMA, CFSS, GBS). All heuristics use horizon 50000.
 
 Usage:
   .venv/bin/python benchmark_models.py
   .venv/bin/python benchmark_models.py --checkpoints rl_agent_weights_mlp_1200.pth --num-instances 10
+  .venv/bin/python benchmark_models.py --methods sgc rdi cfss gbs_adaptive --num-instances 5
+  .venv/bin/python benchmark_models.py --methods all --skip-rl
 """
 
 import argparse
@@ -26,7 +35,8 @@ import random
 import sys
 import time
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Tuple
+from collections.abc import Callable
+from functools import partial
 
 # Suppress matplotlib font cache warnings
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/mpl_config")
@@ -41,15 +51,14 @@ code_dir = os.path.dirname(os.path.abspath(__file__))
 if code_dir not in sys.path:
     sys.path.insert(0, code_dir)
 
-from autostore_heuristic import run_sgc
 from datagen import generate_data
-from decomposition import (
-    create_load_balanced_partitions,
-    create_random_partitions,
-    create_similarity_partitions,
-    distribute_movecap,
+from heuristics import (
+    HeuristicSolution,
+    resolve,
+    run_heuristic,
+    run_partitioned_rdi,
+    validate_solution,
 )
-from heuristic_rdi_sgc import run_rdi_sgc
 from instance import Instance
 from rl_order_assignment import (
     OrderAssignmentAgent,
@@ -95,22 +104,27 @@ def load_agent(
         return agent
 
 
-def generate_benchmark_instance(instance_idx: int, seed_base: int = 100000) -> Instance:
+def generate_benchmark_instance(
+    instance_idx: int, scale, seed_base: int = 100000
+) -> Instance:
     """
     Generates an instance matching the training loop distribution in rl_order_assignment.py
     using a disjoint seed range.
     """
     rng = random.Random(seed_base + instance_idx)
-    s = rng.randint(2, 12)
-    l = rng.randint(3, 10)
-    if s > 5:
-        o = rng.randint(2, 8) * 50
-        m = rng.randint(4, 8) * 5
-        sku = rng.randint(8, 15) * 2000
-    else:
-        o = rng.randint(2, 8) * 10
-        m = rng.randint(4, 8) * 2
-        sku = rng.randint(8, 15) * 1000
+
+    preset = {
+        "small": (4, 3, 10, 1, 500),
+        "medium": (6, 5, 35, 3, 1000),
+        "large": (15, 8, 75, 8, 2500),
+    }
+    max_s, max_l, o_mul, m_mul, sku_mul = preset[scale]
+
+    s = rng.randint(2, max_s)
+    l = rng.randint(2, max_l)
+    o = rng.randint(2, 8) * o_mul
+    m = rng.randint(4, 8) * m_mul
+    sku = rng.randint(8, 15) * sku_mul
 
     instance = generate_data(
         num_stations=s,
@@ -133,14 +147,14 @@ def generate_benchmark_instance(instance_idx: int, seed_base: int = 100000) -> I
 
 def compute_metrics_from_station_results(
     instance: Instance,
-    M_k: List[float],
-    W_k: List[float],
-    Be_k: List[int],
-    P_k: List[int],
-    Rt_k: List[float],
+    M_k: list[float],
+    W_k: list[float],
+    Be_k: list[int],
+    P_k: list[int],
+    Rt_k: list[float],
     elapsed_time: float,
     partition_time: float = 0.0,
-) -> Dict[str, float]:
+) -> dict[str, float]:
     """
     Calculates the exact reward and summary metrics defined in the RL environment.
     """
@@ -206,216 +220,178 @@ def compute_metrics_from_station_results(
     }
 
 
-def evaluate_station_assignments(
+# ======================================================================
+# Metrics from a HeuristicSolution
+# ======================================================================
+
+PENALTY_MAKESPAN = 50000.0
+
+
+def solution_metrics(
     instance: Instance,
-    station_assignments: Dict[int, List[int]],
-    horizon: int = 50000,
-) -> Tuple[List[float], List[float], List[int], List[int], List[float]]:
+    sol: HeuristicSolution | None,
+    elapsed: float,
+    partition_time: float = 0.0,
+) -> dict[str, float]:
+    """Per-station components (M_k, W_k, Be_k, P_k, Rt_k) -> RL-environment metrics.
+
+    Monolithic solutions: if infeasible, every station gets M_k = 50000 and W_k = 0.
+    Partitioned solutions (meta["station_feasible"]): only infeasible stations are
+    penalised and W_k is always the assigned workload (meta["assignment"]).
     """
-    Solves subinstances station by station using run_rdi_sgc and extracts station-level metrics.
-    """
-    M_k = []
-    W_k = []
-    Be_k = []
-    P_k = []
-    Rt_k = []
+    M_k, W_k, Be_k, P_k, Rt_k = [], [], [], [], []
+    station_feasible = sol.meta.get("station_feasible") if sol is not None else None
+    assignment = sol.meta.get("assignment") if sol is not None else None
 
-    n_stations = len(instance.S)
-    workloads = [len(station_assignments.get(i, [])) for i in range(n_stations)]
-    station_movecaps = distribute_movecap(instance.movecap, n_stations, workloads)
-
-    for i, s_idx in enumerate(instance.S):
-        assigned_orders = station_assignments.get(i, [])
-
-        # Workload W_k
-        w = sum(
-            instance.p.get(k, 0)
-            for o in assigned_orders
-            for k in instance.orders_req[o]
+    if station_feasible is None and (sol is None or not sol.feasible):
+        n = len(instance.S)
+        return compute_metrics_from_station_results(
+            instance,
+            [PENALTY_MAKESPAN] * n,
+            [0.0] * n,
+            [0] * n,
+            [0] * n,
+            [0.0] * n,
+            elapsed,
+            partition_time,
         )
-        W_k.append(float(w))
 
-        if not assigned_orders:
-            M_k.append(0.0)
+    for s in instance.S:
+        if assignment is not None:
+            orders = assignment.get(s, [])
+        else:
+            orders = [
+                o for o, (st, _, _, _) in sol.order_assignments.items() if st == s
+            ]
+        W_k.append(
+            float(
+                sum(
+                    instance.p.get(k, 0) for o in orders for k in instance.orders_req[o]
+                )
+            )
+        )
+
+        if station_feasible is not None and not station_feasible.get(s, True):
+            M_k.append(PENALTY_MAKESPAN)
             Be_k.append(0)
             P_k.append(0)
             Rt_k.append(0.0)
             continue
 
-        subinstance = Instance(
-            [s_idx],
-            instance.L,
-            instance.K,
-            {o: instance.orders_req[o] for o in assigned_orders},
-            instance.rt,
-            instance.p,
-            instance.N,
-            station_movecaps[i],
-            instance.seed,
-            instance.rt_ret,
-            instance.pickcap,
+        M_k.append(
+            float(
+                max(
+                    (
+                        en
+                        for (st, _, _, en) in sol.order_assignments.values()
+                        if st == s
+                    ),
+                    default=0.0,
+                )
+            )
+        )
+        events = sol.bin_events.get(s, [])
+        Be_k.append(len(events))
+        P_k.append(sum(1 for (_, st, _) in sol.pick_events if st == s))
+        Rt_k.append(
+            float(
+                sum(
+                    be.fetch_end - be.fetch_start + be.return_end - be.return_start
+                    for be in events
+                )
+            )
         )
 
-        heur_sol = run_rdi_sgc(subinstance, horizon=horizon, batch_start_time=0)
-        if heur_sol and heur_sol.feasible:
-            M_k.append(float(heur_sol.makespan))
-            events = heur_sol.bin_events.get(s_idx, [])
-            Be_k.append(len(events))
-            P_k.append(len(heur_sol.pick_events))
-            rt_sum = sum(
-                be.fetch_end - be.fetch_start + be.return_end - be.return_start
-                for be in events
-            )
-            Rt_k.append(float(rt_sum))
-        else:
-            M_k.append(50000.0)
-            Be_k.append(0)
-            P_k.append(0)
-            Rt_k.append(0.0)
-
-    return M_k, W_k, Be_k, P_k, Rt_k
-
-
-def run_random_partition_rdi(instance: Instance) -> Dict[str, float]:
-    t0 = time.perf_counter()
-    partitions = create_random_partitions(instance, len(instance.S))
-    t_partition = time.perf_counter() - t0
-
-    station_assignments = {i: list(p) for i, p in enumerate(partitions)}
-    M_k, W_k, Be_k, P_k, Rt_k = evaluate_station_assignments(
-        instance, station_assignments
-    )
-    t_total = time.perf_counter() - t0
-
     return compute_metrics_from_station_results(
-        instance, M_k, W_k, Be_k, P_k, Rt_k, t_total, partition_time=t_partition
+        instance, M_k, W_k, Be_k, P_k, Rt_k, elapsed, partition_time
     )
 
 
-def run_similarity_partition_rdi(instance: Instance) -> Dict[str, float]:
+# ======================================================================
+# Methods: Instance -> HeuristicSolution
+# ======================================================================
+
+BENCH_HORIZON = 50000
+
+DEFAULT_METHODS: dict[str, Callable[[Instance], HeuristicSolution]] = {
+    "1. Random-partitioned RDI": partial(
+        run_heuristic, "partitioned_rdi_random", horizon=BENCH_HORIZON
+    ),
+    "2. Similarity-partitioned RDI": partial(
+        run_heuristic, "partitioned_rdi_similarity", horizon=BENCH_HORIZON
+    ),
+    "3. Load-balanced RDI": partial(
+        run_heuristic, "partitioned_rdi_load_balanced", horizon=BENCH_HORIZON
+    ),
+    "4. Full RDI (No Decomposition)": partial(
+        run_heuristic, "rdi", horizon=BENCH_HORIZON
+    ),
+    "5. Standard Full Greedy (SGC)": partial(
+        run_heuristic, "sgc", horizon=BENCH_HORIZON
+    ),
+    "6. Load-balanced Greedy (SGC)": partial(
+        run_heuristic, "lb_sgc", horizon=BENCH_HORIZON
+    ),
+    "7. Standard Piggyback SGC": partial(
+        run_heuristic, "sgc_singles", horizon=BENCH_HORIZON
+    ),
+    "8. Load-balanced Piggyback SGC": partial(
+        run_heuristic, "lb_sgc_singles", horizon=BENCH_HORIZON
+    ),
+}
+
+# Extra registry heuristics added by `--methods all` (or by name).
+EXTRA_METHODS = [
+    "rdi_sum_rt",
+    "rdi_best_score",
+    "ama_two_phase",
+    "ama_two_phase_singles",
+    "ama",
+    "cfss",
+    "cfss_normalized",
+    "gbs_max_sharing",
+    "gbs_critical_path",
+    "gbs_readiness_weighted",
+    "gbs_adaptive",
+]
+
+
+def registry_method(name: str) -> Callable[[Instance], HeuristicSolution]:
+    key = resolve(name)
+    horizon = {"horizon": BENCH_HORIZON}
+    return partial(run_heuristic, key, **horizon)
+
+
+def rl_method(
+    agent, device: torch.device, deterministic: bool = True
+) -> Callable[[Instance], HeuristicSolution]:
+    """RL order->station assignment followed by per-station RDI (partitioned RDI)."""
+
+    def run(instance: Instance) -> HeuristicSolution:
+        t0 = time.perf_counter()
+        assignment = rl_assignment(instance, agent, device, deterministic)
+        t_partition = time.perf_counter() - t0
+        sol = run_partitioned_rdi(instance, partition=assignment, horizon=BENCH_HORIZON)
+        sol.meta["partition_time"] = t_partition
+        return sol
+
+    return run
+
+
+def run_method(
+    method: Callable[[Instance], HeuristicSolution], instance: Instance
+) -> dict[str, float]:
     t0 = time.perf_counter()
-    partitions = create_similarity_partitions(instance, len(instance.S))
-    t_partition = time.perf_counter() - t0
-
-    station_assignments = {i: list(p) for i, p in enumerate(partitions)}
-    M_k, W_k, Be_k, P_k, Rt_k = evaluate_station_assignments(
-        instance, station_assignments
-    )
-    t_total = time.perf_counter() - t0
-
-    return compute_metrics_from_station_results(
-        instance, M_k, W_k, Be_k, P_k, Rt_k, t_total, partition_time=t_partition
-    )
+    sol = method(instance)
+    elapsed = time.perf_counter() - t0
+    partition_time = sol.meta.get("partition_time", 0.0) if sol is not None else 0.0
+    return solution_metrics(instance, sol, elapsed, partition_time)
 
 
-def run_load_balanced_partition_rdi(instance: Instance) -> Dict[str, float]:
-    t0 = time.perf_counter()
-    partitions = create_load_balanced_partitions(instance, len(instance.S))
-    t_partition = time.perf_counter() - t0
-
-    station_assignments = {i: list(p) for i, p in enumerate(partitions)}
-    M_k, W_k, Be_k, P_k, Rt_k = evaluate_station_assignments(
-        instance, station_assignments
-    )
-    t_total = time.perf_counter() - t0
-
-    return compute_metrics_from_station_results(
-        instance, M_k, W_k, Be_k, P_k, Rt_k, t_total, partition_time=t_partition
-    )
-
-
-def _extract_monolithic_solution_metrics(
-    instance: Instance, heur_sol, t_total: float
-) -> Dict[str, float]:
-    M_k = []
-    W_k = []
-    Be_k = []
-    P_k = []
-    Rt_k = []
-
-    if heur_sol and heur_sol.feasible:
-        for s_idx in instance.S:
-            assigned_orders = [
-                o
-                for o, (s, ln, st, en) in heur_sol.order_assignments.items()
-                if s == s_idx
-            ]
-            w = sum(
-                instance.p.get(k, 0)
-                for o in assigned_orders
-                for k in instance.orders_req[o]
-            )
-            W_k.append(float(w))
-
-            stn_makespan = max(
-                (
-                    en
-                    for o, (s, ln, st, en) in heur_sol.order_assignments.items()
-                    if s == s_idx
-                ),
-                default=0.0,
-            )
-            M_k.append(float(stn_makespan))
-
-            events = heur_sol.bin_events.get(s_idx, [])
-            Be_k.append(len(events))
-
-            # Number of pick events for orders at this station
-            stn_picks = sum(
-                1 for (o, stn, k) in heur_sol.pick_events.keys() if stn == s_idx
-            )
-            P_k.append(stn_picks)
-
-            rt_sum = sum(
-                be.fetch_end - be.fetch_start + be.return_end - be.return_start
-                for be in events
-            )
-            Rt_k.append(float(rt_sum))
-    else:
-        for _ in instance.S:
-            M_k.append(50000.0)
-            W_k.append(0.0)
-            Be_k.append(0)
-            P_k.append(0)
-            Rt_k.append(0.0)
-
-    return compute_metrics_from_station_results(
-        instance, M_k, W_k, Be_k, P_k, Rt_k, t_total, partition_time=0.0
-    )
-
-
-def run_full_rdi_no_decomposition(
-    instance: Instance, horizon: int = 50000
-) -> Dict[str, float]:
-    t0 = time.perf_counter()
-    heur_sol = run_rdi_sgc(instance, horizon=horizon, batch_start_time=0)
-    t_total = time.perf_counter() - t0
-    return _extract_monolithic_solution_metrics(instance, heur_sol, t_total)
-
-
-def run_full_greedy_heuristic(
-    instance: Instance,
-    horizon: int = 50000,
-    restrict_stations_by_workload: bool = False,
-) -> Dict[str, float]:
-    t0 = time.perf_counter()
-    heur_sol = run_sgc(
-        instance,
-        horizon=horizon,
-        restrict_stations_by_workload=restrict_stations_by_workload,
-    )
-    t_total = time.perf_counter() - t0
-    return _extract_monolithic_solution_metrics(instance, heur_sol, t_total)
-
-
-def run_rl_checkpoint_rdi(
-    instance: Instance,
-    agent,
-    device: torch.device,
-    deterministic: bool = True,
-) -> Dict[str, float]:
-    t0 = time.perf_counter()
-
+def rl_assignment(
+    instance: Instance, agent, device: torch.device, deterministic: bool = True
+) -> dict[int, list[int]]:
+    """{station_index: [orders]} chosen by an RL checkpoint."""
     if isinstance(agent, StationOrderScorer):
         sim_unw, sim_w = precompute_instance_similarities(instance)
         with torch.no_grad():
@@ -434,30 +410,18 @@ def run_rl_checkpoint_rdi(
             dtype=torch.float,
             device=device,
         )
-
         with torch.no_grad():
             actions, _, _ = agent(
                 hetero_data, instance_stats, order_num_skus, deterministic=deterministic
             )
 
-    t_partition = time.perf_counter() - t0
-
     station_assignments = {s: [] for s in range(len(instance.S))}
     for o_idx, s_idx in enumerate(actions):
-        s_idx = min(s_idx, len(instance.S) - 1)
-        station_assignments[s_idx].append(instance.O[o_idx])
-
-    M_k, W_k, Be_k, P_k, Rt_k = evaluate_station_assignments(
-        instance, station_assignments
-    )
-    t_total = time.perf_counter() - t0
-
-    return compute_metrics_from_station_results(
-        instance, M_k, W_k, Be_k, P_k, Rt_k, t_total, partition_time=t_partition
-    )
+        station_assignments[min(s_idx, len(instance.S) - 1)].append(instance.O[o_idx])
+    return station_assignments
 
 
-def print_comparison_table(results_by_method: Dict[str, List[Dict[str, float]]]):
+def print_comparison_table(results_by_method: dict[str, list[dict[str, float]]]):
     """
     Prints a formatted summary table of average metrics across all benchmark instances.
     """
@@ -536,7 +500,30 @@ def parse_args():
     parser.add_argument(
         "--skip-greedy",
         action="store_true",
-        help="Skip Standard Greedy Heuristic (autostore_heuristic.py SGC) without decomposition.",
+        help="Skip the Standard, Load-balanced and Piggyback SGC methods (5-8).",
+    )
+    parser.add_argument(
+        "--methods",
+        nargs="*",
+        default=None,
+        help="Subset of methods: default labels' leading numbers (1-6), registry names "
+        "(e.g. sgc rdi cfss gbs_adaptive), or 'all' (defaults + EXTRA_METHODS). Default: 1-8.",
+    )
+    parser.add_argument(
+        "--scale",
+        type=str,
+        default="small",
+        help="Scale for the benchmark instances (small, medium, large).",
+    )
+    parser.add_argument(
+        "--skip-rl", action="store_true", help="Do not evaluate RL checkpoints."
+    )
+    parser.add_argument(
+        "--skip-rdi",
+        action="store_true",
+        help="Skip every RDI-based method: partitioned RDI (1-3), Full RDI (4), "
+        "RDI registry variants (e.g. from --methods/all), and RL checkpoints "
+        "(they decompose with partitioned RDI).",
     )
     parser.add_argument(
         "--output-json",
@@ -547,72 +534,89 @@ def parse_args():
     return parser.parse_args()
 
 
+def is_rdi_method(name: str) -> bool:
+    """True for methods built on RDI: labels 1-4 ("... RDI ...") and registry rdi* / partitioned_rdi* names."""
+    return "rdi" in name.lower()
+
+
+def select_methods(args) -> dict[str, Callable[[Instance], HeuristicSolution]]:
+    methods: dict[str, Callable[[Instance], HeuristicSolution]] = {}
+    wanted = args.methods
+    if not wanted:
+        methods = dict(DEFAULT_METHODS)
+    else:
+        for w in wanted:
+            if w == "all":
+                methods.update(DEFAULT_METHODS)
+                for name in EXTRA_METHODS:
+                    methods[name] = registry_method(name)
+                continue
+            label = next(
+                (lab for lab in DEFAULT_METHODS if lab.split(".")[0] == w), None
+            )
+            if label:
+                methods[label] = DEFAULT_METHODS[label]
+            else:
+                methods[resolve(w)] = registry_method(w)
+    if args.skip_full_rdi:
+        methods.pop("4. Full RDI (No Decomposition)", None)
+    if args.skip_rdi:
+        methods = {k: v for k, v in methods.items() if not is_rdi_method(k)}
+    if args.skip_greedy:
+        for label in (
+            "5. Standard Full Greedy (SGC)",
+            "6. Load-balanced Greedy (SGC)",
+            "7. Standard Piggyback SGC",
+            "8. Load-balanced Piggyback SGC",
+        ):
+            methods.pop(label, None)
+    return methods
+
+
 def main():
     args = parse_args()
-
-    # Determine device
-    if args.device:
-        device = torch.device(args.device)
-    else:
-        device = get_default_device()
+    device = torch.device(args.device) if args.device else get_default_device()
     print(f"[*] Running benchmark on PyTorch device: {device}")
 
-    # Discover checkpoints
-    checkpoints = args.checkpoints
-    if not checkpoints:
-        all_pths = sorted(glob.glob("rl_agent_weights*.pth"))
-        checkpoints = all_pths
+    methods: dict[str, Callable[[Instance], HeuristicSolution]] = {}
+    if not args.skip_rl and not args.skip_rdi:
+        checkpoints = args.checkpoints or sorted(glob.glob("rl_agent_weights*.pth"))
         if not checkpoints:
             print("[!] Warning: No .pth files found in current directory.")
-        else:
-            print(
-                f"[*] Auto-discovered {len(checkpoints)} checkpoint(s): {checkpoints}"
-            )
-
-    # Load RL models
-    loaded_models: Dict[str, OrderAssignmentAgent] = {}
-    for cp_path in checkpoints:
-        if not os.path.exists(cp_path):
-            print(f"[!] Warning: Checkpoint file '{cp_path}' does not exist. Skipping.")
-            continue
-        short_name = os.path.basename(cp_path).replace(".pth", "")
-        try:
-            agent = load_agent(cp_path, device=device)
-            loaded_models[f"RL ({short_name})"] = agent
-            print(f"[+] Successfully loaded checkpoint: {cp_path}")
-        except Exception as e:
-            print(f"[!] Failed to load checkpoint {cp_path}: {e}")
-
-    # Setup methods list
-    methods = []
-    for model_name in loaded_models.keys():
-        methods.append(model_name)
-    methods.append("1. Random-partitioned RDI")
-    methods.append("2. Similarity-partitioned RDI")
-    methods.append("3. Load-balanced RDI")
-    if not args.skip_full_rdi:
-        methods.append("4. Full RDI (No Decomposition)")
-    if not args.skip_greedy:
-        methods.append("5. Standard Full Greedy (SGC)")
-        methods.append("6. Load-balanced Greedy (SGC)")
+        for cp_path in checkpoints:
+            if not os.path.exists(cp_path):
+                print(
+                    f"[!] Warning: Checkpoint file '{cp_path}' does not exist. Skipping."
+                )
+                continue
+            short_name = os.path.basename(cp_path).replace(".pth", "")
+            try:
+                agent = load_agent(cp_path, device=device)
+                methods[f"RL ({short_name})"] = rl_method(
+                    agent, device, deterministic=not args.stochastic
+                )
+                print(f"[+] Successfully loaded checkpoint: {cp_path}")
+            except Exception as e:
+                print(f"[!] Failed to load checkpoint {cp_path}: {e}")
+    methods.update(select_methods(args))
 
     print(
         f"\n[*] Evaluating {len(methods)} method(s) across {args.num_instances} instance(s)..."
     )
-
-    results_by_method: Dict[str, List[Dict[str, float]]] = defaultdict(list)
+    results_by_method: dict[str, list[dict[str, float]]] = defaultdict(list)
     detailed_history = []
 
     for inst_idx in range(args.num_instances):
         print(
             f"\n>>> Instance {inst_idx + 1:02d}/{args.num_instances} (Seed: {args.seed_base + inst_idx})"
         )
-        instance = generate_benchmark_instance(inst_idx, seed_base=args.seed_base)
+        instance = generate_benchmark_instance(
+            inst_idx, args.scale, seed_base=args.seed_base
+        )
         print(
             f"    Specs: Stations={len(instance.S)}, Lanes={len(instance.L)}, "
             f"Orders={len(instance.O)}, SKUs={len(instance.K)}, Movecap={instance.movecap}"
         )
-
         inst_record = {
             "instance_idx": inst_idx,
             "seed": args.seed_base + inst_idx,
@@ -623,111 +627,32 @@ def main():
             "methods": {},
         }
 
-        # 1. Pretrained RL Models
-        for model_label, agent in loaded_models.items():
+        for label, method in methods.items():
             try:
-                res = run_rl_checkpoint_rdi(
-                    instance, agent, device=device, deterministic=not args.stochastic
+                t0 = time.perf_counter()
+                sol = method(instance)
+                elapsed = time.perf_counter() - t0
+                part = sol.meta.get("partition_time", 0.0) if sol is not None else 0.0
+                res = solution_metrics(instance, sol, elapsed, part)
+                res["n_violations"] = (
+                    len(validate_solution(sol, instance, horizon=BENCH_HORIZON))
+                    if sol is not None
+                    else -1
                 )
-                results_by_method[model_label].append(res)
-                inst_record["methods"][model_label] = res
+                results_by_method[label].append(res)
+                inst_record["methods"][label] = res
                 print(
-                    f"    - {model_label:<32} | Makespan: {res['makespan']:6.0f} | "
+                    f"    - {label:<32} | Makespan: {res['makespan']:6.0f} | "
                     f"Norm M: {res['normalized_makespan']:7.4f} | Imbalance: {res['avg_pick_imbalance']:7.2f} | "
-                    f"Time: {res['total_time']:6.2f}s"
+                    f"Violations: {res['n_violations']:3d} | Time: {res['total_time']:6.2f}s"
                 )
             except Exception as e:
-                print(f"    - {model_label:<32} | FAILED: {e}")
-
-        # 2. Random-partitioned RDI
-        try:
-            res_rand = run_random_partition_rdi(instance)
-            results_by_method["1. Random-partitioned RDI"].append(res_rand)
-            inst_record["methods"]["1. Random-partitioned RDI"] = res_rand
-            print(
-                f"    - {'1. Random-partitioned RDI':<32} | Makespan: {res_rand['makespan']:6.0f} | "
-                f"Norm M: {res_rand['normalized_makespan']:7.4f} | Imbalance: {res_rand['avg_pick_imbalance']:7.2f} | "
-                f"Time: {res_rand['total_time']:6.2f}s"
-            )
-        except Exception as e:
-            print(f"    - {'1. Random-partitioned RDI':<32} | FAILED: {e}")
-
-        # 3. Similarity-partitioned RDI
-        try:
-            res_sim = run_similarity_partition_rdi(instance)
-            results_by_method["2. Similarity-partitioned RDI"].append(res_sim)
-            inst_record["methods"]["2. Similarity-partitioned RDI"] = res_sim
-            print(
-                f"    - {'2. Similarity-partitioned RDI':<32} | Makespan: {res_sim['makespan']:6.0f} | "
-                f"Norm M: {res_sim['normalized_makespan']:7.4f} | Imbalance: {res_sim['avg_pick_imbalance']:7.2f} | "
-                f"Time: {res_sim['total_time']:6.2f}s"
-            )
-        except Exception as e:
-            print(f"    - {'2. Similarity-partitioned RDI':<32} | FAILED: {e}")
-
-        # 4. Load-balanced RDI
-        try:
-            res_lb = run_load_balanced_partition_rdi(instance)
-            results_by_method["3. Load-balanced RDI"].append(res_lb)
-            inst_record["methods"]["3. Load-balanced RDI"] = res_lb
-            print(
-                f"    - {'3. Load-balanced RDI':<32} | Makespan: {res_lb['makespan']:6.0f} | "
-                f"Norm M: {res_lb['normalized_makespan']:7.4f} | Imbalance: {res_lb['avg_pick_imbalance']:7.2f} | "
-                f"Time: {res_lb['total_time']:6.2f}s"
-            )
-        except Exception as e:
-            print(f"    - {'3. Load-balanced RDI':<32} | FAILED: {e}")
-
-        # 5. Full RDI without decomposition
-        if not args.skip_full_rdi:
-            try:
-                res_full = run_full_rdi_no_decomposition(instance)
-                results_by_method["4. Full RDI (No Decomposition)"].append(res_full)
-                inst_record["methods"]["4. Full RDI (No Decomposition)"] = res_full
-                print(
-                    f"    - {'4. Full RDI (No Decomposition)':<32} | Makespan: {res_full['makespan']:6.0f} | "
-                    f"Norm M: {res_full['normalized_makespan']:7.4f} | Imbalance: {res_full['avg_pick_imbalance']:7.2f} | "
-                    f"Time: {res_full['total_time']:6.2f}s"
-                )
-            except Exception as e:
-                print(f"    - {'4. Full RDI (No Decomposition)':<32} | FAILED: {e}")
-
-        # 6. Standard Full Greedy Heuristic (SGC) without decomposition
-        if not args.skip_greedy:
-            try:
-                res_greedy = run_full_greedy_heuristic(
-                    instance, restrict_stations_by_workload=False
-                )
-                results_by_method["5. Standard Full Greedy (SGC)"].append(res_greedy)
-                inst_record["methods"]["5. Standard Full Greedy (SGC)"] = res_greedy
-                print(
-                    f"    - {'5. Standard Full Greedy (SGC)':<32} | Makespan: {res_greedy['makespan']:6.0f} | "
-                    f"Norm M: {res_greedy['normalized_makespan']:7.4f} | Imbalance: {res_greedy['avg_pick_imbalance']:7.2f} | "
-                    f"Time: {res_greedy['total_time']:6.2f}s"
-                )
-            except Exception as e:
-                print(f"    - {'5. Standard Full Greedy (SGC)':<32} | FAILED: {e}")
-
-            try:
-                res_lb_greedy = run_full_greedy_heuristic(
-                    instance, restrict_stations_by_workload=True
-                )
-                results_by_method["6. Load-balanced Greedy (SGC)"].append(res_lb_greedy)
-                inst_record["methods"]["6. Load-balanced Greedy (SGC)"] = res_lb_greedy
-                print(
-                    f"    - {'6. Load-balanced Greedy (SGC)':<32} | Makespan: {res_lb_greedy['makespan']:6.0f} | "
-                    f"Norm M: {res_lb_greedy['normalized_makespan']:7.4f} | Imbalance: {res_lb_greedy['avg_pick_imbalance']:7.2f} | "
-                    f"Time: {res_lb_greedy['total_time']:6.2f}s"
-                )
-            except Exception as e:
-                print(f"    - {'6. Load-balanced Greedy (SGC)':<32} | FAILED: {e}")
+                print(f"    - {label:<32} | FAILED: {e}")
 
         detailed_history.append(inst_record)
 
-    # Print summary table
     print_comparison_table(results_by_method)
 
-    # Save to JSON
     if args.output_json:
         output_payload = {
             "meta": {

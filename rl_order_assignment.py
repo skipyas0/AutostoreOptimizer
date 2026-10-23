@@ -609,48 +609,24 @@ def evaluate_assignment_reward(instance, actions):
     Evaluates order assignments by running the RDI heuristic on each station subinstance.
     Computes normalized makespan, imbalance, and reward.
     """
-    from heuristic_rdi_sgc import run_rdi_sgc
-    from instance import Instance
+    from heuristics import run_partitioned_rdi
 
     station_assignments = {s: [] for s in range(len(instance.S))}
     for o_idx, s_idx in enumerate(actions):
         s_idx = min(s_idx, len(instance.S) - 1)
         station_assignments[s_idx].append(instance.O[o_idx])
 
-    from decomposition import distribute_movecap
-
-    n_stations = len(instance.S)
-    workloads = [len(station_assignments[i]) for i in range(n_stations)]
-    station_movecaps = distribute_movecap(instance.movecap, n_stations, workloads)
+    sol = run_partitioned_rdi(instance, partition=station_assignments, horizon=50000)
 
     M_k = []
     W_k = []
     for i, s_idx in enumerate(instance.S):
         assigned_orders = station_assignments[i]
-        w = sum(instance.p.get(k, 0) for o in assigned_orders for k in instance.orders_req[o])
-        W_k.append(float(w))
-
+        W_k.append(float(sum(instance.p.get(k, 0) for o in assigned_orders for k in instance.orders_req[o])))
         if not assigned_orders:
             M_k.append(0.0)
-            continue
-
-        subinstance = Instance(
-            [s_idx],
-            instance.L,
-            instance.K,
-            {o: instance.orders_req[o] for o in assigned_orders},
-            instance.rt,
-            instance.p,
-            instance.N,
-            station_movecaps[i],
-            instance.seed,
-            instance.rt_ret,
-            instance.pickcap,
-        )
-
-        heur_sol = run_rdi_sgc(subinstance, horizon=50000, batch_start_time=0)
-        if heur_sol and heur_sol.feasible:
-            M_k.append(float(heur_sol.makespan))
+        elif sol.meta["station_feasible"][s_idx]:
+            M_k.append(float(max(en for (st, _, _, en) in sol.order_assignments.values() if st == s_idx)))
         else:
             M_k.append(50000.0)
 

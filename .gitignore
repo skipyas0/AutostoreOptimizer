@@ -29,3 +29,5 @@ param_exp
 *.jpg
 *.pth
 *.json
+tests/regression/.cache
+*.bak

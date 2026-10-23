@@ -5,14 +5,16 @@ import os
 from collections import defaultdict
 from contextlib import redirect_stdout
 
-from autostore_heuristic import BinEvent, Solution, validate_warmstart
 from cp_model import build_model, inject_warmstart
 from datagen import generate_data
-from heuristic_rdi_sgc import run_rdi_sgc
-from instance import Instance
-from jaccard_similarity import build_similarity_matrix
+from heuristics import BinEvent, ExoState, HeuristicSolution, run_partitioned_rdi, run_rdi, validate_warmstart
+from heuristics.partitioned_rdi import (  # noqa: F401  (re-exported for older imports)
+    create_load_balanced_partitions,
+    create_random_partitions,
+    create_similarity_partitions,
+    distribute_movecap,
+)
 from matheuristic import load_instance
-from neighborhood_selection import strategy_random_orders, strategy_similar_orders
 
 
 def extract_exo_state(sol, handles, overlap_threshold=0):
@@ -194,7 +196,7 @@ def cp_solution_to_heuristic(sol, handles, instance):
     makespan = max((bounds[3] for bounds in order_assignments.values()), default=0)
     total_moves = sum(len(evts) * 2 for evts in bin_events.values())
 
-    return Solution(
+    return HeuristicSolution(
         order_assignments=order_assignments,
         bin_events=dict(bin_events),
         makespan=makespan,
@@ -202,149 +204,6 @@ def cp_solution_to_heuristic(sol, handles, instance):
         feasible=True,
         pick_events=pick_events,
     )
-
-
-def stitch_heuristic_solutions(sols):
-    valid_sols = [s for s in sols if s is not None]
-    if not valid_sols:
-        return None
-
-    order_assignments = {}
-    bin_events = defaultdict(list)
-    pick_events = {}
-
-    for sol in valid_sols:
-        order_assignments.update(sol.order_assignments)
-        pick_events.update(sol.pick_events)
-        for s, evts in sol.bin_events.items():
-            bin_events[s].extend(evts)
-
-    makespan = max((bounds[3] for bounds in order_assignments.values()), default=0)
-    total_moves = sum(len(evts) * 2 for evts in bin_events.values())
-
-    return Solution(
-        order_assignments=order_assignments,
-        bin_events=dict(bin_events),
-        makespan=makespan,
-        total_moves=total_moves,
-        feasible=all(sol.feasible for sol in valid_sols),
-        pick_events=pick_events,
-    )
-
-
-def create_random_partitions(instance, n_partitions=5):
-    order_set = set(instance.O)
-
-    partitions = []
-    for i in range(n_partitions - 1):
-        fake_handles = {"O": list(order_set)}
-        selection_result = strategy_random_orders(
-            fake_handles,
-            p=1 / (n_partitions - i),
-        )
-        selected_orders = selection_result.seed_orders
-        order_set -= selected_orders
-        partitions.append(selected_orders)
-
-    partitions.append(order_set)
-    return partitions
-
-
-def create_similarity_partitions(instance, n_partitions=5):
-    weighted_jaccard_matrix, _ = build_similarity_matrix(
-        instance.O,
-        instance.orders_req,
-        instance.rt,
-        instance.rt_ret,
-        normalize=False,
-    )
-
-    order_set = set(instance.O)
-
-    partitions = []
-    for i in range(n_partitions - 1):
-        fake_handles = {"O": list(order_set)}
-        selection_result = strategy_similar_orders(
-            fake_handles, 1 / (n_partitions - i), weighted_jaccard_matrix
-        )
-        selected_orders = selection_result.seed_orders
-        order_set -= selected_orders
-        partitions.append(selected_orders)
-
-    partitions.append(order_set)
-    return partitions
-
-
-def create_load_balanced_partitions(
-    instance, n_partitions=5, sort_descending=True
-):
-    """
-    Partitions orders across n_partitions by greedily assigning each order
-    to the station/partition with the lowest assigned workload
-    (sum of assigned orders' items' picking times).
-
-    Args:
-        instance: The problem Instance.
-        n_partitions: Number of stations/partitions.
-        sort_descending: If True, processes orders in descending order of workload
-            (LPT - Longest Processing Time first), providing standard greedy load balancing.
-            If False, processes orders in original instance order.
-    Returns:
-        List of sets of order IDs, one set per partition.
-    """
-    if n_partitions <= 0:
-        return []
-    if n_partitions == 1:
-        return [set(instance.O)]
-
-    station_workloads = [0.0] * n_partitions
-    partitions = [set() for _ in range(n_partitions)]
-
-    order_workloads = {
-        o: sum(instance.p.get(k, 0) for k in instance.orders_req[o])
-        for o in instance.O
-    }
-
-    if sort_descending:
-        sorted_orders = sorted(instance.O, key=lambda o: order_workloads[o], reverse=True)
-    else:
-        sorted_orders = list(instance.O)
-
-    for o in sorted_orders:
-        w = order_workloads[o]
-        min_idx = min(range(n_partitions), key=lambda idx: station_workloads[idx])
-        partitions[min_idx].add(o)
-        station_workloads[min_idx] += w
-
-    return partitions
-
-
-def distribute_movecap(
-    total_movecap: int | None,
-    n_stations: int,
-    workloads: list | None = None,
-) -> list[int | None]:
-    """
-    Distributes total_movecap across n_stations so that no unit of movecap is wasted.
-    If total_movecap % n_stations > 0, the remainder units (+1) are prioritized
-    to stations with the highest workloads (or the first stations if workloads are not given).
-    """
-    if total_movecap is None:
-        return [None] * n_stations
-    if n_stations <= 0:
-        return []
-
-    base = total_movecap // n_stations
-    rem = total_movecap % n_stations
-
-    if workloads is not None and len(workloads) == n_stations and rem > 0:
-        # Give +1 to the rem stations with highest workloads
-        bonus_indices = set(
-            sorted(range(n_stations), key=lambda idx: workloads[idx], reverse=True)[:rem]
-        )
-        return [base + (1 if i in bonus_indices else 0) for i in range(n_stations)]
-    else:
-        return [base + (1 if i < rem else 0) for i in range(n_stations)]
 
 
 def solve_station_decomposition(
@@ -377,19 +236,7 @@ def solve_station_decomposition(
             current_exo_blocks[k].extend(v)
 
     for i, p in enumerate(partitions):
-        subinstance = Instance(
-            [instance.S[i]],
-            instance.L,
-            instance.K,
-            {o: instance.orders_req[o] for o in p},
-            instance.rt,
-            instance.p,
-            instance.N,
-            station_movecaps[i],
-            instance.seed,
-            instance.rt_ret,
-            instance.pickcap,
-        )
+        subinstance = instance.subinstance(p, stations=[instance.S[i]], movecap=station_movecaps[i])
 
         # Build and solve CP model
         horizon = batch_start_time + 10000
@@ -403,13 +250,15 @@ def solve_station_decomposition(
             batch_start_time=batch_start_time,
         )
 
-        heur_sol = run_rdi_sgc(
+        heur_sol = run_rdi(
             subinstance,
             horizon=horizon,
-            exo_lanes=exo_lanes_in,
-            exo_blocks=current_exo_blocks,
-            exo_moves=exo_moves_in,
-            batch_start_time=batch_start_time,
+            exo=ExoState(
+                lanes=exo_lanes_in,
+                blocks=current_exo_blocks,
+                moves=exo_moves_in,
+                batch_start_time=batch_start_time,
+            ),
         )
         if heur_sol and heur_sol.feasible:
             v1 = validate_warmstart(heur_sol, heur_sol.pick_events, handles)
@@ -445,7 +294,7 @@ def solve_station_decomposition(
         subsolutions.append(heuristic_sol)
 
     # Stitch solutions across stations
-    return stitch_heuristic_solutions(subsolutions)
+    return HeuristicSolution.stitch(subsolutions)
 
 
 def solve_load_balanced_station_decomposition(
@@ -499,19 +348,7 @@ def solve_time_decomposition(
 
     for i, batch in enumerate(order_batches):
         print(f"Solving time decomposition batch {i}")
-        subinstance = Instance(
-            instance.S,
-            instance.L,
-            instance.K,
-            {o: instance.orders_req[o] for o in batch},
-            instance.rt,
-            instance.p,
-            instance.N,
-            instance.movecap,
-            instance.seed,
-            instance.rt_ret,
-            instance.pickcap,
-        )
+        subinstance = instance.subinstance(batch)
 
         horizon = current_batch_start + 10000
         submodel, handles = build_model(
@@ -524,13 +361,15 @@ def solve_time_decomposition(
             batch_start_time=current_batch_start,
         )
 
-        heur_sol = run_rdi_sgc(
+        heur_sol = run_rdi(
             subinstance,
             horizon=horizon,
-            exo_lanes=current_exo_lanes,
-            exo_blocks=current_exo_blocks,
-            exo_moves=current_exo_moves,
-            batch_start_time=current_batch_start,
+            exo=ExoState(
+                lanes=current_exo_lanes,
+                blocks=current_exo_blocks,
+                moves=current_exo_moves,
+                batch_start_time=current_batch_start,
+            ),
         )
         if heur_sol and heur_sol.feasible:
             v1 = validate_warmstart(heur_sol, heur_sol.pick_events, handles)
@@ -594,7 +433,7 @@ def solve_time_decomposition(
             print("Failed to solve time batch")
             break
 
-    return stitch_heuristic_solutions(subsolutions)
+    return HeuristicSolution.stitch(subsolutions)
 
 
 def solve_2d_decomposition(instance, n_time_batches=5):
@@ -612,19 +451,7 @@ def solve_2d_decomposition(instance, n_time_batches=5):
     current_batch_start = 0
 
     for batch in time_batches:
-        subinstance = Instance(
-            instance.S,
-            instance.L,
-            instance.K,
-            {o: instance.orders_req[o] for o in batch},
-            instance.rt,
-            instance.p,
-            instance.N,
-            instance.movecap,
-            instance.seed,
-            instance.rt_ret,
-            instance.pickcap,
-        )
+        subinstance = instance.subinstance(batch)
 
         # We run the spatial decomposition on this time slice
         batch_sol = solve_station_decomposition(
@@ -660,7 +487,7 @@ def solve_2d_decomposition(instance, n_time_batches=5):
             print("Failed to solve spatial decomposition for time batch")
             break
 
-    return stitch_heuristic_solutions(subsolutions)
+    return HeuristicSolution.stitch(subsolutions)
 
 
 def solve_2d_decomposition_spatial_first(instance, n_time_batches=5):
@@ -678,19 +505,7 @@ def solve_2d_decomposition_spatial_first(instance, n_time_batches=5):
 
     for i, p in enumerate(spatial_partitions):
         print(f"Solving station {i}")
-        subinstance = Instance(
-            [instance.S[i]],
-            instance.L,
-            instance.K,
-            {o: instance.orders_req[o] for o in p},
-            instance.rt,
-            instance.p,
-            instance.N,
-            station_movecaps[i],
-            instance.seed,
-            instance.rt_ret,
-            instance.pickcap,
-        )
+        subinstance = instance.subinstance(p, stations=[instance.S[i]], movecap=station_movecaps[i])
 
         station_sol = solve_time_decomposition(
             subinstance, exo_blocks_in=current_exo_blocks, n_time_batches=n_time_batches
@@ -706,14 +521,12 @@ def solve_2d_decomposition_spatial_first(instance, n_time_batches=5):
             print(f"Failed to solve time decomposition for station {instance.S[i]}")
             break
 
-    return stitch_heuristic_solutions(subsolutions)
+    return HeuristicSolution.stitch(subsolutions)
 
 
 def solve_rl_decomposition(instance, weights_path="rl_agent_weights.pth", device=None):
     import torch
 
-    from heuristic_rdi_sgc import run_rdi_sgc
-    from instance import Instance
     from rl_order_assignment import (
         OrderAssignmentAgent,
         OrderGraphGNN,
@@ -783,37 +596,7 @@ def solve_rl_decomposition(instance, weights_path="rl_agent_weights.pth", device
         s_idx = min(s_idx, len(instance.S) - 1)
         station_assignments[s_idx].append(instance.O[o_idx])
 
-    n_stations = len(instance.S)
-    workloads = [len(station_assignments[i]) for i in range(n_stations)]
-    station_movecaps = distribute_movecap(instance.movecap, n_stations, workloads)
-
-    subsolutions = []
-    print("6")
-    for i, s_idx in enumerate(instance.S):
-        assigned_orders = station_assignments[i]
-        print(f"Solving station {s_idx} with {len(assigned_orders)} orders (movecap: {station_movecaps[i]})...")
-        if not assigned_orders:
-            continue
-
-        subinstance = Instance(
-            [s_idx],
-            instance.L,
-            instance.K,
-            {o: instance.orders_req[o] for o in assigned_orders},
-            instance.rt,
-            instance.p,
-            instance.N,
-            station_movecaps[i],
-            instance.seed,
-            instance.rt_ret,
-            instance.pickcap,
-        )
-
-        heur_sol = run_rdi_sgc(subinstance, horizon=50000, batch_start_time=0)
-        if heur_sol:
-            subsolutions.append(heur_sol)
-
-    return stitch_heuristic_solutions(subsolutions)
+    return run_partitioned_rdi(instance, partition=station_assignments, horizon=50000)
 
 
 if __name__ == "__main__":
@@ -1000,10 +783,9 @@ if __name__ == "__main__":
     else:
         raise ValueError
 
-    from autostore_heuristic import build_viz_handles
     from schedule_visualizer import plot_schedule, write_html
 
-    mock_sol, handles = build_viz_handles(stitched_sol, instance)
+    mock_sol, handles = stitched_sol.to_viz(instance)
     fig = plot_schedule(mock_sol, handles, show=True)
     html_file = f"./{instance_path}/autostore_{decomp}_decomposition_solution.html"
     write_html(fig, html_file)

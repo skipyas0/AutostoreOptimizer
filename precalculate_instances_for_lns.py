@@ -10,91 +10,57 @@ from itertools import product
 # Suppress matplotlib font cache warnings
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/mpl_config")
 
-from autostore_heuristic import (
-    build_viz_handles,
-    run_sgc,
-    validate_solution,
-    validate_warmstart,
-)
 from cp_model import extract_and_print_solution
 import cpp_cp_model
 from datagen import generate_data
-from heuristic_rdi_sgc import run_rdi_sgc
+from heuristics import HEURISTICS, resolve, run_heuristic, validate_solution, validate_warmstart
 from schedule_visualizer import plot_schedule, write_html
 
 
+# Labels written to heuristic_summary.txt (kept from the pre-refactor version).
+HEURISTIC_LABELS = {
+    "lb_sgc": "Load-Balanced SGC (Greedy)",
+    "sgc": "Standard SGC (Greedy)",
+    "rdi": "RDI-SGC",
+}
+
+
 def solve_warmstart_heuristic(heuristic_name: str, instance, config: dict):
-    """
-    Solves the instance using the requested warm-starting heuristic.
-    Returns (heur_sol, heur_label).
+    """Solve the instance with the requested warm-start heuristic. Returns (heur_sol, label).
+
+    Any name/alias of the heuristics registry is accepted; additionally
+    load_balanced_rdi / random_rdi / similarity_rdi run the CP-based station
+    decomposition from decomposition.py.
     """
     h = heuristic_name.lower().replace("-", "_")
-    if h in (
-        "load_balanced_greedy",
-        "load_balanced_sgc",
-        "lb_sgc",
-        "lb_greedy",
-        "load_balancing_sgc",
-        "load_balancing_greedy",
-    ):
-        sol = run_sgc(
-            instance,
-            horizon=config.get("horizon", 10000),
-            move_cap=config.get("movecap"),
-            ALPHA=config.get("alpha", 1.0),
-            BETA=config.get("beta", 0.0),
-            pick_cap=instance.pickcap,
-            restrict_stations_by_workload=True,
-        )
-        return sol, "Load-Balanced SGC (Greedy)"
-    elif h in ("standard_greedy", "standard_sgc", "sgc", "greedy", "full_greedy"):
-        sol = run_sgc(
-            instance,
-            horizon=config.get("horizon", 10000),
-            move_cap=config.get("movecap"),
-            ALPHA=config.get("alpha", 1.0),
-            BETA=config.get("beta", 0.0),
-            pick_cap=instance.pickcap,
-            restrict_stations_by_workload=False,
-        )
-        return sol, "Standard SGC (Greedy)"
-    elif h in ("rdi_sgc", "rdi", "full_rdi"):
-        sol = run_rdi_sgc(
-            instance,
-            horizon=config.get("horizon", 10000),
-            move_cap=config.get("movecap"),
-            ALPHA=config.get("alpha", 1.0),
-            BETA=config.get("beta", 0.0),
-            pick_cap=instance.pickcap,
-        )
-        return sol, "RDI-SGC"
-    elif h in ("load_balanced_rdi", "lb_rdi"):
+    if h in ("load_balanced_rdi", "lb_rdi"):
         from decomposition import solve_load_balanced_station_decomposition
 
-        sol = solve_load_balanced_station_decomposition(instance)
-        return sol, "Load-Balanced RDI"
-    elif h in ("random_rdi", "random_partition_rdi"):
+        return solve_load_balanced_station_decomposition(instance), "Load-Balanced RDI"
+    if h in ("random_rdi", "random_partition_rdi"):
         from decomposition import solve_station_decomposition
 
-        sol = solve_station_decomposition(
-            instance,
-            partition_method="random",
-        )
-        return sol, "Random-Partitioned RDI"
-    elif h in ("similarity_rdi", "similarity_partition_rdi"):
+        return solve_station_decomposition(instance, partition_method="random"), "Random-Partitioned RDI"
+    if h in ("similarity_rdi", "similarity_partition_rdi"):
         from decomposition import solve_station_decomposition
 
-        sol = solve_station_decomposition(
-            instance,
-            partition_method="similarity",
-        )
-        return sol, "Similarity-Partitioned RDI"
-    else:
+        return solve_station_decomposition(instance, partition_method="similarity"), "Similarity-Partitioned RDI"
+
+    try:
+        key = resolve(h)
+    except ValueError:
         raise ValueError(
-            f"Unknown heuristic '{heuristic_name}'. Available options: "
-            f"load_balanced_greedy, standard_greedy, rdi_sgc, "
+            f"Unknown heuristic '{heuristic_name}'. Available options: {sorted(HEURISTICS)}, "
             f"load_balanced_rdi, random_rdi, similarity_rdi"
-        )
+        ) from None
+    sol = run_heuristic(
+        key,
+        instance,
+        horizon=config.get("horizon", 10000),
+        alpha=config.get("alpha", 1.0),
+        beta=config.get("beta", 0.0),
+    )
+    return sol, HEURISTIC_LABELS.get(key, key)
 
 
 def precalculate_config(config):
@@ -149,9 +115,7 @@ def precalculate_config(config):
     heur_sol, heur_label = solve_warmstart_heuristic(heur_name, instance, config)
     elapsed = time.perf_counter() - t0
 
-    violations = validate_solution(
-        heur_sol, instance, horizon=config["horizon"], move_cap=config["movecap"]
-    )
+    violations = validate_solution(heur_sol, instance, horizon=config["horizon"])
     violations.extend(validate_warmstart(heur_sol, heur_sol.pick_events, handles))
     if violations:
         print(
@@ -168,7 +132,7 @@ def precalculate_config(config):
             f"{heur_label} Result | Feasible: {heur_sol.feasible} | Makespan: {heur_sol.makespan} | BinEvents: {heur_sol.total_moves // 2} | Time: {elapsed:.3f}s\n"
         )
 
-    mock_sol, viz_handles = build_viz_handles(heur_sol, instance)
+    mock_sol, viz_handles = heur_sol.to_viz(instance)
     fig = plot_schedule(mock_sol, viz_handles, show=False)
     html_file = f"{path}/heuristic_solution.html"
     write_html(fig, html_file)

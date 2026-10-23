@@ -1,4 +1,4 @@
-from autostore_heuristic import BinEvent, Solution
+from heuristics import BinEvent, HeuristicSolution
 
 
 def cp_sol_to_solution(sol, handles):
@@ -87,7 +87,7 @@ def cp_sol_to_solution(sol, handles):
                     )
                     bin_events[s].append(be_obj)
 
-    return Solution(
+    return HeuristicSolution(
         order_assignments=order_assignments,
         bin_events=bin_events,
         makespan=makespan,
