@@ -37,8 +37,6 @@ def inst():
     )
 
 
-# Heuristics known to violate PickCap today (docs/KNOWN_ISSUES.md) — validated loosely.
-PICKCAP_BROKEN = {"cfss", "cfss_normalized"}
 # Stitched per-station solutions may break cross-station bin-copy limits.
 STITCHED = {"partitioned_rdi_random", "partitioned_rdi_similarity", "partitioned_rdi_load_balanced"}
 
@@ -54,9 +52,7 @@ def test_registry_heuristic_contract(inst, name):
     assert sol.makespan == max(e for (_, _, _, e) in sol.order_assignments.values())
     assert sol.total_moves == 2 * sum(len(v) for v in sol.bin_events.values())
     violations = sol.validate(inst, H)
-    if name in PICKCAP_BROKEN:
-        assert all(v.startswith("PickCap") for v in violations), violations
-    elif name in STITCHED:
+    if name in STITCHED:
         assert all("concurrency" in v for v in violations), violations
     else:
         assert violations == []

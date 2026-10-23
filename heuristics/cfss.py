@@ -9,7 +9,7 @@
 4. Interleaved scheduling: repeatedly take the station whose earliest lane is
    free first and commit its pending order with the best SGC plan score.
 
-Known issue (kept for exactness): plans ignore pickcap; see docs/KNOWN_ISSUES.md.
+Plans use the SGC planner and respect MoveCap and PickCap.
 """
 
 from __future__ import annotations
@@ -122,7 +122,7 @@ def run_cfss(
         station_load[best_s] += cluster.total_rt_mass
 
     # Phase 2: interleaved scheduling
-    state = init_state(inst, horizon, ignore_pickcap=True)
+    state = init_state(inst, horizon)
     order_assignments: dict[int, tuple[int, int, int, int]] = {}
     pick_events: dict[tuple[int, int, int], tuple[int, int]] = {}
     failed_orders: list[int] = []

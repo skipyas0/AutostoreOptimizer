@@ -194,7 +194,7 @@ class HeuristicState:
 
     inst: Instance
     horizon: int
-    pick_cap: int | None  # None = unlimited simultaneous picks per bin (see KNOWN_ISSUES: CFSS)
+    pick_cap: int  # max simultaneous picks from one presented bin
     move_cap: int  # global MoveCap
     lane_free: dict[tuple[int, int], int]  # (s, ln) -> earliest free time
     pickface_free: dict[int, int]  # s -> earliest time pickface is free
@@ -211,7 +211,6 @@ def init_state(
     inst: Instance,
     horizon: int,
     exo: ExoState | None = None,
-    ignore_pickcap: bool = False,
 ) -> HeuristicState:
     """Build the initial state, respecting exogenous resources and batch start time."""
     S, L, K, N = inst.S, inst.L, inst.K, inst.N
@@ -247,7 +246,7 @@ def init_state(
     return HeuristicState(
         inst=inst,
         horizon=horizon,
-        pick_cap=None if ignore_pickcap else inst.pickcap,
+        pick_cap=inst.pickcap,
         move_cap=inst.movecap,
         lane_free={(s, ln): t0 for s in S for ln in L},
         pickface_free={s: t0 for s in S},
@@ -505,10 +504,7 @@ def find_shared_bin(
 
         # 1. fit inside the current presence window
         if earliest + p[k] <= curr_pres_end:
-            if pick_cap is not None:
-                slot = find_pick_slot(ev_picks, earliest, p[k], curr_pres_end, pick_cap)
-            else:
-                slot = earliest
+            slot = find_pick_slot(ev_picks, earliest, p[k], curr_pres_end, pick_cap)
             if slot is not None and slot <= t_cursor + max_wait and slot < best_start:
                 best_ev = ev
                 best_start = slot
@@ -520,10 +516,7 @@ def find_shared_bin(
         if earliest <= curr_pres_end:
             ext_limit = min(horizon - rt_ret[k], curr_pres_end + p[k])
             if earliest + p[k] <= ext_limit:
-                if pick_cap is not None:
-                    slot = find_pick_slot(ev_picks, earliest, p[k], ext_limit, pick_cap)
-                else:
-                    slot = earliest
+                slot = find_pick_slot(ev_picks, earliest, p[k], ext_limit, pick_cap)
                 if slot is not None and slot <= curr_pres_end and slot < best_start:
                     req_pres_end = max(curr_pres_end, slot + p[k])
                     ext = _can_extend_bin_event(ev, s, req_pres_end, state, scratch, curr_pres_end, curr_ret_end)
