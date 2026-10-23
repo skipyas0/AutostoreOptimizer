@@ -214,7 +214,7 @@ def update_cached_scores(
     committed: OrderPlan,
     state: HeuristicState,
     cached: dict[int, InsertionScores],
-    unscheduled: set[int],
+    unscheduled: dict[int, None],
     alpha: float,
     beta: float,
     regret_k: int,
@@ -287,7 +287,9 @@ def run_rdi(
     sharing_degrees = inst.sharing_degree
     sum_rts = {o: sum(inst.rt[k] for k in inst.req_sets[o]) for o in O}
 
-    unscheduled = set(O)
+    # Insertion-ordered dict used as an ordered set: iteration (and hence exact-tie breaking,
+    # first candidate wins) follows order id, independent of hash-table layout.
+    unscheduled = dict.fromkeys(O)
     cached = {o: score_order_insertions(o, state, alpha, beta, regret_k) for o in O}
 
     order_assignments: dict[int, tuple[int, int, int, int]] = {}
@@ -295,7 +297,7 @@ def run_rdi(
 
     while unscheduled:
         best_o, best_key = None, None
-        for o in unscheduled:  # NB: set iteration order decides exact ties
+        for o in unscheduled:  # in order-id order; the first of exactly tied candidates wins
             c = cached[o]
             if c.best_plan is None:
                 continue
@@ -317,7 +319,7 @@ def run_rdi(
         plan = cached[best_o].best_plan
         commit_plan(plan, state)
         record_plan(plan, order_assignments, pick_events)
-        unscheduled.remove(best_o)
+        del unscheduled[best_o]
         if not unscheduled:
             break
         update_cached_scores(plan, state, cached, unscheduled, alpha, beta, regret_k, use_lazy)

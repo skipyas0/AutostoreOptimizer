@@ -49,7 +49,7 @@ def agglomerative_cluster(
     for (o1, o2), s in sim_matrix.items():
         cluster_sim[_key(o1, o2)] = s
 
-    active = set(O)  # NB: set iteration order determines the output order (ties in later sorts)
+    active = set(O)  # membership only; iterate via sorted(active) so results never depend on set order
     while True:
         best_sim = -1.0
         best_pair: tuple[int, int] | None = None
@@ -71,7 +71,7 @@ def agglomerative_cluster(
 
         # UPGMA update. NB: cluster_size[ca] already holds the merged size here, so the
         # weight of the old ca part is (new_size - |cb|) — matches the original code.
-        for co in list(active):
+        for co in sorted(active):
             if co == ca:
                 continue
             sim_ca_co = cluster_sim.get(_key(ca, co), 0.0)
@@ -83,7 +83,7 @@ def agglomerative_cluster(
             del cluster_sim[k]
 
     result: list[OrderCluster] = []
-    for cid in active:
+    for cid in sorted(active):
         order_ids = clusters[cid]
         all_skus: set[int] = set()
         mass = 0.0
@@ -126,7 +126,8 @@ def run_cfss(
     order_assignments: dict[int, tuple[int, int, int, int]] = {}
     pick_events: dict[tuple[int, int, int], tuple[int, int]] = {}
     failed_orders: list[int] = []
-    unassigned = {s: set(station_orders[s]) for s in S}
+    # ordered sets (dict keys): pending orders per station, in assignment order
+    unassigned = {s: dict.fromkeys(station_orders[s]) for s in S}
 
     while any(unassigned.values()):
         earliest_s, earliest_time = None, float("inf")
@@ -140,7 +141,7 @@ def run_cfss(
             break
 
         best_plan, best_score = None, float("inf")
-        for o in unassigned[earliest_s]:  # NB: set iteration order decides exact ties
+        for o in unassigned[earliest_s]:  # assignment order; the first of exactly tied plans wins
             plan = plan_order_at_station(o, earliest_s, state, alpha, beta)
             if plan is not None and plan.score < best_score:
                 best_score, best_plan = plan.score, plan
@@ -152,7 +153,7 @@ def run_cfss(
 
         commit_plan(best_plan, state)
         record_plan(best_plan, order_assignments, pick_events)
-        unassigned[earliest_s].remove(best_plan.order)
+        del unassigned[earliest_s][best_plan.order]
 
     if failed_orders:
         print(f"[CFSS-SGC] WARNING: {len(failed_orders)} orders could not be scheduled: {failed_orders}")
