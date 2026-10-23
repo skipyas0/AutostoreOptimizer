@@ -155,6 +155,93 @@ class TestMatheuristicPlotsColorPalettes(unittest.TestCase):
             )
         )
 
+    def test_upper_bound_and_intermediate_barcodes_on_disk(self):
+        # When iters is None and time_limit is set, upper bound should be calculated reasonably
+        time_limit = 10.0
+        iter_time_limit = 2.0
+        vlg = VisualLogger(
+            instance_folder=self.test_dir,
+            instance_config={},
+            experiment_config={
+                "runs": 2,
+                "iters": None,
+                "time_limit": time_limit,
+                "iter_time_limit": iter_time_limit,
+            },
+        )
+        num_vars = 20
+        var_to_idx = {f"var_{i}": i for i in range(num_vars)}
+
+        vlg.log_run_start(num_vars, var_to_idx, None)
+        # Upper bound should not be the massive default of 100,000
+        self.assertLess(vlg.current_capacity, 1000)
+        self.assertGreaterEqual(vlg.current_capacity, 100)
+
+        for i in range(5):
+            vlg.log_iteration_start(i)
+            vlg.log_strategy("Strategy_0", 0)
+            vlg.log_freeze_constr([f"var_{i}"], var_to_idx, 0)
+            vlg.log_iteration_end(Status.Optimal_Improve, best=100 - i, cur=100)
+
+        vlg.log_run_end()
+
+        # Intermediate barcode must be saved on disk as .npy
+        expected_npy = os.path.join(vlg.path, "barcode_run_1.npy")
+        self.assertTrue(os.path.exists(expected_npy))
+
+        # In-memory current_barcode must be released
+        self.assertIsNone(vlg.current_barcode)
+
+        # Barcode access via LazyBarcodeList should dynamically load the array
+        self.assertEqual(len(vlg.barcodes), 1)
+        matrix = vlg.barcodes[0]
+        self.assertEqual(matrix.shape, (5, num_vars))
+        self.assertEqual(matrix[0, 0], 0)
+        self.assertEqual(matrix[0, 1], -1)
+
+        # Run 2
+        vlg.log_run_start(num_vars, var_to_idx, None)
+        for i in range(3):
+            vlg.log_iteration_start(i)
+            vlg.log_strategy("Strategy_0", 0)
+            vlg.log_freeze_constr([f"var_{i}"], var_to_idx, 0)
+            vlg.log_iteration_end(Status.Optimal_Improve, best=90 - i, cur=90)
+        vlg.log_run_end()
+
+        expected_npy_2 = os.path.join(vlg.path, "barcode_run_2.npy")
+        self.assertTrue(os.path.exists(expected_npy_2))
+        self.assertEqual(len(vlg.barcodes), 2)
+        self.assertEqual(vlg.barcodes[1].shape, (3, num_vars))
+
+    def test_dynamic_capacity_expansion(self):
+        # Start with a very small initial capacity (3 iters) and log 10 iterations
+        vlg = VisualLogger(
+            instance_folder=self.test_dir,
+            instance_config={},
+            experiment_config={"runs": 1, "iters": 3, "time_limit": None},
+        )
+        num_vars = 10
+        var_to_idx = {f"var_{i}": i for i in range(num_vars)}
+
+        vlg.log_run_start(num_vars, var_to_idx, None)
+        self.assertEqual(vlg.current_capacity, 3)
+
+        # Log 10 iterations (exceeding initial capacity 3)
+        for i in range(10):
+            vlg.log_iteration_start(i)
+            vlg.log_strategy("Strategy_0", 0)
+            vlg.log_freeze_constr([f"var_{i % num_vars}"], var_to_idx, 0)
+            vlg.log_iteration_end(Status.Optimal_Improve, best=100 - i, cur=100)
+
+        # Capacity should have expanded automatically
+        self.assertGreaterEqual(vlg.current_capacity, 10)
+        vlg.log_run_end()
+
+        # Final saved barcode should have 10 rows
+        matrix = vlg.barcodes[0]
+        self.assertEqual(matrix.shape, (10, num_vars))
+
 
 if __name__ == "__main__":
     unittest.main()
+

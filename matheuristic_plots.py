@@ -130,6 +130,26 @@ class LoguruStream:
         pass
 
 
+class LazyBarcodeList(list):
+    """List proxy that stores barcode file paths on disk and loads numpy arrays lazily on access."""
+
+    def __init__(self, elements=None):
+        super().__init__(elements or [])
+
+    def __getitem__(self, idx):
+        if isinstance(idx, slice):
+            return LazyBarcodeList(super().__getitem__(idx))
+        val = super().__getitem__(idx)
+        if isinstance(val, (str, os.PathLike)) and str(val).endswith((".npy", ".npz")):
+            if os.path.exists(val):
+                return np.load(val)
+        return val
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield self[i]
+
+
 class VisualLogger:
     def __init__(
         self, instance_folder, instance_config, experiment_config, instance=None
@@ -159,9 +179,10 @@ class VisualLogger:
 
         # Data storage
         self.df = pd.DataFrame()
-        self.barcodes = []
+        self.barcodes = LazyBarcodeList()
         self.current_run_data = {}
         self.current_barcode = None
+        self.current_capacity = 0
         self.num_variables = 0
 
         # Strategy Tracking
@@ -179,6 +200,37 @@ class VisualLogger:
         self.last_time = curr_time
         return diff
 
+    def _ensure_capacity(self, iteration):
+        if iteration < self.current_capacity:
+            return
+        new_capacity = max(iteration + 1, int(self.current_capacity * 1.5) + 100)
+        additional = new_capacity - self.current_capacity
+
+        for key in self.current_run_data:
+            old_arr = self.current_run_data[key]
+            dtype = old_arr.dtype
+            if key == "run_id":
+                pad = np.full(additional, self.current_run, dtype=dtype)
+            elif key == "iteration":
+                pad = np.arange(self.current_capacity, new_capacity, dtype=dtype)
+            elif key == "severity_increases":
+                pad = np.zeros(additional, dtype=dtype)
+            elif key == "cp_obj":
+                pad = np.full(additional, "", dtype=dtype)
+            elif dtype == object:
+                pad = np.full(additional, None, dtype=dtype)
+            elif np.issubdtype(dtype, np.integer):
+                pad = np.full(additional, -1, dtype=dtype)
+            else:
+                pad = np.full(additional, -1.0, dtype=dtype)
+            self.current_run_data[key] = np.concatenate([old_arr, pad])
+
+        if self.current_barcode is not None:
+            pad_barcode = np.full((additional, self.num_variables), -1, dtype=np.int8)
+            self.current_barcode = np.vstack([self.current_barcode, pad_barcode])
+
+        self.current_capacity = new_capacity
+
     def log_run_start(self, num_variables, var_to_idx, sp):
         self.current_run += 1
         self.all_run_solutions.append([])
@@ -194,11 +246,21 @@ class VisualLogger:
         )
         logger.info(f"Starting run #{self.current_run}")
 
-        iters = (
-            self.experiment_config["iters"]
-            if self.experiment_config["iters"] is not None
-            else 100000
-        )
+        if self.experiment_config.get("iters") is not None:
+            iters = self.experiment_config["iters"]
+        elif self.experiment_config.get("time_limit") is not None:
+            time_limit = float(self.experiment_config["time_limit"])
+            iter_time_limit = float(
+                self.experiment_config.get("iter_time_limit") or 2.0
+            )
+            # Estimate upper bound on iterations based on time_limit and iter_time_limit.
+            # Iterations rarely execute in under max(0.1, iter_time_limit / 4.0) seconds.
+            min_expected_iter_time = max(0.1, min(0.5, iter_time_limit / 4.0))
+            iters = max(100, int(np.ceil(time_limit / min_expected_iter_time)))
+        else:
+            iters = 1000
+
+        self.current_capacity = iters
 
         # Pre-allocate run data
         self.current_run_data = {
@@ -292,11 +354,11 @@ class VisualLogger:
         c_iters = self.completed_iterations
         for key in self.current_run_data:
             self.current_run_data[key] = self.current_run_data[key][:c_iters]
-        self.current_barcode = self.current_barcode[:c_iters]
+        if self.current_barcode is not None:
+            self.current_barcode = self.current_barcode[:c_iters].copy()
 
         run_df = pd.DataFrame(self.current_run_data)
         self.df = pd.concat([self.df, run_df], ignore_index=True)
-        self.barcodes.append(self.current_barcode)
 
         # 2. Extract metrics for logging
         run_time = time.perf_counter() - self.active_run_start
@@ -358,11 +420,11 @@ class VisualLogger:
                 from manim_visualizer import LNSOptimizationScene
 
                 frozen_vars = []
-                iters = self.experiment_config["iters"]
+                iters = c_iters
                 for it in range(iters):
                     frozen_in_it = []
                     for v_idx in range(self.num_variables):
-                        if self.current_barcode[it, v_idx] == -1:  # frozen
+                        if self.current_barcode is not None and self.current_barcode[it, v_idx] == -1:  # frozen
                             frozen_in_it.append(self.var_names[v_idx])
                     frozen_vars.append(frozen_in_it)
 
@@ -455,12 +517,20 @@ class VisualLogger:
             f"=================================================\n"
         )
 
-        # 4. Reset states
+        # 4. Save intermediate barcode to disk and free memory
+        if self.current_barcode is not None:
+            barcode_path = f"{self.path}/barcode_run_{self.current_run}.npy"
+            np.save(barcode_path, self.current_barcode)
+            self.barcodes.append(barcode_path)
+            self.current_barcode = None
+
+        # 5. Reset states
         self.active_iteration_start = None
         self.last_time = None
         logger.remove(self.open_log)
 
     def log_iteration_start(self, iteration):
+        self._ensure_capacity(iteration)
         self.active_iteration_start = time.perf_counter()
         self.current_iteration = iteration
 
@@ -556,7 +626,7 @@ class VisualLogger:
                 if hasattr(var, "get_name")
                 else (var.name if hasattr(var, "name") else str(var))
             )
-            if var_name in self.var_name_to_idx:
+            if var_name in self.var_name_to_idx and self.current_barcode is not None:
                 var_idx = self.var_name_to_idx[var_name]
                 self.current_barcode[self.current_iteration, var_idx] = strategy_idx
 
@@ -614,6 +684,7 @@ class VisualLogger:
         self.add_stat_to_current("solve_time", wall_solve_time)
 
     def add_stat_to_current(self, stat_name: str, value):
+        self._ensure_capacity(self.current_iteration)
         # Explicit .value extraction prevents Enum Object type-casting failures in arrays
         if isinstance(value, IntEnum):
             value = value.value
@@ -836,6 +907,17 @@ class VisualLogger:
 
         with open(f"{self.path}/barcodes.pkl", "wb") as f:
             pickle.dump(self.barcodes, f)
+
+        barcode_manifest = [
+            (
+                item
+                if isinstance(item, str)
+                else f"{self.path}/barcode_run_{r + 1}.npy"
+            )
+            for r, item in enumerate(self.barcodes)
+        ]
+        with open(f"{self.path}/barcodes_manifest.json", "w+") as f:
+            json.dump(barcode_manifest, f, indent=4)
 
         # 2. Generate Summary Text
         self._write_summary_file()
@@ -1536,7 +1618,7 @@ class VisualLogger:
         if not self.barcodes:
             return
 
-        for r in range(self.experiment_config["runs"]):
+        for r in range(len(self.barcodes)):
             matrix = self.barcodes[r]
             matrix_t = matrix.T
 
@@ -2023,7 +2105,7 @@ class VisualLogger:
         if not self.barcodes:
             return
 
-        for r in range(self.experiment_config["runs"]):
+        for r in range(len(self.barcodes)):
             matrix = self.barcodes[r]
 
             # Fetch the sequence of strategies used in this run

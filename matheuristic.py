@@ -478,7 +478,7 @@ class Solver:
                 self.instance_config,
                 self.instance,
                 self.heur_sol,
-                experiment_config["cp_objective"],
+                self.experiment_config["cp_objective"],
             )
         elif self.experiment_config["backend"] == "cpp":
             self.mdl, self.handles, sp = prepare_model_cpp(
