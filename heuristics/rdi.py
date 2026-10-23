@@ -124,6 +124,10 @@ def plan_order_gap_filling(o: int, s: int, state: HeuristicState, alpha: float, 
 
         # 2. Otherwise fetch the highest-demand remaining SKU into the earliest pickface gap
         k = remaining_skus.pop(0)
+        # NOTE (time-based decomposition): rt[k] is an *absolute* lower bound here (a fetch cannot
+        # start before t=0). With ExoState.batch_start_time > 0 the meaningful bound would be
+        # batch_start_time + rt[k]. Harmless today because t_cursor >= batch_start_time and
+        # copy availability starts at batch_start_time, but revisit when tuning time decomposition.
         desired_presence = max(t_cursor, rt[k])
         while True:
             gap_start = find_earliest_gap(sc.local_intervals, desired_presence, p[k])
@@ -230,13 +234,12 @@ def update_cached_scores(
 
     # Robot moves committed or moved by the plan (for MoveCap overlap checks)
     committed_moves: list[tuple[int, int]] = []
-    if state.move_cap is not None:
-        for ev in committed.bin_events:
-            committed_moves.append((ev.fetch_start, ev.fetch_end))
-            committed_moves.append((ev.return_start, ev.return_end))
-        for _k, sh_ev, _ps, _pe, new_rs, new_re in committed.shared_picks:
-            committed_moves.append((sh_ev.return_start, sh_ev.return_end))
-            committed_moves.append((new_rs, new_re))
+    for ev in committed.bin_events:
+        committed_moves.append((ev.fetch_start, ev.fetch_end))
+        committed_moves.append((ev.return_start, ev.return_end))
+    for _k, sh_ev, _ps, _pe, new_rs, new_re in committed.shared_picks:
+        committed_moves.append((sh_ev.return_start, sh_ev.return_end))
+        committed_moves.append((new_rs, new_re))
 
     for o in unscheduled:
         c = cached[o]
@@ -247,7 +250,7 @@ def update_cached_scores(
             # lets the order discover new shared bins there) + stations whose cached
             # plan collides with the committed moves.
             stations = [committed.station]
-            if state.move_cap is not None and committed_moves:
+            if committed_moves:
                 for s in S:
                     if s == committed.station:
                         continue

@@ -81,11 +81,9 @@ def create_load_balanced_partitions(
     return partitions
 
 
-def distribute_movecap(total_movecap: int | None, n_stations: int, workloads: list | None = None) -> list[int | None]:
+def distribute_movecap(total_movecap: int, n_stations: int, workloads: list | None = None) -> list[int]:
     """Split MoveCap over stations without waste; the remainder goes to the highest workloads
     (or the first stations if no workloads are given)."""
-    if total_movecap is None:
-        return [None] * n_stations
     if n_stations <= 0:
         return []
     base, rem = divmod(total_movecap, n_stations)

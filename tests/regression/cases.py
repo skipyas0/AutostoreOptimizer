@@ -46,7 +46,7 @@ def instance_specs() -> list[dict]:
     for st in (1, 2, 4):
         for ln in (1, 3):
             for no in (8, 30, 80):
-                for mc in (None, 3, 20):
+                for mc in (3, 20, 1000):  # 1000 ~ effectively uncapped
                     for hz in (10000, TIGHT_HORIZON):
                         specs.append(
                             {
@@ -145,13 +145,10 @@ def cases_for(spec, inst) -> list[tuple[str, str, dict, dict]]:
     add("cfss_norm", "cfss", {"normalize_similarity": True})
     if small:
         add("cfss_wrapper_defaults", "cfss", {"beta": 1.0, "max_cluster_orders": 4})
-    for rule in ("max_sharing", "critical_path", "readiness_weighted"):
-        add(f"gbs_{rule}", "gbs", {"rule": rule})
-    add("gbs_adaptive", "gbs", {"rule": "adaptive"})
 
-    if spec["kind"] == "gen" and n_st > 1 and hz == 10000 and inst.movecap is not None:
+    if spec["kind"] == "gen" and n_st > 1 and hz == 10000:
         for method in ("random", "similarity", "load_balanced", "explicit"):
-            params = {"partition": method, "seed": 123, "horizon": 50000}
+            params = {"partition": method, "seed": 123, "horizon": 10000}
             out.append((f"{spec['id']}|prdi_{method}", "partitioned_rdi", params, {"warmstart": False}))
         if n_orders <= 30:
             for method in ("random", "similarity", "load_balanced", "greedy", "lb_greedy", "full_rdi"):

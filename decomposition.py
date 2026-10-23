@@ -5,9 +5,9 @@ import os
 from collections import defaultdict
 from contextlib import redirect_stdout
 
-from cp_model import build_model, inject_warmstart
+from cp_model import build_model
 from datagen import generate_data
-from heuristics import BinEvent, ExoState, HeuristicSolution, run_partitioned_rdi, run_rdi, validate_warmstart
+from heuristics import ExoState, HeuristicSolution, run_partitioned_rdi, run_rdi, validate_warmstart
 from heuristics.partitioned_rdi import (  # noqa: F401  (re-exported for older imports)
     create_load_balanced_partitions,
     create_random_partitions,
@@ -128,82 +128,22 @@ def validate_exo_constraints(heur_sol, exo_lanes, exo_blocks, exo_moves, handles
     return violations
 
 
-def cp_solution_to_heuristic(sol, handles, instance):
-    if sol is None or not sol.is_solution():
-        return None
-
-    order_assignments = {}
-    bin_events = defaultdict(list)
-    pick_events = {}
-
-    def get_bounds(iv):
-        vs = sol.get_var_solution(iv)
-        if vs is not None and vs.is_present():
-            return vs.get_start(), vs.get_end()
-        return None
-
-    O = handles.get("O", [])
-    S = handles.get("S", [])
-    L = handles.get("L", [])
-    K = handles.get("K", [])
-    U = handles.get("U", {})
-    orders_req = handles.get("orders_req", {})
-
-    # order_assignments
-    for o in O:
-        s_sel = next((s for s in S if get_bounds(handles["I_os"][(o, s)])), None)
-        if s_sel is not None:
-            ln_sel = next(
-                (ln for ln in L if get_bounds(handles["I_os_lane"][(o, s_sel, ln)])),
-                None,
-            )
-
-            if ln_sel is not None:
-                st, en = get_bounds(handles["I_os"][(o, s_sel)])
-                order_assignments[o] = (s_sel, ln_sel, st, en)
-
-                # picks
-                for k in orders_req.get(o, []):
-                    for e in range(U.get(k, 0)):
-                        p_bounds = get_bounds(
-                            handles.get("P", {}).get((o, s_sel, k, e))
-                        )
-                        if p_bounds:
-                            pick_events[(o, s_sel, k)] = p_bounds
-                            break
-
-    # bin_events
-    for s in S:
-        for k in K:
-            for e in range(U.get(k, 0)):
-                f_bounds = get_bounds(handles.get("F", {}).get((s, k, e)))
-                b_bounds = get_bounds(handles.get("B", {}).get((s, k, e)))
-                r_bounds = get_bounds(handles.get("R", {}).get((s, k, e)))
-                if f_bounds and b_bounds and r_bounds:
-                    ev = BinEvent(
-                        sku=k,
-                        copy_id=e,
-                        fetch_start=f_bounds[0],
-                        fetch_end=f_bounds[1],
-                        presence_start=b_bounds[0],
-                        presence_end=b_bounds[1],
-                        return_start=r_bounds[0],
-                        return_end=r_bounds[1],
-                        orders_served=[],
-                    )
-                    bin_events[s].append(ev)
-
-    makespan = max((bounds[3] for bounds in order_assignments.values()), default=0)
-    total_moves = sum(len(evts) * 2 for evts in bin_events.values())
-
-    return HeuristicSolution(
-        order_assignments=order_assignments,
-        bin_events=dict(bin_events),
-        makespan=makespan,
-        total_moves=total_moves,
-        feasible=True,
-        pick_events=pick_events,
-    )
+def _set_warm_start(submodel, handles, heur_sol, exo_lanes, exo_blocks, exo_moves, label: str) -> None:
+    """Warm-start `submodel` from the RDI solution only if it is fully valid (CP model + exogenous
+    constraints); otherwise print why and let CP start cold. Never injects an infeasible warm start."""
+    if heur_sol is None or not heur_sol.feasible:
+        print(f"[{label}] heuristic solution infeasible -> CP cold start")
+        return
+    hard = [v for v in validate_warmstart(heur_sol, heur_sol.pick_events, handles) if not v.startswith("Symmetry")]
+    hard += validate_exo_constraints(heur_sol, exo_lanes, exo_blocks, exo_moves, handles)
+    if hard:
+        print(f"--- WARMSTART VIOLATIONS in {label} -> CP cold start ---")
+        for v in hard:
+            print(v)
+        print("---------------------------------------")
+        return
+    print(f"Warmstart for {label} is strictly feasible!")
+    submodel.set_starting_point(heur_sol.to_warmstart(submodel, handles))
 
 
 def solve_station_decomposition(
@@ -260,24 +200,10 @@ def solve_station_decomposition(
                 batch_start_time=batch_start_time,
             ),
         )
-        if heur_sol and heur_sol.feasible:
-            v1 = validate_warmstart(heur_sol, heur_sol.pick_events, handles)
-            v2 = validate_exo_constraints(
-                heur_sol,
-                exo_lanes_in or {},
-                current_exo_blocks,
-                exo_moves_in or [],
-                handles,
-            )
-            if v1 or v2:
-                print(f"--- WARMSTART VIOLATIONS in station spatial batch {i} ---")
-                for v in v1 + v2:
-                    print(v)
-                print("---------------------------------------")
-            else:
-                print(f"Warmstart for station spatial batch {i} is strictly feasible!")
-            sp = inject_warmstart(heur_sol, heur_sol.pick_events, submodel, handles)
-            submodel.set_starting_point(sp)
+        _set_warm_start(
+            submodel, handles, heur_sol, exo_lanes_in or {}, current_exo_blocks, exo_moves_in or [],
+            f"station spatial batch {i}",
+        )
 
         subsolution_cp = submodel.solve(
             TimeLimit=60, LogVerbosity="Quiet"
@@ -290,7 +216,7 @@ def solve_station_decomposition(
         for k, blocks in new_blocks.items():
             current_exo_blocks[k].extend(blocks)
 
-        heuristic_sol = cp_solution_to_heuristic(subsolution_cp, handles, subinstance)
+        heuristic_sol = HeuristicSolution.from_cp(subsolution_cp, handles)
         subsolutions.append(heuristic_sol)
 
     # Stitch solutions across stations
@@ -371,31 +297,13 @@ def solve_time_decomposition(
                 batch_start_time=current_batch_start,
             ),
         )
-        if heur_sol and heur_sol.feasible:
-            v1 = validate_warmstart(heur_sol, heur_sol.pick_events, handles)
-            v2 = validate_exo_constraints(
-                heur_sol,
-                current_exo_lanes,
-                current_exo_blocks,
-                current_exo_moves,
-                handles,
-            )
-            if v1 or v2:
-                print(f"--- WARMSTART VIOLATIONS in batch {i} ---")
-                for v in v1 + v2:
-                    print(v)
-                print("---------------------------------------")
-            else:
-                print(f"Warmstart for batch {i} is strictly feasible!")
-
-            sp = inject_warmstart(heur_sol, heur_sol.pick_events, submodel, handles)
-            submodel.set_starting_point(sp)
+        _set_warm_start(
+            submodel, handles, heur_sol, current_exo_lanes, current_exo_blocks, current_exo_moves, f"batch {i}"
+        )
         subsolution_cp = submodel.solve(LogVerbosity="Terse", TimeLimit=60)
 
         if subsolution_cp is not None and subsolution_cp.is_solution():
-            heuristic_sol = cp_solution_to_heuristic(
-                subsolution_cp, handles, subinstance
-            )
+            heuristic_sol = HeuristicSolution.from_cp(subsolution_cp, handles)
             subsolutions.append(heuristic_sol)
 
             if heuristic_sol and heuristic_sol.order_assignments:

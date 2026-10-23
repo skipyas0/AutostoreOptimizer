@@ -36,16 +36,38 @@ class HeuristicSolution:
         self.__dict__.update({"meta": {}, **state})
 
     # ------------------------------------------------------------------ CP
-    def to_warmstart(self, mdl, handles):
-        """docplex CpoStartingPoint for a model built by cp_model.build_model."""
+    def check_warmstart(self, handles) -> None:
+        """Raise ValueError unless this solution is a feasible warm start for the CP model in `handles`.
+
+        Rejects solutions flagged infeasible and any violation reported by validate_warmstart
+        except the diagnostic "Symmetry" notes (lanes are remapped by inject_warmstart).
+        """
+        if not self.feasible:
+            raise ValueError(
+                f"Refusing to warm-start from an infeasible heuristic solution "
+                f"({self.meta.get('name', self.meta.get('heuristic', '?'))}); see sol.meta / sol.validate()."
+            )
+        hard = [v for v in validate_warmstart(self, self.pick_events, handles) if not v.startswith("Symmetry")]
+        if hard:
+            raise ValueError(f"Warm start violates {len(hard)} CP constraint(s), e.g.: {hard[:3]}")
+
+    def to_warmstart(self, mdl, handles, strict: bool = True):
+        """docplex CpoStartingPoint for a model built by cp_model.build_model.
+
+        strict (default): raise instead of silently passing an infeasible warm start.
+        """
         import cp_model
 
+        if strict:
+            self.check_warmstart(handles)
         return cp_model.inject_warmstart(self, self.pick_events, mdl, handles)
 
-    def to_cpp_warmstart(self, mdl, handles):
+    def to_cpp_warmstart(self, mdl, handles, strict: bool = True):
         """Apply this solution as warm start to a cpp_cp_model model (returns the mock starting point)."""
         import cpp_cp_model
 
+        if strict:
+            self.check_warmstart(handles)
         return cpp_cp_model.inject_warmstart(self, self.pick_events, mdl, handles)
 
     def validate_warmstart(self, handles) -> list[str]:
@@ -68,6 +90,78 @@ class HeuristicSolution:
             if picks:
                 span_sum += max(pe for ps, pe in picks) - min(ps for ps, pe in picks)
         return alpha * c_max + beta * span_sum
+
+    # ------------------------------------------------------------------ CP -> heuristic
+    @classmethod
+    def from_cp(cls, cp_sol, handles: dict) -> "HeuristicSolution | None":
+        """Convert a CP solution on the variables in `handles` (from cp_model / cpp_cp_model.build_model).
+
+        Accepts docplex ``CpoSolveResult``, ``cp_model_utils.CppSolveResult`` (``get_var_solution``)
+        and CP-SAT-style results (``BooleanValue``/``Value``). Returns None if there is no solution.
+        """
+        if cp_sol is None or (hasattr(cp_sol, "is_solution") and not cp_sol.is_solution()):
+            return None
+
+        if hasattr(cp_sol, "BooleanValue"):
+            def present(x):
+                return x is not None and cp_sol.BooleanValue(x.pres)
+
+            def bounds(x):
+                return cp_sol.Value(x.start), cp_sol.Value(x.end)
+        else:
+            def present(x):
+                if x is None:
+                    return False
+                vs = cp_sol.get_var_solution(x)
+                return vs is not None and vs.is_present()
+
+            def bounds(x):
+                vs = cp_sol.get_var_solution(x)
+                return vs.get_start(), vs.get_end()
+
+        I_os, I_os_lane, P, F, B, R, U = (handles[k] for k in ("I_os", "I_os_lane", "P", "F", "B", "R", "U"))
+        orders_req = handles["orders_req"]
+        S, L, K, O = handles["S"], handles["L"], handles["K"], handles["O"]
+
+        order_assignments = {}
+        for o in O:
+            s_sel = next((s for s in S if present(I_os[(o, s)])), None)
+            if s_sel is not None:
+                ln_sel = next(ln for ln in L if present(I_os_lane[(o, s_sel, ln)]))
+                order_assignments[o] = (s_sel, ln_sel, *bounds(I_os[(o, s_sel)]))
+
+        bin_events: dict[int, list[BinEvent]] = {s: [] for s in S}
+        pick_events = {}
+        for s in S:
+            for k in K:
+                for e in range(U[k]):
+                    if (s, k, e) not in B or not present(B[(s, k, e)]):
+                        continue
+                    served, picks = [], []
+                    for o in O:
+                        key = (o, s, k, e)
+                        if k in orders_req[o] and key in P and present(P[key]):
+                            served.append(o)
+                            pick_events[(o, s, k)] = bounds(P[key])
+                            picks.append(pick_events[(o, s, k)])
+                    fs, fe = bounds(F[(s, k, e)])
+                    bs, be = bounds(B[(s, k, e)])
+                    rs, re = bounds(R[(s, k, e)])
+                    bin_events[s].append(
+                        BinEvent(sku=k, copy_id=e, fetch_start=fs, fetch_end=fe, presence_start=bs,
+                                 presence_end=be, return_start=rs, return_end=re,
+                                 orders_served=served, pick_intervals=sorted(picks))
+                    )
+
+        return cls(
+            order_assignments=order_assignments,
+            bin_events=bin_events,
+            makespan=max((a[3] for a in order_assignments.values()), default=0),
+            total_moves=2 * sum(len(v) for v in bin_events.values()),
+            feasible=True,
+            pick_events=pick_events,
+            meta={"heuristic": "cp"},
+        )
 
     # ------------------------------------------------------------------ composition
     @classmethod
@@ -166,15 +260,14 @@ def validate_solution(sol: HeuristicSolution, inst: Instance, *, horizon: int = 
             violations.append(f"SKU {k} Block concurrency {hit[0]} > N[{k}]={N[k]} at t={hit[1]}")
 
     # 5. MoveCap
-    if move_cap is not None:
-        moves = []
-        for s in S:
-            for ev in sol.bin_events.get(s, []):
-                moves.append((ev.fetch_start, ev.fetch_end))
-                moves.append((ev.return_start, ev.return_end))
-        hit = _sweep_exceeds(moves, move_cap)
-        if hit:
-            violations.append(f"MoveCap violation: {hit[0]} > {move_cap} at t={hit[1]}")
+    moves = []
+    for s in S:
+        for ev in sol.bin_events.get(s, []):
+            moves.append((ev.fetch_start, ev.fetch_end))
+            moves.append((ev.return_start, ev.return_end))
+    hit = _sweep_exceeds(moves, move_cap)
+    if hit:
+        violations.append(f"MoveCap violation: {hit[0]} > {move_cap} at t={hit[1]}")
 
     # 6. Bin event timing consistency
     for s in S:
@@ -358,6 +451,21 @@ def validate_warmstart(sol: HeuristicSolution, pick_events: dict, handles: dict)
         hit = _sweep_exceeds(moves, mc)
         if hit:
             violations.append(f"MoveCap violation: {hit[0]} > {mc} at t={hit[1]}")
+
+    # 12. PickCap: simultaneous picks per station (CP: always_in(sum of pick pulses, 0, pick_cap))
+    pc = handles.get("pick_cap")
+    if pc is not None:
+        for s in S:
+            hit = _sweep_exceeds([iv for (o, ss, k), iv in pick_events.items() if ss == s], pc)
+            if hit:
+                violations.append(f"PickCap violation at S{s}: {hit[0]} > {pc} at t={hit[1]}")
+
+    # 13. Horizon
+    hz = handles.get("horizon")
+    if hz is not None:
+        late = [be for s in S for be in sol.bin_events.get(s, []) if be.return_end > hz]
+        if late:
+            violations.append(f"Horizon violation: {len(late)} bin visit(s) return after {hz}")
 
     return violations
 

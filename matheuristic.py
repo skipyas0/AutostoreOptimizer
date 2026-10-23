@@ -12,10 +12,9 @@ from loguru import logger
 
 import cp_model as docplex_model
 import cpp_cp_model
-from heuristics import validate_solution
+from heuristics import HeuristicSolution, validate_solution
 from cp_model_utils import (
     CppSolveResult,
-    cp_sol_to_solution,
     sort_variables,
 )
 from freezing_utils import (
@@ -134,36 +133,9 @@ def prepare_model_docplex(config, instance, heur_sol, objective_func):
         objective_func=objective_func,
     )
 
-    starting_point = docplex_model.inject_warmstart(
-        heur_sol, heur_sol.pick_events, mdl, handles
-    )
+    # strict: raises if the heuristic solution is infeasible or inconsistent with the CP model
+    starting_point = heur_sol.to_warmstart(mdl, handles)
     return mdl, handles, starting_point
-
-
-class MockCpoStartingPoint:
-    def __init__(self):
-        self.state_dict = {}
-
-    def add_interval_var_solution(
-        self, var, presence=False, start=None, end=None, size=None
-    ):
-        name = var.get_name()
-        d = {"present": 1 if presence else 0}
-        if start is not None:
-            d["start"] = start
-        if end is not None:
-            d["end"] = end
-        if size is not None:
-            d["size"] = size
-        self.state_dict[name] = d
-
-    def add_integer_var_solution(self, var, value):
-        pass
-
-
-class MockCpoModel:
-    def create_empty_solution(self):
-        return MockCpoStartingPoint()
 
 
 def prepare_model_cpp(config, instance, heur_sol, objective_func):
@@ -173,19 +145,8 @@ def prepare_model_cpp(config, instance, heur_sol, objective_func):
         horizon=config["horizon"],
         objective_func=objective_func,
     )
-    mock_mdl = MockCpoModel()
-    mock_sp = docplex_model.inject_warmstart(
-        heur_sol, heur_sol.pick_events, mock_mdl, handles
-    )
-
-    warm_names, warm_p, warm_s, warm_e = [], [], [], []
-    for name, state in mock_sp.state_dict.items():
-        warm_names.append(name)
-        warm_p.append(state.get("present", 0))
-        warm_s.append(state.get("start", 0))
-        warm_e.append(state.get("end", 0))
-
-    mdl.apply_warm_start(warm_names, warm_p, warm_s, warm_e)
+    # strict: raises if the heuristic solution is infeasible or inconsistent with the CP model
+    mock_sp = heur_sol.to_cpp_warmstart(mdl, handles)
     return (
         mdl,
         handles,
@@ -750,7 +711,7 @@ class Solver:
 
         # End of LNS loop: Validate the best solution found
         logger.info("Converting best solution for validation...")
-        final_solution = cp_sol_to_solution(self.best_solution, self.handles)
+        final_solution = HeuristicSolution.from_cp(self.best_solution, self.handles)
 
         logger.info("Validating final solution...")
         try:

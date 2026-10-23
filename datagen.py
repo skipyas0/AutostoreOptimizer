@@ -292,10 +292,15 @@ def generate_data(
     pick_time_model: str = "variable",
     bin_count_model: str = "popularity_correlated",
     grid_depth: int = 16,
-    movecap: int = None,
+    *,
+    movecap: int,
+    pickcap: int = 1,
     verbose: bool = False,
 ) -> Instance:
     """Generate realistic synthetic AutoStore scheduling data.
+
+    movecap (required) / pickcap: robot-move and picking capacities; use a large
+    value for an effectively uncapped instance (None is not allowed).
 
     Parameters
     ----------
@@ -479,6 +484,7 @@ def generate_data(
         rt_ret=rt_ret,
         movecap=movecap,
         seed=seed,
+        pickcap=pickcap,
     )
     if verbose:
         instance.print_summary()
@@ -500,6 +506,8 @@ def generate_data_legacy(
     pick_touch_time: int = 4,
     order_size_dist: str = "poisson2_to_1_6",
     max_bins_per_sku: int = 5,
+    *,
+    movecap: int,
 ) -> Instance:
     """Backward-compatible wrapper using all legacy settings."""
     return generate_data(
@@ -515,6 +523,7 @@ def generate_data_legacy(
         retrieval_time_model="triangular",
         pick_time_model="constant",
         bin_count_model="uniform",
+        movecap=movecap,
     )
 
 
@@ -571,6 +580,8 @@ def main():
         default="popularity_correlated",
     )
     ap.add_argument("--grid-depth", type=int, default=16)
+    ap.add_argument("--movecap", type=int, default=20)
+    ap.add_argument("--pickcap", type=int, default=1)
     ap.add_argument(
         "--json", type=str, default=None, help="Path to dump the instance as JSON"
     )
@@ -590,6 +601,8 @@ def main():
         pick_time_model=args.pick_model,
         bin_count_model=args.bin_model,
         grid_depth=args.grid_depth,
+        movecap=args.movecap,
+        pickcap=args.pickcap,
     )
 
     instance.print_summary()

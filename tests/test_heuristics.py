@@ -38,8 +38,7 @@ def inst():
 
 
 # Heuristics known to violate PickCap today (docs/KNOWN_ISSUES.md) — validated loosely.
-PICKCAP_BROKEN = {"cfss", "cfss_normalized", "gbs_max_sharing", "gbs_critical_path",
-                  "gbs_readiness_weighted", "gbs_adaptive"}
+PICKCAP_BROKEN = {"cfss", "cfss_normalized"}
 # Stitched per-station solutions may break cross-station bin-copy limits.
 STITCHED = {"partitioned_rdi_random", "partitioned_rdi_similarity", "partitioned_rdi_load_balanced"}
 
@@ -49,9 +48,6 @@ def test_registry_heuristic_contract(inst, name):
     if name == "ama":
         pytest.skip("192 SGC runs; covered by test_ama_* with two_phase")
     sol = run_heuristic(name, inst, horizon=H)
-    if sol is None:  # gbs_adaptive returns None if no rule is feasible
-        assert name == "gbs_adaptive"
-        return
     assert isinstance(sol, HeuristicSolution)
     assert sol.meta["name"] == name and sol.meta["runtime"] >= 0
     assert set(sol.order_assignments) == set(inst.O)
@@ -170,7 +166,7 @@ def toy():
     return Instance(
         S=[0], L=[0, 1], K=[0, 1, 2],
         orders_requirements={0: [0, 1], 1: [1], 2: [1], 3: [2], 4: [0, 2]},
-        rt={0: 10, 1: 10, 2: 10}, p={0: 4, 1: 4, 2: 4}, N={0: 1, 1: 1, 2: 1}, movecap=None, seed=0,
+        rt={0: 10, 1: 10, 2: 10}, p={0: 4, 1: 4, 2: 4}, N={0: 1, 1: 1, 2: 1}, movecap=100, seed=0,
     )
 
 
@@ -207,3 +203,51 @@ def test_ama_passes_piggyback_through(toy):
     order_rule, sku_rule = sol.meta["best_rule"]
     again = run_sgc(toy, horizon=1000, order_rule=order_rule, sku_rule=sku_rule, piggyback_singles=True)
     assert again.order_assignments == sol.order_assignments
+
+
+# ---------------------------------------------------------------------------
+# Capacities, warm-start safety, CP -> heuristic conversion
+# ---------------------------------------------------------------------------
+
+
+def test_instance_requires_integer_caps(inst):
+    from instance import Instance
+
+    args = (inst.S, inst.L, inst.K, inst.orders_req, inst.rt, inst.p, inst.N)
+    with pytest.raises(ValueError):
+        Instance(*args, movecap=None, seed=0)
+    with pytest.raises(ValueError):
+        Instance(*args, movecap=5, seed=0, pickcap=0)
+    legacy = dict(inst.__dict__)
+    legacy.pop("_pickcap")
+    with pytest.raises(ValueError, match="predates"):
+        Instance.__new__(Instance).__setstate__(legacy)
+
+
+def test_strict_warmstart_refuses_infeasible(inst):
+    cp_model = pytest.importorskip("cp_model")
+    sol = run_rdi(inst, horizon=H)
+    mdl, handles = cp_model.build_model(inst, add_symmetry_breaking=True, horizon=H)
+    sol.feasible = False
+    with pytest.raises(ValueError, match="infeasible"):
+        sol.to_warmstart(mdl, handles)
+    sol.feasible = True
+    # a pick moved outside its bin presence is a hard violation
+    (o, s, k), (ps, pe) = next(iter(sol.pick_events.items()))
+    sol.pick_events[(o, s, k)] = (ps + 10_000, pe + 10_000)
+    with pytest.raises(ValueError, match="violates"):
+        sol.to_warmstart(mdl, handles)
+
+
+def test_from_cp_roundtrip(inst):
+    cp_model = pytest.importorskip("cp_model")
+    sol = run_rdi(inst, horizon=H)
+    mdl, handles = cp_model.build_model(inst, add_symmetry_breaking=True, horizon=H)
+    sp = sol.to_warmstart(mdl, handles)  # a docplex solution object on the model's variables
+    back = HeuristicSolution.from_cp(sp, handles)
+    assert back.makespan == sol.makespan and back.total_moves == sol.total_moves
+    # lanes may be permuted by the symmetry-breaking remap; everything else must match
+    assert {o: (s, a, b) for o, (s, _, a, b) in back.order_assignments.items()} == \
+           {o: (s, a, b) for o, (s, _, a, b) in sol.order_assignments.items()}
+    assert back.pick_events == sol.pick_events
+    assert back.validate(inst, H) == []

@@ -117,46 +117,17 @@ class DifferenceArray:
             self.prefix[t] = self.prefix[t - 1] + self.diff[t]
         self._dirty = False
 
-    def range_max(self, t1: int, t2: int) -> int:
-        """Max concurrent moves in [t1, t2]."""
-        if self._dirty:
-            self.build_prefix()
-        t1 = max(0, t1)
-        t2 = min(t2, self.H)
-        if t1 > t2:
-            return 0
-        return max(self.prefix[t1 : t2 + 1])
-
-    def delay_for_movecap(self, t_start: int, duration: int, cap: int | None) -> int:
-        """Slide t_start forward until [t_start, t_start+duration) fits under cap."""
-        if self._dirty:
-            self.build_prefix()
-        if cap is None:
-            return t_start
-        t = t_start
-        limit = self.H - duration + 1
-        while t <= limit:
-            ok = True
-            for i in range(t, t + duration):
-                if self.prefix[i] >= cap:
-                    ok = False
-                    t = i + 1
-                    break
-            if ok:
-                return t
-        return t  # may exceed horizon — caller must check
-
     def delay_for_movecap_with_pending(
         self,
         t_start: int,
         duration: int,
-        cap: int | None,
+        cap: int,
         pending_moves: list[tuple[int, int]],
         removed_moves: list[tuple[int, int]] | None = None,
     ) -> int:
-        """Like delay_for_movecap but also counts uncommitted pending/removed moves."""
-        if cap is None:
-            return t_start
+        """Slide t_start forward until [t_start, t_start+duration) fits under cap,
+        counting committed moves plus uncommitted pending (+1) / removed (-1) moves.
+        May return a time past the horizon — the caller must check."""
         if self._dirty:
             self.build_prefix()
 
@@ -204,11 +175,6 @@ class BinCopyPool:
                 return
         raise ValueError(f"copy_id {copy_id} not found in pool for SKU {self.sku}")
 
-    def peek_nth(self, n: int) -> int:
-        """Availability time of the n-th earliest copy (0-indexed)."""
-        sorted_copies = sorted(self._heap)
-        return sorted_copies[n][0] if n < len(sorted_copies) else float("inf")
-
     def __deepcopy__(self, memo):
         new = BinCopyPool.__new__(BinCopyPool)
         new.sku = self.sku
@@ -229,7 +195,7 @@ class HeuristicState:
     inst: Instance
     horizon: int
     pick_cap: int | None  # None = unlimited simultaneous picks per bin (see KNOWN_ISSUES: CFSS)
-    move_cap: int | None  # global MoveCap (None = no cap)
+    move_cap: int  # global MoveCap
     lane_free: dict[tuple[int, int], int]  # (s, ln) -> earliest free time
     pickface_free: dict[int, int]  # s -> earliest time pickface is free
     move_da: DifferenceArray  # global move profile
@@ -330,8 +296,6 @@ class PlanScratch:
 
     def delay_move(self, state: HeuristicState, t: int, duration: int) -> int:
         """Earliest start >= t for a robot move of `duration` under MoveCap."""
-        if state.move_cap is None:
-            return t
         return state.move_da.delay_for_movecap_with_pending(
             t, duration, state.move_cap, self.pending_moves, removed_moves=self.removed_moves
         )
@@ -478,11 +442,9 @@ def _can_extend_bin_event(
         if orig_ret not in eff_removed:
             eff_removed.append(orig_ret)
 
-    new_ret_start = req_presence_end
-    if state.move_cap is not None:
-        new_ret_start = state.move_da.delay_for_movecap_with_pending(
-            req_presence_end, ret_dur, state.move_cap, eff_pending, eff_removed
-        )
+    new_ret_start = state.move_da.delay_for_movecap_with_pending(
+        req_presence_end, ret_dur, state.move_cap, eff_pending, eff_removed
+    )
     new_ret_end = new_ret_start + ret_dur
     if new_ret_end > state.horizon:
         return None

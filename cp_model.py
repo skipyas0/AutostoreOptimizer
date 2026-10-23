@@ -449,6 +449,8 @@ def build_model(
         "O": O,
         "N": N,
         "move_cap": move_cap,
+        "pick_cap": pick_cap,
+        "horizon": horizon,
         "makespan": makespan,
         "bin_fetches": num_bin_fetches,
         "total_flow_time": total_flow_time,

@@ -138,7 +138,8 @@ def precalculate_config(config):
     write_html(fig, html_file)
     print(f"\nWrote visualization to {html_file}")
 
-    sp = cpp_cp_model.inject_warmstart(heur_sol, heur_sol.pick_events, mdl, handles)
+    # strict: raises instead of silently warm-starting CP from an infeasible solution
+    sp = heur_sol.to_cpp_warmstart(mdl, handles)
 
     for seed in config["cp_seeds"]:
         mdl, handles = cpp_cp_model.build_model(

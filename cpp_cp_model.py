@@ -215,6 +215,8 @@ def build_model(
         "O": O,
         "N": N,
         "move_cap": move_cap,
+        "pick_cap": pick_cap,
+        "horizon": horizon,
         "all_intervals_flat": all_intervals_flat,
     }
 

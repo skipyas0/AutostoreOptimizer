@@ -25,7 +25,7 @@ import cases as C  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# OLD adapter (pre-refactor API)
+# OLD adapter (legacy pre-package API, only used for refs <= f391800)
 # ---------------------------------------------------------------------------
 
 
@@ -85,24 +85,6 @@ def old_run(heur, inst, params):
             sim_threshold=params.get("sim_threshold", 0.1),
             max_cluster_orders=params.get("max_cluster_orders", 8),
         )
-    if heur == "gbs":
-        from heuristic_gbs import run_gbs
-
-        rule = params.get("rule", "max_sharing")
-        if rule != "adaptive":
-            return run_gbs(inst, horizon=hz, move_cap=inst.movecap, ALPHA=a, BETA=b, scoring_rule=rule)
-        # run_gbs_adaptive crashes at the reference commit (bad Instance(...) call);
-        # emulate its intended selection logic on top of the old run_gbs.
-        best_sol, best_obj, best_moves = None, float("inf"), float("inf")
-        for r in ["max_sharing", "critical_path", "readiness_weighted"]:
-            sol = run_gbs(inst, horizon=hz, move_cap=inst.movecap, ALPHA=a, BETA=b, scoring_rule=r)
-            if not sol.feasible:
-                continue
-            flow = sum(sol.order_assignments[o][3] - sol.order_assignments[o][2] for o in inst.O)
-            obj = a * sol.makespan + b * flow
-            if obj < best_obj or (obj == best_obj and sol.total_moves < best_moves):
-                best_sol, best_obj, best_moves = sol, obj, sol.total_moves
-        return best_sol
     if heur == "partitioned_rdi":
         from decomposition import distribute_movecap, stitch_heuristic_solutions
         from heuristic_rdi_sgc import run_rdi_sgc
@@ -174,16 +156,11 @@ def new_run(heur, inst, params):
         from heuristics import run_cfss
 
         return run_cfss(inst, **params)
-    if heur == "gbs":
-        from heuristics import run_gbs
-
-        return run_gbs(inst, **params)
     if heur == "partitioned_rdi":
         from heuristics import run_partitioned_rdi
 
         if params["partition"] == "explicit":
             params["partition"] = C.explicit_assignment(inst)
-        params.pop("horizon", None)
         return run_partitioned_rdi(inst, **params)
     raise KeyError(heur)
 
@@ -220,11 +197,18 @@ def new_validate_warmstart(sol, pick_events, handles):
 # ---------------------------------------------------------------------------
 
 
+def _ref_has_package() -> bool:
+    """True if the reference commit already has the heuristics/ package (use the new adapter on both sides)."""
+    root = os.environ.get("HEURISTICS_REF_ROOT")
+    return bool(root) and os.path.exists(os.path.join(root, "heuristics", "__init__.py"))
+
+
 def _work(side, spec):
-    run = old_run if side == "old" else new_run
-    bench = old_bench if side == "old" else new_bench
-    validate = old_validate if side == "old" else new_validate
-    validate_ws = old_validate_warmstart if side == "old" else new_validate_warmstart
+    legacy = side == "old" and not _ref_has_package()
+    run = old_run if legacy else new_run
+    bench = old_bench if legacy else new_bench
+    validate = old_validate if legacy else new_validate
+    validate_ws = old_validate_warmstart if legacy else new_validate_warmstart
 
     out = {}
     with contextlib.redirect_stdout(io.StringIO()):

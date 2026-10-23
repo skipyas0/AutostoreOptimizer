@@ -37,8 +37,9 @@ class Instance:
         self.p = p
         self.N = N
         self._rt_ret = rt_ret if rt_ret is not None else dict(rt)
-        self._movecap = movecap
-        self._pickcap = pickcap
+        # Capacities are always explicit integers; for "unlimited", pass a large number.
+        self._movecap = self._check_cap("movecap", movecap, minimum=0)
+        self._pickcap = self._check_cap("pickcap", pickcap, minimum=1)
         self._seed = seed
 
         all_skus = np.concatenate(
@@ -53,6 +54,23 @@ class Instance:
 
         self.stats = self.get_statistics()
         self.features = self.get_features()
+
+    @staticmethod
+    def _check_cap(name: str, value, minimum: int) -> int:
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < minimum:
+            raise ValueError(
+                f"{name} must be an integer >= {minimum} (got {value!r}); "
+                f"use a large value instead of None for an effectively uncapped instance"
+            )
+        return int(value)
+
+    def __setstate__(self, state: dict) -> None:
+        if "_pickcap" not in state or state.get("_movecap") is None:
+            raise ValueError(
+                "This pickled Instance predates mandatory movecap/pickcap. "
+                "Convert it with: python scripts/migrate_heuristic_pickles.py --instances --apply"
+            )
+        self.__dict__.update(state)
 
     @property
     def orders_requirements(self) -> dict[int, list[int]]:
@@ -93,7 +111,7 @@ class Instance:
 
     @property
     def pickcap(self) -> int:
-        return self._pickcap if hasattr(self, "_pickcap") else len(self.L)
+        return self._pickcap
 
     @property
     def seed(self) -> int:
@@ -194,12 +212,12 @@ class Instance:
         self,
         orders,
         stations: list[int] | None = None,
-        movecap: int | None | str = "same",
+        movecap: int | str = "same",
     ) -> "Instance":
         """Instance restricted to `orders` (iteration order kept) and optionally `stations`.
 
         Lanes, SKUs, times, bin counts, seed and pickcap are shared with self;
-        movecap is kept unless given (None = uncapped).
+        movecap is kept unless given.
         """
         return Instance(
             list(stations) if stations is not None else self.S,
@@ -284,7 +302,7 @@ class Instance:
         supply_demand_ratio_stdev = float(np.sqrt(((supply - demand) ** 2).mean()))
 
         # Movecap
-        movecap_norm = (self.movecap / 100) if self.movecap is not None else 0.0
+        movecap_norm = self.movecap / 100
         movecap_norm_per_lane = movecap_norm / (len(self.S) * len(self.L))
 
         return {

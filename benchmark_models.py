@@ -18,12 +18,12 @@ plus timings). Default methods (same labels as before the heuristics refactor):
   8. Load-balanced Piggyback SGC     heuristics: lb_sgc_singles
 
 ``--methods`` selects a subset by label number/registry name, or ``all`` to add
-EXTRA_METHODS (RDI tiebreakers, AMA, CFSS, GBS). All heuristics use horizon 50000.
+EXTRA_METHODS (RDI tiebreakers, AMA, CFSS). All heuristics use horizon 50000.
 
 Usage:
   .venv/bin/python benchmark_models.py
   .venv/bin/python benchmark_models.py --checkpoints rl_agent_weights_mlp_1200.pth --num-instances 10
-  .venv/bin/python benchmark_models.py --methods sgc rdi cfss gbs_adaptive --num-instances 5
+  .venv/bin/python benchmark_models.py --methods sgc rdi cfss ama_two_phase --num-instances 5
   .venv/bin/python benchmark_models.py --methods all --skip-rl
 """
 
@@ -349,10 +349,6 @@ EXTRA_METHODS = [
     "ama",
     "cfss",
     "cfss_normalized",
-    "gbs_max_sharing",
-    "gbs_critical_path",
-    "gbs_readiness_weighted",
-    "gbs_adaptive",
 ]
 
 
@@ -507,7 +503,7 @@ def parse_args():
         nargs="*",
         default=None,
         help="Subset of methods: default labels' leading numbers (1-6), registry names "
-        "(e.g. sgc rdi cfss gbs_adaptive), or 'all' (defaults + EXTRA_METHODS). Default: 1-8.",
+        "(e.g. sgc rdi cfss ama_two_phase), or 'all' (defaults + EXTRA_METHODS). Default: 1-8.",
     )
     parser.add_argument(
         "--scale",

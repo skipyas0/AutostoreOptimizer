@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Verify that the refactored heuristics reproduce a reference commit exactly.
 
-    .venv/bin/python tests/regression/equivalence.py --ref f391800
+    .venv/bin/python tests/regression/equivalence.py              # working tree vs. HEAD
+    .venv/bin/python tests/regression/equivalence.py --ref f391800 # vs. the pre-refactor code
 
 Steps:
   1. `git worktree add` the reference commit into a temp dir (cached per ref).
@@ -45,8 +46,8 @@ def ensure_worktree(sha: str) -> str:
     return path
 
 
-def dump(side: str, out: str, pythonpath: str, jobs: int, filt: str | None):
-    env = dict(os.environ, PYTHONPATH=pythonpath, PYTHONDONTWRITEBYTECODE="1")
+def dump(side: str, out: str, pythonpath: str, jobs: int, filt: str | None, ref_root: str = ""):
+    env = dict(os.environ, PYTHONPATH=pythonpath, PYTHONDONTWRITEBYTECODE="1", HEURISTICS_REF_ROOT=ref_root)
     cmd = [PY, os.path.join(HERE, "_dump.py"), "--side", side, "--out", out, "--jobs", str(jobs)]
     if filt:
         cmd += ["--filter", filt]
@@ -77,7 +78,7 @@ def first_diff(a, b, path="") -> str:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ref", default="f391800")
+    ap.add_argument("--ref", default="HEAD", help="reference commit (default: HEAD = last commit)")
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) - 2))
     ap.add_argument("--filter", default=None)
     ap.add_argument("--refresh", action="store_true", help="recompute old-side results")
@@ -92,7 +93,7 @@ def main():
 
     if args.refresh or not os.path.exists(old_json):
         wt = ensure_worktree(sha)
-        dump("old", old_json, f"{wt}{os.pathsep}{REPO}", args.jobs, args.filter)
+        dump("old", old_json, f"{wt}{os.pathsep}{REPO}", args.jobs, args.filter, ref_root=wt)
     if args.old_only:
         return
     dump("new", new_json, REPO, args.jobs, args.filter)
