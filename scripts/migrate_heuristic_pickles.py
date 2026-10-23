@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Convert pickles of pre-refactor heuristic solutions to the new classes, in place.
+"""Convert legacy pickles in place (dry run by default).
+
+Mode 1 (default): heuristic solutions.
 
 Old pickles reference ``autostore_heuristic.Solution`` / ``autostore_heuristic.BinEvent``,
 which no longer exist. This script loads them with a remapping unpickler
@@ -13,6 +15,14 @@ and only then atomically replaces the file (keeping ``<file>.bak`` unless --no-b
 By default it scans ``precalculated_instances/`` and ``param_exp/`` for
 ``heuristic_solution.pkl``; pass paths/directories to override, and --all-pkl to
 consider every ``*.pkl`` under the given directories.
+
+Mode 2 (--instances): Instances pickled before pickcap existed (no ``_pickcap``).
+Back then a missing pickcap meant ``len(L)`` (one pick per lane, i.e. effectively
+unlimited), so that value is written explicitly; every other field is checked to
+be byte-identical after the round trip. Scans ``instance.pkl`` under
+``precalculated_instances/``, ``param_exp/`` and ``decomposition_experiments/``.
+
+    .venv/bin/python scripts/migrate_heuristic_pickles.py --instances --apply
 """
 
 from __future__ import annotations
@@ -29,6 +39,7 @@ REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, REPO)
 
 from heuristics import BinEvent, HeuristicSolution  # noqa: E402
+from instance import Instance  # noqa: E402
 
 LEGACY_MODULE = "autostore_heuristic"
 REMAP = {
@@ -102,32 +113,78 @@ def migrate(path: str, apply: bool, backup: bool) -> str:
     return f"converted ({type(obj).__name__})" + (" [.bak kept]" if backup else "")
 
 
-def collect(targets: list[str], all_pkl: bool) -> list[str]:
+class _LegacyInstance(Instance):
+    """Instance that skips the mandatory-caps check so a legacy pickle can be read once."""
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+
+
+class LegacyInstanceUnpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        if (module, name) == ("instance", "Instance"):
+            return _LegacyInstance
+        return super().find_class(module, name)
+
+
+def migrate_instance(path: str, apply: bool, backup: bool) -> str:
+    raw = open(path, "rb").read()
+    obj = LegacyInstanceUnpickler(io.BytesIO(raw)).load()
+    state = dict(obj.__dict__)
+    if state.get("_movecap") is None:
+        raise RuntimeError("movecap is None; set it explicitly (no safe default)")
+    if "_pickcap" in state:
+        return "skip (already has pickcap)"
+    obj.__class__ = Instance
+    obj._pickcap = len(obj.L)
+    new_raw = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+    reloaded = pickle.loads(new_raw)  # plain unpickler: Instance.__setstate__ must accept it
+    if set(reloaded.__dict__) != set(state) | {"_pickcap"} or any(
+        pickle.dumps(reloaded.__dict__[k]) != pickle.dumps(v) for k, v in state.items()
+    ):
+        raise RuntimeError("round-trip mismatch")
+    if not apply:
+        return f"would set pickcap = |L| = {obj._pickcap}"
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(new_raw)
+    if backup:
+        shutil.copy2(path, path + ".bak")
+    os.replace(tmp, path)
+    with open(path, "rb") as f:
+        if pickle.load(f).pickcap != len(obj.L):
+            raise RuntimeError("post-write verification failed")
+    return f"pickcap set to |L| = {obj._pickcap}" + (" [.bak kept]" if backup else "")
+
+
+def collect(targets: list[str], all_pkl: bool, name: str = "heuristic_solution.pkl") -> list[str]:
     files = []
     for t in targets:
         if os.path.isfile(t):
             files.append(t)
         elif os.path.isdir(t):
-            pattern = "**/*.pkl" if all_pkl else "**/heuristic_solution.pkl"
+            pattern = "**/*.pkl" if all_pkl else f"**/{name}"
             files.extend(glob.glob(os.path.join(t, pattern), recursive=True))
     return sorted(set(files))
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("targets", nargs="*", default=[
-        os.path.join(REPO, "precalculated_instances"), os.path.join(REPO, "param_exp"),
-    ])
+    ap.add_argument("targets", nargs="*", default=None)
+    ap.add_argument("--instances", action="store_true", help="migrate pre-pickcap Instance pickles (instance.pkl)")
     ap.add_argument("--apply", action="store_true", help="write converted files (default: dry run)")
     ap.add_argument("--no-backup", action="store_true", help="do not keep <file>.bak")
     ap.add_argument("--all-pkl", action="store_true", help="scan every *.pkl, not only heuristic_solution.pkl")
     args = ap.parse_args()
 
-    files = collect(args.targets, args.all_pkl)
+    roots = ["precalculated_instances", "param_exp"] + (["decomposition_experiments"] if args.instances else [])
+    targets = args.targets or [os.path.join(REPO, r) for r in roots]
+    files = collect(targets, args.all_pkl, "instance.pkl" if args.instances else "heuristic_solution.pkl")
+    migrate_fn = migrate_instance if args.instances else migrate
     counts = {"converted": 0, "skip": 0, "error": 0}
     for path in files:
         try:
-            msg = migrate(path, args.apply, backup=not args.no_backup)
+            msg = migrate_fn(path, args.apply, backup=not args.no_backup)
             counts["skip" if msg.startswith("skip") else "converted"] += 1
         except Exception as e:
             msg = f"ERROR: {type(e).__name__}: {e}"

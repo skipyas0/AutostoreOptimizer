@@ -18,7 +18,7 @@ plus timings). Default methods (same labels as before the heuristics refactor):
   8. Load-balanced Piggyback SGC     heuristics: lb_sgc_singles
 
 ``--methods`` selects a subset by label number/registry name, or ``all`` to add
-EXTRA_METHODS (RDI tiebreakers, AMA, CFSS). All heuristics use horizon 50000.
+EXTRA_METHODS (RDI tiebreakers, AMA, CFSS). All heuristics use horizon 10000.
 
 Usage:
   .venv/bin/python benchmark_models.py
@@ -235,43 +235,30 @@ def solution_metrics(
 ) -> dict[str, float]:
     """Per-station components (M_k, W_k, Be_k, P_k, Rt_k) -> RL-environment metrics.
 
-    Monolithic solutions: if infeasible, every station gets M_k = 50000 and W_k = 0.
-    Partitioned solutions (meta["station_feasible"]): only infeasible stations are
-    penalised and W_k is always the assigned workload (meta["assignment"]).
+    W_k is always the picking workload of the orders assigned to station k (from
+    meta["assignment"] for partitioned solutions, else from the schedule). An
+    infeasible station — every station of an infeasible monolithic solution, or the
+    infeasible ones of a partitioned solution (meta["station_feasible"]) — gets
+    M_k = PENALTY_MAKESPAN and Be_k = P_k = Rt_k = 0.
     """
     M_k, W_k, Be_k, P_k, Rt_k = [], [], [], [], []
     station_feasible = sol.meta.get("station_feasible") if sol is not None else None
     assignment = sol.meta.get("assignment") if sol is not None else None
 
-    if station_feasible is None and (sol is None or not sol.feasible):
-        n = len(instance.S)
-        return compute_metrics_from_station_results(
-            instance,
-            [PENALTY_MAKESPAN] * n,
-            [0.0] * n,
-            [0] * n,
-            [0] * n,
-            [0.0] * n,
-            elapsed,
-            partition_time,
-        )
-
     for s in instance.S:
         if assignment is not None:
             orders = assignment.get(s, [])
+        elif sol is not None:
+            orders = [o for o, (st, _, _, _) in sol.order_assignments.items() if st == s]
         else:
-            orders = [
-                o for o, (st, _, _, _) in sol.order_assignments.items() if st == s
-            ]
-        W_k.append(
-            float(
-                sum(
-                    instance.p.get(k, 0) for o in orders for k in instance.orders_req[o]
-                )
-            )
-        )
+            orders = []
+        W_k.append(float(sum(instance.p.get(k, 0) for o in orders for k in instance.orders_req[o])))
 
-        if station_feasible is not None and not station_feasible.get(s, True):
+        if station_feasible is not None:
+            ok = station_feasible.get(s, True)
+        else:
+            ok = sol is not None and sol.feasible
+        if not ok:
             M_k.append(PENALTY_MAKESPAN)
             Be_k.append(0)
             P_k.append(0)
@@ -311,7 +298,7 @@ def solution_metrics(
 # Methods: Instance -> HeuristicSolution
 # ======================================================================
 
-BENCH_HORIZON = 50000
+BENCH_HORIZON = 10000
 
 DEFAULT_METHODS: dict[str, Callable[[Instance], HeuristicSolution]] = {
     "1. Random-partitioned RDI": partial(
@@ -342,7 +329,7 @@ DEFAULT_METHODS: dict[str, Callable[[Instance], HeuristicSolution]] = {
 
 # Extra registry heuristics added by `--methods all` (or by name).
 EXTRA_METHODS = [
-    "rdi_sum_rt",
+    "rdi_sharing_degree",
     "rdi_best_score",
     "ama_two_phase",
     "ama_two_phase_singles",

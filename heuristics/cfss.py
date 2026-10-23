@@ -99,9 +99,9 @@ def run_cfss(
     *,
     horizon: int = 10000,
     alpha: float = 1.0,
-    beta: float = 0.0,
+    beta: float = 1.0,
     sim_threshold: float = 0.1,
-    max_cluster_orders: int = 8,
+    max_cluster_orders: int = 4,
     normalize_similarity: bool = False,
 ) -> HeuristicSolution:
     from jaccard_similarity import build_similarity_matrix

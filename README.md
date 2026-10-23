@@ -31,7 +31,7 @@ docplex config --upgrade <PATH_TO_CPLEX_STUDIO>
 ## Documentation
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): problem summary, pipeline, map of every top-level module, workflows
-- [docs/HEURISTICS.md](docs/HEURISTICS.md): the `heuristics/` package (SGC, AMA, RDI, partitioned RDI, CFSS, GBS), API, how to add a heuristic, equivalence harness
+- [docs/HEURISTICS.md](docs/HEURISTICS.md): the `heuristics/` package (SGC, AMA, RDI, partitioned RDI, CFSS), API, how to add a heuristic, equivalence harness
 - [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md): known bugs and quirks
 
 ## Repository Structure
@@ -60,7 +60,7 @@ docplex config --upgrade <PATH_TO_CPLEX_STUDIO>
 
 ```bash
 python -m pytest tests/test_heuristics.py tests/test_instance.py -v
-python tests/regression/equivalence.py --ref f391800   # heuristics identical to the pre-refactor commit
+python tests/regression/equivalence.py                 # heuristics behave exactly as in the last commit (HEAD)
 ```
 
 ### Heuristics
@@ -68,7 +68,7 @@ python tests/regression/equivalence.py --ref f391800   # heuristics identical to
 ```bash
 python -m heuristics --list
 python -m heuristics sgc --stations 1 --lanes 2 --orders 7 --skus 5 --seed 42 --pick 4 --horizon 2000
-python -m heuristics rdi --orders 40 --param tiebreaker=sum_rt_asc --vis
+python -m heuristics rdi --orders 40 --param tiebreaker=sharing_degree --vis
 python -m heuristics ama_two_phase --orders 40
 ```
 

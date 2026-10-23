@@ -505,7 +505,7 @@ def solve_rl_decomposition(instance, weights_path="rl_agent_weights.pth", device
         s_idx = min(s_idx, len(instance.S) - 1)
         station_assignments[s_idx].append(instance.O[o_idx])
 
-    return run_partitioned_rdi(instance, partition=station_assignments, horizon=50000)
+    return run_partitioned_rdi(instance, partition=station_assignments)
 
 
 if __name__ == "__main__":

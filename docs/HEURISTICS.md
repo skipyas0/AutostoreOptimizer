@@ -6,17 +6,20 @@ Every heuristic is a plain function with the same contract:
 run_x(inst: Instance, *, horizon: int = ..., **algorithm_params) -> HeuristicSolution
 ```
 
-- MoveCap and PickCap are always read from the `Instance`, never passed separately.
+- MoveCap and PickCap are always read from the `Instance`, never passed separately. Both are mandatory integers
+  (≥ 1); for an effectively uncapped instance, pass a large value.
+- The default horizon is 10000 everywhere.
 - No `*args` and no instance generation inside: the caller builds or loads the `Instance`.
 - Parameters are keyword-only, explicit, and have defaults.
 
 ```python
 from heuristics import run_heuristic, run_rdi, HEURISTICS
 sol = run_heuristic("lb_sgc", inst, horizon=10000)          # by registry name
-sol = run_rdi(inst, horizon=10000, tiebreaker="sum_rt_asc")  # or directly
+sol = run_rdi(inst, tiebreaker="sharing_degree")          # or directly
 violations = sol.validate(inst, horizon=10000)
-sp = sol.to_warmstart(mdl, handles)          # docplex model from cp_model.build_model
-sol.to_cpp_warmstart(mdl, handles)           # C++ model from cpp_cp_model.build_model
+sp = sol.to_warmstart(mdl, handles)          # docplex model from cp_model.build_model (strict)
+sol.to_cpp_warmstart(mdl, handles)           # C++ model from cpp_cp_model.build_model (strict)
+cp_as_heur = HeuristicSolution.from_cp(cp_result, handles)   # CP solution -> HeuristicSolution
 fig = plot_schedule(*sol.to_viz(inst))       # schedule_visualizer
 ```
 
@@ -34,7 +37,6 @@ CLI: `python -m heuristics --list`, `python -m heuristics <name> [--orders 40 ..
 | `rdi.py` | RDI (regret insertion with the gap-filling planner) |
 | `partitioned_rdi.py` | Order→station partitioning, `distribute_movecap`, partitioned RDI |
 | `cfss.py` | Clustering plus interleaved SGC |
-| `gbs.py` | Bin-centred GBS, with its own state classes |
 
 ## Registry
 
@@ -45,17 +47,15 @@ CLI: `python -m heuristics --list`, `python -m heuristics <name> [--orders 40 ..
 | `sgc_singles` / `lb_sgc_singles` | `run_sgc(piggyback_singles=True)` / `run_sgc(load_balanced=True, piggyback_singles=True)` |
 | `ama` / `ama_two_phase` | `run_ama(mode="full_grid" / "two_phase")` |
 | `ama_singles` / `ama_two_phase_singles` / `lb_ama_two_phase_singles` | `run_ama(..., piggyback_singles=True[, load_balanced=True])` |
-| `rdi` / `rdi_sum_rt` / `rdi_best_score` | `run_rdi(tiebreaker="sharing_degree" / "sum_rt_asc" / "best_score")` |
-| `partitioned_rdi_{random,similarity,load_balanced}` | `run_partitioned_rdi(partition=...)`, horizon 50000 |
+| `rdi` / `rdi_sharing_degree` / `rdi_best_score` | `run_rdi(tiebreaker="sum_rt_asc" / "sharing_degree" / "best_score")` |
+| `partitioned_rdi_{random,similarity,load_balanced}` | `run_partitioned_rdi(partition=...)` (seed 0) |
 | `cfss` / `cfss_normalized` | `run_cfss(normalize_similarity=False / True)` |
-| `gbs_{max_sharing,critical_path,readiness_weighted,adaptive}` | `run_gbs(rule=...)` |
 
 Aliases such as `greedy`, `load_balanced_greedy` and `rdi_sgc` are accepted by `run_heuristic`
 and by `precalculate_instances_for_lns.py`.
 
 The registry replaces the old per-variant modules. For example, `heuristic_rdi_sgc_best_score.py`
-became `rdi_best_score`, `heuristic_cfss_sgc_normalized.py` became `cfss_normalized`, and
-`heuristic_gbs_critical_path.py` became `gbs_critical_path`.
+became `rdi_best_score` and `heuristic_cfss_sgc_normalized.py` became `cfss_normalized`. GBS was removed.
 
 ---
 
@@ -75,8 +75,14 @@ class HeuristicSolution:
 
 Methods:
 - `validate(inst, horizon)`: checks assignment, lanes, pickface, copies (N), MoveCap, timing, horizon, pick completeness and PickCap.
-- `validate_warmstart(handles)`: checks consistency with the CP model's indexing.
-- `to_warmstart`, `to_cpp_warmstart`, `to_viz`.
+- `validate_warmstart(handles)`: checks consistency with the CP model: indexing, copies, MoveCap, PickCap and horizon.
+- `to_warmstart(mdl, handles)` and `to_cpp_warmstart(mdl, handles)` are **strict by default**. They raise
+  `ValueError` if the solution is flagged infeasible or `validate_warmstart` reports any hard violation (everything
+  except the "Symmetry" diagnostics, which `inject_warmstart` fixes by remapping lanes). An infeasible heuristic
+  solution therefore can never silently become a CP warm start. Pass `strict=False` to override.
+- `HeuristicSolution.from_cp(cp_result, handles)`: converts a docplex / C++ / CP-SAT-style CP solution on the
+  `build_model` variables. It returns `None` if there is no solution. It is used by the LNS final validation and the decomposition.
+- `to_viz`.
 - `objective(alpha, beta, stations)`: `alpha * C_max + beta * Σ_s span_s`.
 - `HeuristicSolution.stitch(sols)`: union of solutions over disjoint orders.
 
@@ -91,7 +97,7 @@ Methods:
 | Piece | Role |
 |---|---|
 | `HeuristicState` | Committed partial schedule: lane / pickface free times, `DifferenceArray` MoveCap profile, one `BinCopyPool` per SKU, bin events and pickface intervals per station. It also carries `inst`, `horizon` and `pick_cap`, so helpers take only `state`. |
-| `init_state(inst, horizon, exo=None, ignore_pickcap=False)` | Initial state. `ExoState(lanes, blocks, moves, batch_start_time)` pre-occupies resources; it is used by decomposition. |
+| `init_state(inst, horizon, exo=None)` | Initial state. `ExoState(lanes, blocks, moves, batch_start_time)` pre-occupies resources; it is used by decomposition. |
 | `PlanScratch` | Tentative bookkeeping while planning one order at one station: pending and removed moves, pending copy commitments, the local pickface intervals, temporarily extended bins, new bins, shared picks and pick times. `apply_shared_pick` and `add_new_bin` are the two ways an order line gets served. |
 | `find_shared_bin(cands, k, t_cursor, state, s, sc)` | Best existing or tentative visit of SKU k that the order can pick from. The order may wait at most `rt[k]`. It either fits inside the presence window (respecting PickCap via `find_pick_slot`) or extends the window, if the picker is ready by its end and the extended presence still respects pickface, copy, MoveCap and horizon limits (`_can_extend_bin_event`). |
 | `earliest_feasible_fetch(k, t, state, sc)` | Earliest fetch start given copy availability (including tentative commitments) and MoveCap |
@@ -152,7 +158,10 @@ Keeps an insertion plan of every unscheduled order at every station. It repeated
 ```
 
 where `regret_k` is the sum of the score gaps of the k−1 next-best stations.
-- `tiebreaker` is one of `sharing_degree`, `sum_rt_asc` (−Σrt) or `best_score`.
+- `tiebreaker` is one of `sum_rt_asc` (−Σrt, **default**), `sharing_degree` or `best_score`. The last two always give
+  identical results (see KNOWN_ISSUES).
+- Exact ties go to the first candidate in order-id order. Unscheduled orders are kept in an insertion-ordered dict, so
+  results never depend on hash-table order.
 - After a commit, plans are refreshed only where they can change (`use_lazy=True`):
   - orders sharing an SKU with the committed order are re-planned at all stations;
   - every other order is re-planned at the committed station, plus any station whose cached plan overlaps the committed robot moves (MoveCap).
@@ -166,14 +175,17 @@ Parameters: `horizon, alpha, beta, regret_k, use_lazy, tiebreaker, exo`.
 
 ### Partitioned RDI, the "decomposition RDI" (`run_partitioned_rdi`)
 1. Assign orders to stations. `partition` is one of:
-   - `"random"` (global RNG; `seed` sets it)
-   - `"similarity"`
+   - `"random"` (local `random.Random(seed)`, default `seed=0`)
+   - `"similarity"` (random seed order, same RNG)
    - `"load_balanced"` (LPT on picking workload)
    - an explicit `{station_index: [orders]}`, e.g. from the RL policy
-2. Split MoveCap with `distribute_movecap`; the remainder goes to the stations with the most orders.
-3. Run RDI independently on each single-station subinstance (horizon 50000) and stitch the results.
+   Named methods only use the first `min(|S|, MoveCap)` stations (`active_station_count`), so every used station gets a robot.
+2. Split MoveCap with `distribute_movecap`; the remainder goes to the stations with the most orders. With an explicit
+   assignment, a station left with MoveCap 0 is not solved: a warning is issued, its orders stay unscheduled and the station is infeasible.
+3. Run RDI independently on each single-station subinstance and stitch the results.
+4. Check the cross-station copy limits `N[k]`. If any is exceeded, warn and set `feasible = False`.
 
-`meta`: `station_feasible`, `assignment` (station → orders), `partition_time`.
+`meta`: `station_feasible`, `assignment` (station → orders), `partition_time`, `copy_conflicts`.
 This is the heuristic-only counterpart of `decomposition.solve_station_decomposition`, which solves each part by CP.
 
 ### CFSS: Cluster-First Schedule-Second (`run_cfss`)
@@ -182,21 +194,9 @@ This is the heuristic-only counterpart of `decomposition.solve_station_decomposi
 3. Assign clusters to the station with the least rt mass. Multi-order clusters go first, then singletons, each group by mass descending.
 4. Interleave: repeatedly take the station whose earliest lane frees first and commit its pending order with the best SGC plan.
 
-Parameters: `horizon, alpha, beta, sim_threshold, max_cluster_orders, normalize_similarity`.
-
-### GBS: Global Bin Scheduling (`run_gbs`)
-A bin-centred heuristic.
-1. Partition orders over stations (SKU-overlap gain minus load).
-2. Per station, seed the lanes with overlapping orders.
-3. Repeatedly schedule the best "bin task": one visit of SKU k serving every active order that needs it.
-
-Rules:
-- `max_sharing`: n_sharing·(rt+rt_ret)
-- `critical_path`: the largest remaining work among the orders served
-- `readiness_weighted`: max_sharing − pickface idle gap
-- `adaptive`: the best feasible result of the three, by `alpha*C_max + beta*flow`
-
-Parameters: `horizon, rule, alpha, beta`. **Ignores PickCap; see KNOWN_ISSUES.**
+Parameters: `horizon, alpha, beta (default 1.0), sim_threshold (0.1), max_cluster_orders (4), normalize_similarity`.
+Plans use the SGC planner, so MoveCap and PickCap hold. Clusters and pending orders are visited in a fixed order, so the
+result is deterministic.
 
 ---
 
@@ -224,8 +224,8 @@ Parameters: `horizon, rule, alpha, beta`. **Ignores PickCap; see KNOWN_ISSUES.**
 
 ## Verifying behaviour: the equivalence harness
 
-`tests/regression/equivalence.py` checks the refactored code against a reference commit (default `f391800`, the last
-commit before the refactor) **exactly**. It runs every case with both versions and compares:
+`tests/regression/equivalence.py` checks the working tree against a reference commit **exactly**. The default
+reference is `HEAD`; `f391800` is the last commit before the refactor. It runs every case with both versions and compares:
 - feasibility, makespan, moves;
 - all order assignments, bin events (in list order, including copy ids and pick intervals) and pick events;
 - `validate_solution` and `validate_warmstart` output;
@@ -233,13 +233,18 @@ commit before the refactor) **exactly**. It runs every case with both versions a
 - benchmark metrics.
 
 ```bash
-.venv/bin/python tests/regression/equivalence.py              # all cases (~3 min with 8 workers)
+.venv/bin/python tests/regression/equivalence.py              # working tree vs. HEAD (~3 min with 8 workers)
+.venv/bin/python tests/regression/equivalence.py --ref f391800   # vs. the pre-refactor code (legacy adapter)
 .venv/bin/python tests/regression/equivalence.py --filter pkl- --jobs 1   # subset, sequential timing
 ```
 
 How it runs:
 - The old side runs in a temporary `git worktree` of the reference commit; its results are cached in `tests/regression/.cache/`.
-- The case grid lives in `tests/regression/cases.py`: 108 generated instances (stations × lanes × orders × MoveCap × {normal, tight} horizon), PickCap = 2 variants and 3 real precalculated instances. Together that is 2259 cases covering every heuristic and parameter variant.
+  For references that already contain `heuristics/`, both sides use the same adapter. For older references
+  (≤ `f391800`), a legacy adapter calls the removed modules.
+- The case grid lives in `tests/regression/cases.py`: 108 generated instances (stations × lanes × orders × MoveCap {3, 20, 1000} × {normal, tight} horizon), PickCap = 2 variants and 3 real precalculated instances. Together that is 1899 cases covering every heuristic and parameter variant.
+- Cases pass their parameters explicitly, so a change of *defaults* only shows up in cases that rely on defaults
+  (`cfss`, `rdi_beta`, `rdi_exo`, partitioned and benchmark cases).
 - AMA has no old reference because it crashed at the reference commit. It is covered by `test_ama_is_best_of_sgc_runs` and by the default-rule SGC equality.
 
 When you **intentionally** change heuristic behaviour (e.g. fix a known issue), the harness will report the affected

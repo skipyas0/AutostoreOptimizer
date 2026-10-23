@@ -23,8 +23,8 @@ This file maps the top-level code. Heuristic internals are in
 | `O` | orders, each a list of SKUs | `inst.O`, `inst.orders_req` |
 | `rt[k]`, `rt_ret[k]` | robot fetch / return time of a bin of SKU k | `inst.rt`, `inst.rt_ret` |
 | `p[k]` | pick time per order line | `inst.p` |
-| MoveCap | max simultaneous robot moves (fetch + return), global | `inst.movecap` (None = ∞) |
-| PickCap | max orders picking from one presented bin simultaneously | `inst.pickcap` (default 1) |
+| MoveCap | max simultaneous robot moves (fetch + return), global | `inst.movecap` (required int ≥ 1; use a large value for "uncapped") |
+| PickCap | max orders picking from one presented bin simultaneously | `inst.pickcap` (int ≥ 1, default 1) |
 
 A **bin visit** at station s consists of three intervals:
 - fetch `[fetch_start, fetch_end)`, length `rt[k]`;
@@ -92,7 +92,7 @@ See [HEURISTICS.md](HEURISTICS.md).
 - `run_heuristic(name, inst, **params) -> HeuristicSolution`
 - registry `HEURISTICS`
 - CLI: `python -m heuristics --list`
-- Algorithms: SGC, load-balanced SGC, AMA, RDI, partitioned RDI, CFSS, GBS.
+- Algorithms: SGC (± load balancing, ± single-item piggybacking), AMA, RDI, partitioned RDI, CFSS.
 
 ### Exact model
 | Module | Purpose |
@@ -100,7 +100,7 @@ See [HEURISTICS.md](HEURISTICS.md).
 | `cp_model.py` | docplex CP Optimizer model. `build_model(inst, add_symmetry_breaking, horizon, exo_*, batch_start_time, objective_func)` returns `(mdl, handles)`, where `handles` are the interval-variable dictionaries `I_os, I_os_lane, F, B, R, P, C, Block, U, …`. `inject_warmstart(sol, pick_events, mdl, handles)` turns a HeuristicSolution into a starting point. |
 | `cp_lns_core.cpp` + `setup.py` | The same model in C++ (CP Optimizer C++ API, pybind11). It avoids docplex overhead in the LNS loop. Build with `python setup.py mac` (macOS) or `python setup.py ubuntu` (Linux) to get the untracked `cp_lns_core*.so`. |
 | `cpp_cp_model.py` | Python wrapper with the same `build_model` / `inject_warmstart` interface as `cp_model.py`, plus `export_model` |
-| `cp_model_utils.py` | CP ↔ heuristic conversion (`cp_sol_to_solution`), solution diffs (`build_solve_dict`, `Diff`), utilisation time series, `.cpo` canonicalisation and comparison |
+| `cp_model_utils.py` | `CppSolveResult`, solution diffs (`build_solve_dict`, `Diff`), utilisation time series, `.cpo` canonicalisation and comparison |
 | `verify_cp_models.py` | Checks that the docplex and C++ models export identical `.cpo` |
 
 ### LNS matheuristic ("CP-based LNS", fix-and-optimize)
@@ -171,7 +171,7 @@ python matheuristic.py GEN42-4-4-5000-200-20 --backend cpp --runs 5
 python benchmark_models.py --num-instances 10 --methods all --skip-rl
 
 # verify the heuristics still match the reference commit exactly
-python tests/regression/equivalence.py --ref f391800
+python tests/regression/equivalence.py              # vs. HEAD; --ref <commit> for another baseline
 ```
 
 ---

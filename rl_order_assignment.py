@@ -616,7 +616,7 @@ def evaluate_assignment_reward(instance, actions):
         s_idx = min(s_idx, len(instance.S) - 1)
         station_assignments[s_idx].append(instance.O[o_idx])
 
-    sol = run_partitioned_rdi(instance, partition=station_assignments, horizon=50000)
+    sol = run_partitioned_rdi(instance, partition=station_assignments)
 
     M_k = []
     W_k = []

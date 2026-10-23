@@ -11,7 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 
-from heuristics import HEURISTICS, resolve, run_heuristic
+from heuristics import HEURISTICS, run_heuristic
 
 
 def _parse_value(v: str):
@@ -64,8 +64,7 @@ def main() -> None:
         )
     params = dict(kv.split("=", 1) for kv in args.param)
     params = {k: _parse_value(v) for k, v in params.items()}
-    if "partitioned_rdi" not in resolve(args.name):
-        params.setdefault("horizon", args.horizon)
+    params.setdefault("horizon", args.horizon)
 
     print(f"Stations={len(inst.S)} Lanes={len(inst.L)} Orders={len(inst.O)} "
           f"MoveCap={inst.movecap} PickCap={inst.pickcap}")

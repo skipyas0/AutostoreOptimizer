@@ -278,7 +278,7 @@ def run_rdi(
     beta: float = 0.0,
     regret_k: int = 2,
     use_lazy: bool = True,
-    tiebreaker: str = "sharing_degree",
+    tiebreaker: str = "sum_rt_asc",
     exo: ExoState | None = None,
 ) -> HeuristicSolution:
     """Regret-based Dynamic Insertion SGC. ``tiebreaker`` in TIEBREAKERS."""

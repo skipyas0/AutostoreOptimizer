@@ -140,13 +140,13 @@ def run_partitioned_rdi(
     inst: Instance,
     *,
     partition: str | dict[int, list[int]] = "load_balanced",
-    horizon: int = 50000,
+    horizon: int = 10000,
     seed: int = 0,
     alpha: float = 1.0,
     beta: float = 0.0,
     regret_k: int = 2,
     use_lazy: bool = True,
-    tiebreaker: str = "sharing_degree",
+    tiebreaker: str = "sum_rt_asc",
 ) -> HeuristicSolution:
     t0 = time.perf_counter()
     assignment = partition_orders(inst, partition, seed)
