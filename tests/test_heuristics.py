@@ -247,3 +247,51 @@ def test_from_cp_roundtrip(inst):
            {o: (s, a, b) for o, (s, _, a, b) in sol.order_assignments.items()}
     assert back.pick_events == sol.pick_events
     assert back.validate(inst, H) == []
+
+
+# ---------------------------------------------------------------------------
+# Partitioned RDI: zero-MoveCap stations, seeding, bin-copy conflicts
+# ---------------------------------------------------------------------------
+
+
+def test_partitioned_rdi_turns_off_zero_movecap_stations():
+    small = generate_data(num_stations=4, lanes_per_station=2, num_orders=16, num_skus=3200,
+                          seed=11, pick_touch_time=4, movecap=3)
+    for method in ("random", "similarity", "load_balanced"):
+        sol = run_partitioned_rdi(small, partition=method)
+        assert sol.meta["assignment"][small.S[3]] == []  # 4th station has no robot -> unused
+        assert all(sol.meta["station_feasible"].values())
+        assert set(sol.order_assignments) == set(small.O)
+    # explicit assignment that needs all 4 stations: the robot-less one is skipped, with a warning
+    rr = {i: small.O[i::4] for i in range(4)}
+    with pytest.warns(UserWarning, match="MoveCap 0"):
+        sol = run_partitioned_rdi(small, partition=rr)
+    assert not sol.feasible and list(sol.meta["station_feasible"].values()).count(False) == 1
+
+
+def test_partitioned_rdi_seeding_is_local_and_reproducible(inst):
+    import random
+
+    state = random.getstate()
+    a = run_partitioned_rdi(inst, partition="random")
+    b = run_partitioned_rdi(inst, partition="random", seed=0)
+    c = run_partitioned_rdi(inst, partition="random", seed=1)
+    assert random.getstate() == state  # global RNG untouched
+    assert a.meta["assignment"] == b.meta["assignment"]
+    assert a.meta["assignment"] != c.meta["assignment"]
+
+
+def test_partitioned_rdi_flags_copy_conflicts():
+    from instance import Instance
+
+    # one copy of SKU 0, two orders needing it on different stations at the same time
+    two = Instance(S=[0, 1], L=[0], K=[0, 1], orders_requirements={0: [0], 1: [0]},
+                   rt={0: 10, 1: 10}, p={0: 4, 1: 4}, N={0: 1, 1: 1}, movecap=4, seed=0)
+    with pytest.warns(UserWarning, match="bin-copy limit"):
+        sol = run_partitioned_rdi(two, partition={0: [0], 1: [1]})
+    assert all(sol.meta["station_feasible"].values())  # each station alone is fine...
+    assert not sol.feasible and sol.meta["copy_conflicts"] == 1  # ...but not together
+    cp_model = pytest.importorskip("cp_model")
+    mdl, handles = cp_model.build_model(two, add_symmetry_breaking=True, horizon=H)
+    with pytest.raises(ValueError):
+        sol.to_warmstart(mdl, handles)

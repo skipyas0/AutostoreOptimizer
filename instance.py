@@ -38,7 +38,7 @@ class Instance:
         self.N = N
         self._rt_ret = rt_ret if rt_ret is not None else dict(rt)
         # Capacities are always explicit integers; for "unlimited", pass a large number.
-        self._movecap = self._check_cap("movecap", movecap, minimum=0)
+        self._movecap = self._check_cap("movecap", movecap, minimum=1)
         self._pickcap = self._check_cap("pickcap", pickcap, minimum=1)
         self._seed = seed
 

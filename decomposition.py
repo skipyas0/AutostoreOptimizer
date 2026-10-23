@@ -9,6 +9,7 @@ from cp_model import build_model
 from datagen import generate_data
 from heuristics import ExoState, HeuristicSolution, run_partitioned_rdi, run_rdi, validate_warmstart
 from heuristics.partitioned_rdi import (  # noqa: F401  (re-exported for older imports)
+    active_station_count,
     create_load_balanced_partitions,
     create_random_partitions,
     create_similarity_partitions,
@@ -154,7 +155,7 @@ def solve_station_decomposition(
     batch_start_time=0,
     partition_method="random",
 ):
-    n_partitions = len(instance.S)
+    n_partitions = active_station_count(instance)  # stations without a robot (MoveCap < |S|) stay unused
     if partition_method == "load_balanced":
         partitions = create_load_balanced_partitions(instance, n_partitions)
     elif partition_method == "similarity":
@@ -403,7 +404,7 @@ def solve_2d_decomposition_spatial_first(instance, n_time_batches=5):
     Combines spatial and temporal decomposition by partitioning spatially first,
     then solving each station temporally.
     """
-    n_partitions = len(instance.S)
+    n_partitions = active_station_count(instance)  # stations without a robot (MoveCap < |S|) stay unused
     spatial_partitions = create_random_partitions(instance, n_partitions)
     workloads = [len(p) for p in spatial_partitions]
     station_movecaps = distribute_movecap(instance.movecap, n_partitions, workloads)
