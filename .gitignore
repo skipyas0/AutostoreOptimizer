@@ -31,3 +31,6 @@ param_exp
 *.json
 tests/regression/.cache
 *.bak
+
+# Warehouse editor/simulator web app (separate git repo)
+warehouse-sim/
