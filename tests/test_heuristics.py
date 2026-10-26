@@ -295,3 +295,71 @@ def test_partitioned_rdi_flags_copy_conflicts():
     mdl, handles = cp_model.build_model(two, add_symmetry_breaking=True, horizon=H)
     with pytest.raises(ValueError):
         sol.to_warmstart(mdl, handles)
+
+
+# ---------------------------------------------------------------------------
+# Bin-sharing options: wider share window, lambda reward, RDI lazy-cache fix
+# ---------------------------------------------------------------------------
+
+
+def _three_sku_state(share=None):
+    from instance import Instance
+    from heuristics.heuristic_utils import commit_plan, init_state
+    from heuristics.sgc import plan_order_at_station
+
+    # order 0 visits SKUs 1, 2, 0 (rt desc); its SKU-0 bin is present at [38, 42)
+    two = Instance(S=[0], L=[0, 1], K=[0, 1, 2], orders_requirements={0: [1, 2, 0], 1: [0]},
+                   rt={0: 10, 1: 30, 2: 20}, p={0: 4, 1: 4, 2: 4}, N={0: 1, 1: 1, 2: 1}, movecap=100, seed=0)
+    state = init_state(two, 1000, share=share)
+    plan = plan_order_at_station(0, 0, state, 1.0, 0.0, Rule("rt", True))
+    commit_plan(plan, state)
+    return state
+
+
+def test_find_shared_bin_respects_wider_limit():
+    from heuristics.heuristic_utils import PlanScratch, find_shared_bin
+
+    state = _three_sku_state()
+    ev0 = next(ev for ev in state.station_bin_events[0] if ev.sku == 0)
+    assert (ev0.presence_start, ev0.presence_end) == (38, 42)
+    sc = PlanScratch.for_station(state, 0)
+    # picker of order 1 ready at t=0: default window is rt[0] = 10 -> the bin (t=38) is too late
+    assert find_shared_bin(state.station_bin_events[0], 0, 0, state, 0, sc)[0] is None
+    # wider limit: share it right after order 0's pick, extending the presence
+    ev, start, ret_s, ret_e = find_shared_bin(state.station_bin_events[0], 0, 0, state, 0, sc, max_pick_start=50)
+    assert ev is ev0 and start == 42 and ret_s == 46
+
+
+@pytest.mark.parametrize("load_balanced", [False, True])
+def test_extended_share_window_shares_more_on_toy(load_balanced):
+    from instance import Instance
+
+    two = Instance(S=[0], L=[0, 1], K=[0, 1, 2], orders_requirements={0: [1, 2, 0], 1: [0]},
+                   rt={0: 10, 1: 30, 2: 20}, p={0: 4, 1: 4, 2: 4}, N={0: 1, 1: 1, 2: 1}, movecap=100, seed=0)
+    kw = dict(horizon=1000, order_rule=("order_size", True), sku_rule=("rt", True), load_balanced=load_balanced)
+    base = run_sgc(two, **kw)
+    wide = run_sgc(two, extend_share_window=True, **kw)
+    assert wide.validate(two, 1000) == []
+    assert wide.total_moves < base.total_moves  # order 1 rides on order 0's SKU-0 visit
+    assert wide.meta["extend_share_window"] is True
+
+
+def test_share_reward_score():
+    from heuristics.heuristic_utils import PlanScratch, ShareOptions
+
+    state = _three_sku_state(ShareOptions(reward=1.5))
+    sc = PlanScratch.for_station(state, 0)
+    ev0 = next(ev for ev in state.station_bin_events[0] if ev.sku == 0)
+    assert sc.score(state, 1.0, 0.0, 0, 50) == 50  # no shared pick -> plain makespan score
+    sc.apply_shared_pick(state, 0, 0, ev0, 42, 46, 56)
+    inst = state.inst
+    assert sc.score(state, 1.0, 0.0, 42, 46) == 46 - 1.5 * (inst.rt[0] + inst.rt_ret[0])
+
+
+def test_rdi_lazy_cache_keeps_movecap_with_extensions():
+    bm = pytest.importorskip("benchmark_models")
+    big = bm.generate_benchmark_instance(0, "small")
+    # used to produce "MoveCap violation: 5 > 4": a cached plan's extended shared-bin return was
+    # not considered when deciding which cached plans to re-plan
+    sol = run_rdi(big, extend_share_window=True, share_reward=2.0, legacy_share_bonus=0.0)
+    assert sol.validate(big) == []

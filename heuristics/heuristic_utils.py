@@ -22,6 +22,7 @@ from __future__ import annotations
 import heapq
 from collections import defaultdict
 from dataclasses import dataclass, field
+from typing import Callable
 
 from instance import Instance
 
@@ -188,6 +189,22 @@ class BinCopyPool:
 # ============================================================
 
 
+@dataclass(frozen=True)
+class ShareOptions:
+    """How the SGC/RDI planners treat bin sharing (all off = original behaviour).
+
+    extend_window: a shared pick may start up to the order's own best new-fetch pick
+        for that SKU (instead of at most rt[k] after the picker is ready).
+    reward: lambda; plan score -= lambda * sum over shared picks of (rt[k] + rt_ret[k])
+        (robot time saved by not fetching a new bin).
+    legacy_rt_p: weight of the older RDI bonus, score -= w * sum over shared picks of (rt[k] + p[k]).
+    """
+
+    extend_window: bool = False
+    reward: float = 0.0
+    legacy_rt_p: float = 0.0
+
+
 @dataclass
 class HeuristicState:
     """Committed partial schedule + instance/run parameters."""
@@ -205,12 +222,14 @@ class HeuristicState:
     lane_intervals: dict[tuple[int, int], list[tuple[int, int]]]  # (s, ln) -> [(start, end)]
     first_pick: dict[int, int]  # s -> earliest pick start at s
     last_pick: dict[int, int]  # s -> latest pick end at s
+    share: ShareOptions = field(default_factory=ShareOptions)
 
 
 def init_state(
     inst: Instance,
     horizon: int,
     exo: ExoState | None = None,
+    share: ShareOptions | None = None,
 ) -> HeuristicState:
     """Build the initial state, respecting exogenous resources and batch start time."""
     S, L, K, N = inst.S, inst.L, inst.K, inst.N
@@ -257,6 +276,7 @@ def init_state(
         lane_intervals=lane_intervals,
         first_pick={s: horizon + 1 for s in S},
         last_pick={s: 0 for s in S},
+        share=share or ShareOptions(),
     )
 
 
@@ -348,6 +368,17 @@ class PlanScratch:
         self.pending_moves.append((ev.return_start, ev.return_end))
         self.pending_copies[ev.sku].append((ev.copy_id, ev.return_end))
         self.pick_times[ev.sku] = ev.pick_intervals[0]
+
+    def score(self, state: HeuristicState, alpha: float, beta: float, start: int, end: int) -> float:
+        """alpha*end + beta*(end-start), minus the sharing bonuses configured in state.share."""
+        score = alpha * end + beta * (end - start)
+        opt = state.share
+        if opt.legacy_rt_p or opt.reward:
+            rt, rt_ret, p = state.inst.rt, state.inst.rt_ret, state.inst.p
+            ks = [k for (k, *_rest) in self.shared_picks]
+            bonus = opt.legacy_rt_p * sum(rt[k] + p[k] for k in ks) + opt.reward * sum(rt[k] + rt_ret[k] for k in ks)
+            score = score - bonus
+        return score
 
     def window(self, default: int) -> tuple[int, int]:
         """(order_start, order_end) spanned by this order's picks."""
@@ -475,12 +506,13 @@ def find_shared_bin(
     state: HeuristicState,
     s: int,
     scratch: PlanScratch,
+    max_pick_start: float | None = None,
 ) -> tuple[BinEvent | None, int | None, int | None, int | None]:
     """Find a bin event of SKU k (committed or tentative) whose presence can cover a pick.
 
-    A pick may wait at most rt[k] after t_cursor. The presence window may be
-    extended if the picker is ready by its current end (no dead air).
-    Returns (bin_event, pick_start, new_return_start, new_return_end) or all-None.
+    A shared pick may start at most at ``max_pick_start`` (default: t_cursor + rt[k]).
+    The presence window may be extended if the picker is ready by its current end
+    (no dead air). Returns (bin_event, pick_start, new_return_start, new_return_end) or all-None.
     """
     p, rt, rt_ret = state.inst.p, state.inst.rt, state.inst.rt_ret
     horizon, pick_cap = state.horizon, state.pick_cap
@@ -489,7 +521,7 @@ def find_shared_bin(
     best_ret_start = None
     best_ret_end = None
 
-    max_wait = rt[k]
+    limit = t_cursor + rt[k] if max_pick_start is None else max_pick_start
 
     for ev in candidates:
         if ev.sku != k:
@@ -499,13 +531,13 @@ def find_shared_bin(
         curr_pres_end, curr_ret_end = scratch.temp_bounds.get(ev_id, (ev.presence_end, ev.return_end))
 
         earliest = max(t_cursor, ev.presence_start)
-        if earliest > t_cursor + max_wait:
+        if earliest > limit:
             continue
 
         # 1. fit inside the current presence window
         if earliest + p[k] <= curr_pres_end:
             slot = find_pick_slot(ev_picks, earliest, p[k], curr_pres_end, pick_cap)
-            if slot is not None and slot <= t_cursor + max_wait and slot < best_start:
+            if slot is not None and slot <= limit and slot < best_start:
                 best_ev = ev
                 best_start = slot
                 best_ret_start = curr_pres_end
@@ -528,6 +560,25 @@ def find_shared_bin(
     if best_ev is None:
         return (None, None, None, None)
     return (best_ev, best_start, best_ret_start, best_ret_end)
+
+
+def share_pick_limit(
+    candidates: list[BinEvent],
+    k: int,
+    t_cursor: int,
+    state: HeuristicState,
+    new_fetch: Callable[[], BinEvent | None],
+) -> float | None:
+    """Upper bound on a shared pick's start for find_shared_bin (None = default rt[k] window).
+
+    With ShareOptions.extend_window, waiting for an existing bin of SKU k is allowed as long as the
+    pick starts no later than the order's own best new fetch of k would (``new_fetch()``, evaluated
+    lazily and only if a candidate bin of SKU k exists; infeasible fetch -> no limit).
+    """
+    if not state.share.extend_window or not any(ev.sku == k for ev in candidates):
+        return None
+    alt = new_fetch()
+    return max(t_cursor + state.inst.rt[k], alt.presence_start if alt is not None else float("inf"))
 
 
 def earliest_feasible_fetch(

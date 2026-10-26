@@ -16,6 +16,10 @@ plus timings). Default methods (same labels as before the heuristics refactor):
   6. Load-balanced Greedy (SGC)      heuristics: lb_sgc
   7. Standard Piggyback SGC          heuristics: sgc_singles
   8. Load-balanced Piggyback SGC     heuristics: lb_sgc_singles
+  9. Standard Share SGC              heuristics: sgc_share      (wider share window + lambda=1 reward)
+ 10. Load-balanced Share SGC         heuristics: lb_sgc_share
+ 11. Full Share RDI                  heuristics: rdi_share
+ 12. Load-balanced Share RDI         heuristics: partitioned_rdi_load_balanced_share
 
 ``--methods`` selects a subset by label number/registry name, or ``all`` to add
 EXTRA_METHODS (RDI tiebreakers, AMA, CFSS). All heuristics use horizon 10000.
@@ -249,10 +253,18 @@ def solution_metrics(
         if assignment is not None:
             orders = assignment.get(s, [])
         elif sol is not None:
-            orders = [o for o, (st, _, _, _) in sol.order_assignments.items() if st == s]
+            orders = [
+                o for o, (st, _, _, _) in sol.order_assignments.items() if st == s
+            ]
         else:
             orders = []
-        W_k.append(float(sum(instance.p.get(k, 0) for o in orders for k in instance.orders_req[o])))
+        W_k.append(
+            float(
+                sum(
+                    instance.p.get(k, 0) for o in orders for k in instance.orders_req[o]
+                )
+            )
+        )
 
         if station_feasible is not None:
             ok = station_feasible.get(s, True)
@@ -325,10 +337,20 @@ DEFAULT_METHODS: dict[str, Callable[[Instance], HeuristicSolution]] = {
     "8. Load-balanced Piggyback SGC": partial(
         run_heuristic, "lb_sgc_singles", horizon=BENCH_HORIZON
     ),
+    "9. Standard Share SGC": partial(run_heuristic, "sgc_share", horizon=BENCH_HORIZON),
+    "10. Load-balanced Share SGC": partial(run_heuristic, "lb_sgc_share", horizon=BENCH_HORIZON),
+    "11. Full Share RDI": partial(run_heuristic, "rdi_share", horizon=BENCH_HORIZON),
+    "12. Load-balanced Share RDI": partial(
+        run_heuristic, "partitioned_rdi_load_balanced_share", horizon=BENCH_HORIZON
+    ),
 }
 
 # Extra registry heuristics added by `--methods all` (or by name).
 EXTRA_METHODS = [
+    "sgc_share_window",
+    "rdi_share_window",
+    "rdi_share_reward",
+    "ama_two_phase_share",
     "rdi_sharing_degree",
     "rdi_best_score",
     "ama_two_phase",
@@ -481,16 +503,21 @@ def parse_args():
         help="Skip Full RDI (without decomposition) if speed is a concern on large instances.",
     )
     parser.add_argument(
+        "--skip-decomposition",
+        action="store_true",
+        help="Skip all decomposition if speed is a concern on large instances.",
+    )
+    parser.add_argument(
         "--skip-greedy",
         action="store_true",
-        help="Skip the Standard, Load-balanced and Piggyback SGC methods (5-8).",
+        help="Skip the Standard, Load-balanced, Piggyback and Share SGC methods (5-10).",
     )
     parser.add_argument(
         "--methods",
         nargs="*",
         default=None,
         help="Subset of methods: default labels' leading numbers (1-6), registry names "
-        "(e.g. sgc rdi cfss ama_two_phase), or 'all' (defaults + EXTRA_METHODS). Default: 1-8.",
+        "(e.g. sgc rdi cfss ama_two_phase), or 'all' (defaults + EXTRA_METHODS). Default: 1-12.",
     )
     parser.add_argument(
         "--scale",
@@ -543,14 +570,22 @@ def select_methods(args) -> dict[str, Callable[[Instance], HeuristicSolution]]:
                 methods[resolve(w)] = registry_method(w)
     if args.skip_full_rdi:
         methods.pop("4. Full RDI (No Decomposition)", None)
+        methods.pop("11. Full Share RDI", None)
     if args.skip_rdi:
         methods = {k: v for k, v in methods.items() if not is_rdi_method(k)}
+    if args.skip_decomposition:
+        key = "4. Full RDI (No Decomposition)"
+        rdi = methods.pop(key, None)
+        methods = {k: v for k, v in methods.items() if not is_rdi_method(k)}
+        methods.update({key: rdi})
     if args.skip_greedy:
         for label in (
             "5. Standard Full Greedy (SGC)",
             "6. Load-balanced Greedy (SGC)",
             "7. Standard Piggyback SGC",
             "8. Load-balanced Piggyback SGC",
+            "9. Standard Share SGC",
+            "10. Load-balanced Share SGC",
         ):
             methods.pop(label, None)
     return methods

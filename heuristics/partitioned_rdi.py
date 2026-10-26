@@ -147,7 +147,11 @@ def run_partitioned_rdi(
     regret_k: int = 2,
     use_lazy: bool = True,
     tiebreaker: str = "sum_rt_asc",
+    extend_share_window: bool = False,
+    share_reward: float = 0.0,
+    legacy_share_bonus: float = 0.5,
 ) -> HeuristicSolution:
+    """Partition orders over stations, run RDI per station (RDI parameters are passed through)."""
     t0 = time.perf_counter()
     assignment = partition_orders(inst, partition, seed)
     partition_time = time.perf_counter() - t0
@@ -176,6 +180,9 @@ def run_partitioned_rdi(
             regret_k=regret_k,
             use_lazy=use_lazy,
             tiebreaker=tiebreaker,
+            extend_share_window=extend_share_window,
+            share_reward=share_reward,
+            legacy_share_bonus=legacy_share_bonus,
         )
         station_feasible[s] = sub.feasible
         subs.append(sub)

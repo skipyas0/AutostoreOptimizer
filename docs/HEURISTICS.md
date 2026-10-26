@@ -45,10 +45,16 @@ CLI: `python -m heuristics --list`, `python -m heuristics <name> [--orders 40 ..
 | `sgc` | `run_sgc()` |
 | `lb_sgc` | `run_sgc(load_balanced=True)` |
 | `sgc_singles` / `lb_sgc_singles` | `run_sgc(piggyback_singles=True)` / `run_sgc(load_balanced=True, piggyback_singles=True)` |
+| `sgc_share` / `lb_sgc_share` | `run_sgc(extend_share_window=True, share_reward=1.0[, load_balanced=True])` |
+| `sgc_share_window` | `run_sgc(extend_share_window=True)` (ablation) |
 | `ama` / `ama_two_phase` | `run_ama(mode="full_grid" / "two_phase")` |
 | `ama_singles` / `ama_two_phase_singles` / `lb_ama_two_phase_singles` | `run_ama(..., piggyback_singles=True[, load_balanced=True])` |
+| `ama_two_phase_share` | `run_ama(mode="two_phase", extend_share_window=True, share_reward=1.0)` |
 | `rdi` / `rdi_sharing_degree` / `rdi_best_score` | `run_rdi(tiebreaker="sum_rt_asc" / "sharing_degree" / "best_score")` |
+| `rdi_share` | `run_rdi(extend_share_window=True, share_reward=1.0, legacy_share_bonus=0.0)` |
+| `rdi_share_window` / `rdi_share_reward` | ablations: window only (legacy bonus kept) / `share_reward=1.0, legacy_share_bonus=0.0` |
 | `partitioned_rdi_{random,similarity,load_balanced}` | `run_partitioned_rdi(partition=...)` (seed 0) |
+| `partitioned_rdi_load_balanced_share` | as above with the `rdi_share` options |
 | `cfss` / `cfss_normalized` | `run_cfss(normalize_similarity=False / True)` |
 
 Aliases such as `greedy`, `load_balanced_greedy` and `rdi_sgc` are accepted by `run_heuristic`
@@ -136,7 +142,9 @@ both build on these pieces and differ only in SKU sequencing, bin placement and 
      (sharing degree ascending), singles often come first and become anchors themselves, which still chains the other
      singles with the same SKU.
 
-Parameters: `horizon, alpha, beta, order_rule, sku_rule, load_balanced, piggyback_singles, exo`.
+Parameters: `horizon, alpha, beta, order_rule, sku_rule, load_balanced, piggyback_singles,
+extend_share_window, share_reward, exo`. The two sharing options are described under
+[Bin-sharing options](#bin-sharing-options-sgc-and-rdi).
 
 **Dispatching rules.** `Rule(attr, descending)` sorts by `Instance.order_attrs[o][attr]` or `Instance.sku_attrs[k][attr]`.
 - Order attributes: `sum_rt, order_size, sum_cycle, max_rt, sku_rarity, sku_contention, sharing_degree, min_copies`.
@@ -148,7 +156,7 @@ Runs SGC for several `(order_rule, sku_rule)` pairs and returns the best by `obj
 - `mode="full_grid"` runs all 192 pairs.
 - `mode="two_phase"` runs 16 order rules with the SKU rule fixed to demand desc, then the 12 SKU rules for the best order rule.
 - `meta["best_rule"]` holds the winner and `meta["runs"]` holds one record per SGC run.
-- `load_balanced` and `piggyback_singles` are passed to every SGC run.
+- `load_balanced`, `piggyback_singles`, `extend_share_window` and `share_reward` are passed to every SGC run.
 
 ### RDI: Regret-based Dynamic Insertion (`run_rdi`)
 Keeps an insertion plan of every unscheduled order at every station. It repeatedly commits the order with the largest key
@@ -171,7 +179,38 @@ Gap-filling planner (`plan_order_gap_filling`):
   remaining SKU into the **earliest pickface gap** (it does not only append after the last presence).
 - Score: `alpha*end + beta*(end-start) - 0.5 * Σ_shared (rt+p)`.
 
-Parameters: `horizon, alpha, beta, regret_k, use_lazy, tiebreaker, exo`.
+Parameters: `horizon, alpha, beta, regret_k, use_lazy, tiebreaker, extend_share_window, share_reward,
+legacy_share_bonus (default 0.5), exo`. `run_partitioned_rdi` passes all RDI parameters through.
+
+### Bin-sharing options (SGC and RDI)
+
+With PickCap = 1, orders can share a bin visit only *sequentially*. The second order picks after the first, and the
+bin's presence is extended by one pick. Two options make the planners share more. Both are off by default, which keeps
+the original behaviour; the options live in `ShareOptions` on the `HeuristicState`.
+
+- `extend_share_window` (bool). By default a shared pick may start at most `rt[k]` after the order's picker is
+  ready, assuming a fresh bin would arrive within `rt[k]`. That assumption fails when robots are the bottleneck. With
+  the option on, the limit becomes the start of the order's own best new-fetch pick for that SKU, computed by the
+  side-effect-free `_new_fetch_sgc` / `_new_fetch_gap` helpers and never earlier than the default. In words: wait for
+  an existing bin as long as that is no later than fetching a fresh one.
+- `share_reward` = λ. The plan score (lower is better) becomes `alpha*end + beta*span − λ·Σ_shared (rt[k] + rt_ret[k])`,
+  i.e. each shared pick is credited with the robot time it saves. For a fixed order this equals adding λ·(rt + rt_ret)
+  per *new* fetch, up to a per-order constant. RDI additionally keeps its older bonus
+  `legacy_share_bonus·Σ_shared (rt[k] + p[k])`, default 0.5 (added in `ff676ba`); the `*_share` variants set it to 0.
+
+On 20 benchmark instances (small scale, robot-bound), compared with each heuristic's default:
+
+| | makespan | pick/bin |
+|---|---|---|
+| SGC + wider window | −2.5% | 0.024 → 0.074 |
+| SGC + wider window + λ = 1 (`sgc_share`) | −2.9% | → 0.084 |
+| LB-SGC + wider window + λ = 1 (`lb_sgc_share`) | −1.8% | 0.019 → 0.061 |
+| RDI + wider window (legacy bonus kept) | −2.1% | 0.049 → 0.109 |
+| RDI + λ = 1 instead of the legacy bonus | −0.6% | → 0.069 |
+| RDI + wider window + λ = 1 (`rdi_share`) | −2.5% | → 0.133 |
+
+λ between 0.5 and 2 performs about the same; most of the gain comes from the wider window. See also KNOWN_ISSUES,
+"Sharing under PickCap = 1".
 
 ### Partitioned RDI, the "decomposition RDI" (`run_partitioned_rdi`)
 1. Assign orders to stations. `partition` is one of:

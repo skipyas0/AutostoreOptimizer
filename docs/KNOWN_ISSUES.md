@@ -6,6 +6,27 @@ records its effect, measured with `tests/regression/equivalence.py --ref <previo
 
 ## Open
 
+### Sharing under PickCap = 1 is structurally limited
+With PickCap = 1, sharing a bin visit means picking *after* the previous order, so the presence must be stretched
+while the next order's picker is ready.
+
+On benchmark instances (robot-bound: makespan is about 8.5× the pure picking time per station):
+- If every SKU's order lines shared one bin visit, pick/bin would reach about 0.45.
+- The planners reach about 0.025 (SGC) and 0.05 (RDI). With PickCap = |L| they reached about 0.05 and 0.10.
+
+The main reason is the forward-only, append-only construction. When a later order needs the same SKU, the bin has
+usually already left (67% of failed lookups for SGC, 84% for RDI); presence extension is rarely the blocker.
+
+The opt-in `extend_share_window` and `share_reward` options (see HEURISTICS.md) roughly triple sharing and cut
+makespan by about 3%. A structural fix would plan bin-centrically, e.g. serving all pending orders that need SKU k at
+a station from one visit (a generalisation of single-item piggybacking).
+
+### RDI's legacy share bonus
+`legacy_share_bonus` (default 0.5) credits `rt + p` per shared pick. It was added together with pickcap in `ff676ba`
+and was never calibrated. A shared pick saves `rt + rt_ret` of robot time, and no pick time under PickCap = 1.
+The `share_reward` (λ) option uses `rt + rt_ret`; the default keeps the legacy term so existing results stay
+reproducible.
+
 ### Partitioned RDI ignores cross-station bin-copy limits (now detected)
 
 Stations are solved independently, each assuming all `N[k]` copies are free, so the stitched solution can exceed
@@ -77,8 +98,9 @@ Partitioned RDI with zero orders returns an empty feasible solution.
 | Ties in RDI/CFSS were broken by set iteration order | Ordered dicts / sorted iteration (RDI results unchanged; CFSS ±0 on average) | `f509335` |
 | Partitioned RDI gave stations MoveCap 0 (all their orders failed) | Robot-less stations switched off (see Open) | `a5d4c62` |
 | Random partitions not reproducible (global RNG, consumed by imports) | Local `random.Random(seed)`, default `seed=0`; similarity partitions likewise | `a5d4c62` |
-| Defaults differed between entry points | RDI `tiebreaker="sum_rt_asc"` everywhere (registry `rdi`; `rdi_sharing_degree` and `rdi_best_score` remain as variants); CFSS defaults `beta=1.0, max_cluster_orders=4`; horizon 10000 everywhere (benchmark, partitioned RDI, RL reward, RL decomposition) | this commit |
-| Benchmark: infeasible monolithic solutions got `W_k = 0`; `movecap=None` crashed the metrics | `W_k` is always the assigned workload; infeasible stations get the 50000 makespan penalty; `movecap` can no longer be None | this commit |
+| Defaults differed between entry points | RDI `tiebreaker="sum_rt_asc"` everywhere (registry `rdi`; `rdi_sharing_degree` and `rdi_best_score` remain as variants); CFSS defaults `beta=1.0, max_cluster_orders=4`; horizon 10000 everywhere (benchmark, partitioned RDI, RL reward, RL decomposition) | `4d3f486` |
+| Benchmark: infeasible monolithic solutions got `W_k = 0`; `movecap=None` crashed the metrics | `W_k` is always the assigned workload; infeasible stations get the 50000 makespan penalty; `movecap` can no longer be None | `4d3f486` |
+| RDI lazy cache could commit a stale plan that broke MoveCap: when deciding which cached plans to re-plan after a commit, only *new* bin moves were compared, not the shifted return of an extended shared bin. It did not occur in the regression grid with default settings, but did with the sharing options (`MoveCap violation: 5 > 4`) | `_plan_moves` includes extended shared-bin returns; regression test `test_rdi_lazy_cache_keeps_movecap_with_extensions` | after `4d3f486` |
 
 ## Removed dead code
 

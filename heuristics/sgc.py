@@ -37,11 +37,13 @@ from heuristics.heuristic_utils import (
     HeuristicState,
     OrderPlan,
     PlanScratch,
+    ShareOptions,
     commit_plan,
     earliest_feasible_fetch,
     earliest_lane,
     find_shared_bin,
     init_state,
+    share_pick_limit,
     record_plan,
 )
 from heuristics.solution import HeuristicSolution
@@ -85,6 +87,37 @@ DEFAULT_SKU_RULE = Rule("demand", True)
 # ======================================================================
 
 
+def _new_fetch_sgc(
+    o: int, k: int, t_cursor: int, station_free: int, state: HeuristicState, sc: PlanScratch
+) -> BinEvent | None:
+    """Fetch a new copy of k so its presence starts once picker AND pickface are ready
+    (copy availability + MoveCap permitting). Does not modify sc; None if infeasible."""
+    rt, rt_ret, p = state.inst.rt[k], state.inst.rt_ret[k], state.inst.p[k]
+    try:
+        t_fetch, copy_id = earliest_feasible_fetch(k, max(t_cursor, station_free) - rt, state, sc)
+    except ValueError:
+        return None
+    fetch_end = t_fetch + rt
+    pick_end = fetch_end + p
+    if pick_end + rt_ret > state.horizon:
+        return None
+    return_start = sc.delay_move(state, pick_end, rt_ret)
+    if return_start + rt_ret > state.horizon:
+        return None
+    return BinEvent(
+        sku=k,
+        copy_id=copy_id,
+        fetch_start=t_fetch,
+        fetch_end=fetch_end,
+        presence_start=fetch_end,
+        presence_end=return_start,
+        return_start=return_start,
+        return_end=return_start + rt_ret,
+        orders_served=[o],
+        pick_intervals=[(fetch_end, pick_end)],
+    )
+
+
 def plan_order_at_station(
     o: int,
     s: int,
@@ -97,9 +130,9 @@ def plan_order_at_station(
     """Tentatively schedule order o at station s. Returns an OrderPlan or None if infeasible.
 
     ``last_sku`` (piggybacking) moves that SKU to the end of the sku_rule sequence.
+    Sharing behaviour (wait window, score reward) follows ``state.share``.
     """
     inst = state.inst
-    rt, rt_ret, p = inst.rt, inst.rt_ret, inst.p
     lane = earliest_lane(state, s)
     if lane is None:
         return None
@@ -116,53 +149,26 @@ def plan_order_at_station(
     sc = PlanScratch.for_station(state, s)
 
     for k in skus_sorted:
-        shared, pick_start, new_ret_start, new_ret_end = find_shared_bin(
-            state.station_bin_events[s] + sc.new_bin_events, k, t_cursor, state, s, sc
+        cands = state.station_bin_events[s] + sc.new_bin_events
+        limit = share_pick_limit(
+            cands, k, t_cursor, state, lambda: _new_fetch_sgc(o, k, t_cursor, current_station_free, state, sc)
         )
+        shared, pick_start, new_ret_start, new_ret_end = find_shared_bin(cands, k, t_cursor, state, s, sc, limit)
         if shared is not None:
             t_cursor, extended = sc.apply_shared_pick(state, s, k, shared, pick_start, new_ret_start, new_ret_end)
             if extended:
                 current_station_free = max(current_station_free, new_ret_start)
             continue
 
-        # --- new bin fetch: presence must start after picker AND pickface are ready
-        try:
-            desired_fetch = max(t_cursor, current_station_free) - rt[k]
-            t_fetch, copy_id = earliest_feasible_fetch(k, desired_fetch, state, sc)
-        except ValueError:
+        ev = _new_fetch_sgc(o, k, t_cursor, current_station_free, state, sc)
+        if ev is None:
             return None
-
-        fetch_end = t_fetch + rt[k]
-        pick_start = fetch_end
-        pick_end = pick_start + p[k]
-        return_start = pick_end
-        return_end = return_start + rt_ret[k]
-        if return_end > state.horizon:
-            return None
-        return_start = sc.delay_move(state, return_start, rt_ret[k])
-        return_end = return_start + rt_ret[k]
-        if return_end > state.horizon:
-            return None
-
-        t_cursor = pick_end
-        current_station_free = max(current_station_free, return_start)
-        sc.add_new_bin(
-            BinEvent(
-                sku=k,
-                copy_id=copy_id,
-                fetch_start=t_fetch,
-                fetch_end=fetch_end,
-                presence_start=fetch_end,
-                presence_end=return_start,
-                return_start=return_start,
-                return_end=return_end,
-                orders_served=[o],
-                pick_intervals=[(pick_start, pick_end)],
-            )
-        )
+        t_cursor = ev.pick_intervals[0][1]
+        current_station_free = max(current_station_free, ev.return_start)
+        sc.add_new_bin(ev)
 
     start, end = sc.window(t_order_start)
-    return sc.to_plan(o, s, best_lane, start, end, alpha * end + beta * (end - start))
+    return sc.to_plan(o, s, best_lane, start, end, sc.score(state, alpha, beta, start, end))
 
 
 # ======================================================================
@@ -206,7 +212,7 @@ def plan_single_from_bin(
         return None
     sc.apply_shared_pick(state, s, k, shared, pick_start, new_ret_start, new_ret_end)
     start, end = sc.window(t_ready)
-    return sc.to_plan(o, s, lane, start, end, alpha * end + beta * (end - start))
+    return sc.to_plan(o, s, lane, start, end, sc.score(state, alpha, beta, start, end))
 
 
 # ======================================================================
@@ -224,9 +230,16 @@ def run_sgc(
     sku_rule: Rule = DEFAULT_SKU_RULE,
     load_balanced: bool = False,
     piggyback_singles: bool = False,
+    extend_share_window: bool = False,
+    share_reward: float = 0.0,
     exo: ExoState | None = None,
 ) -> HeuristicSolution:
     """Sequential Greedy Construction with the given dispatching rules.
+
+    extend_share_window: wait for an existing bin of a SKU as long as the shared pick starts no
+    later than the order's own new fetch of that SKU would (default: at most rt[k] after the
+    picker is ready).
+    share_reward: lambda; plan score -= lambda * sum over shared picks of (rt[k] + rt_ret[k]).
 
     piggyback_singles: when an order is planned, the SKU wanted by the most unscheduled
     1-item orders goes last; once the order is committed, those 1-item orders run one
@@ -237,7 +250,7 @@ def run_sgc(
     """
     order_rule, sku_rule = Rule(*order_rule), Rule(*sku_rule)
     S, p, orders_req = inst.S, inst.p, inst.orders_req
-    state = init_state(inst, horizon, exo)
+    state = init_state(inst, horizon, exo, ShareOptions(extend_window=extend_share_window, reward=share_reward))
 
     order_attrs = inst.order_attrs
     sorted_orders = sorted(inst.O, key=lambda o: order_attrs[o][order_rule.attr], reverse=order_rule.descending)
@@ -320,6 +333,8 @@ def run_sgc(
             "order_rule": str(order_rule),
             "sku_rule": str(sku_rule),
             **({"piggyback_singles": True, "n_piggybacked": n_piggybacked} if piggyback_singles else {}),
+            **({"extend_share_window": True} if extend_share_window else {}),
+            **({"share_reward": share_reward} if share_reward else {}),
         },
     )
 
@@ -338,11 +353,14 @@ def run_ama(
     mode: str = "full_grid",
     load_balanced: bool = False,
     piggyback_singles: bool = False,
+    extend_share_window: bool = False,
+    share_reward: float = 0.0,
     verbose: bool = False,
 ) -> HeuristicSolution:
     """Adaptive Multi-Attribute SGC: run SGC per dispatching-rule pair, keep the best.
 
-    ``load_balanced`` / ``piggyback_singles`` are passed to every SGC run.
+    ``load_balanced``, ``piggyback_singles``, ``extend_share_window`` and ``share_reward``
+    are passed to every SGC run.
 
     ``meta["best_rule"]`` = (order_rule, sku_rule); ``meta["runs"]`` = one record per SGC run.
     """
@@ -355,6 +373,7 @@ def run_ama(
         sol = run_sgc(
             inst, horizon=horizon, alpha=alpha, beta=beta, order_rule=order_rule, sku_rule=sku_rule,
             load_balanced=load_balanced, piggyback_singles=piggyback_singles,
+            extend_share_window=extend_share_window, share_reward=share_reward,
         )
         obj = sol.objective(alpha, beta, inst.S)
         runs.append(

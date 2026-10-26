@@ -30,12 +30,14 @@ from heuristics.heuristic_utils import (
     HeuristicState,
     OrderPlan,
     PlanScratch,
+    ShareOptions,
     commit_plan,
     earliest_feasible_fetch,
     earliest_lane,
     find_shared_bin,
     init_state,
     record_plan,
+    share_pick_limit,
 )
 from heuristics.solution import HeuristicSolution
 from instance import Instance
@@ -93,9 +95,55 @@ def find_earliest_gap(intervals: list[tuple[int, int]], ready_time: int, duratio
 # ======================================================================
 
 
+def _new_fetch_gap(o: int, k: int, t_cursor: int, state: HeuristicState, sc: PlanScratch) -> BinEvent | None:
+    """Fetch a new copy of k into the earliest pickface gap at or after the picker is ready
+    (copy availability + MoveCap permitting). Does not modify sc; None if infeasible."""
+    rt, rt_ret, p = state.inst.rt[k], state.inst.rt_ret[k], state.inst.p[k]
+    # NOTE (time-based decomposition): rt is an *absolute* lower bound here (a fetch cannot
+    # start before t=0). With ExoState.batch_start_time > 0 the meaningful bound would be
+    # batch_start_time + rt. Harmless today because t_cursor >= batch_start_time and
+    # copy availability starts at batch_start_time, but revisit when tuning time decomposition.
+    desired_presence = max(t_cursor, rt)
+    while True:
+        gap_start = find_earliest_gap(sc.local_intervals, desired_presence, p)
+        desired_fetch = gap_start - rt
+        try:
+            t_fetch, copy_id = earliest_feasible_fetch(k, desired_fetch, state, sc)
+        except ValueError:
+            return None
+        if t_fetch > desired_fetch:
+            desired_presence = t_fetch + rt
+            continue
+
+        presence_start = t_fetch + rt
+        pick_end = presence_start + p
+        return_start = pick_end
+        if return_start + rt_ret > state.horizon:
+            return None
+        return_delayed = sc.delay_move(state, return_start, rt_ret)
+        if return_delayed != return_start:
+            return_start = return_delayed
+            if return_start + rt_ret > state.horizon:
+                return None
+            if gap_start != find_earliest_gap(sc.local_intervals, presence_start, return_start - presence_start):
+                desired_presence = presence_start + 1
+                continue
+        return BinEvent(
+            sku=k,
+            copy_id=copy_id,
+            fetch_start=t_fetch,
+            fetch_end=presence_start,
+            presence_start=presence_start,
+            presence_end=return_start,
+            return_start=return_start,
+            return_end=return_start + rt_ret,
+            orders_served=[o],
+            pick_intervals=[(presence_start, pick_end)],
+        )
+
+
 def plan_order_gap_filling(o: int, s: int, state: HeuristicState, alpha: float, beta: float) -> OrderPlan | None:
     inst = state.inst
-    rt, rt_ret, p = inst.rt, inst.rt_ret, inst.p
     lane = earliest_lane(state, s)
     if lane is None:
         return None
@@ -112,7 +160,9 @@ def plan_order_gap_filling(o: int, s: int, state: HeuristicState, alpha: float, 
         best_shared_k = None
         best_shared_res = (None, float("inf"), None, None)
         for k_cand in remaining_skus:
-            res = find_shared_bin(candidate_bins + sc.new_bin_events, k_cand, t_cursor, state, s, sc)
+            cands = candidate_bins + sc.new_bin_events
+            limit = share_pick_limit(cands, k_cand, t_cursor, state, lambda: _new_fetch_gap(o, k_cand, t_cursor, state, sc))
+            res = find_shared_bin(cands, k_cand, t_cursor, state, s, sc, limit)
             if res[0] is not None and res[1] < best_shared_res[1]:
                 best_shared_k, best_shared_res = k_cand, res
 
@@ -124,64 +174,15 @@ def plan_order_gap_filling(o: int, s: int, state: HeuristicState, alpha: float, 
 
         # 2. Otherwise fetch the highest-demand remaining SKU into the earliest pickface gap
         k = remaining_skus.pop(0)
-        # NOTE (time-based decomposition): rt[k] is an *absolute* lower bound here (a fetch cannot
-        # start before t=0). With ExoState.batch_start_time > 0 the meaningful bound would be
-        # batch_start_time + rt[k]. Harmless today because t_cursor >= batch_start_time and
-        # copy availability starts at batch_start_time, but revisit when tuning time decomposition.
-        desired_presence = max(t_cursor, rt[k])
-        while True:
-            gap_start = find_earliest_gap(sc.local_intervals, desired_presence, p[k])
-            desired_fetch = gap_start - rt[k]
-            try:
-                t_fetch, copy_id = earliest_feasible_fetch(k, desired_fetch, state, sc)
-            except ValueError:
-                return None
-            if t_fetch > desired_fetch:
-                desired_presence = t_fetch + rt[k]
-                continue
-
-            fetch_end = t_fetch + rt[k]
-            presence_start = fetch_end
-            pick_start = presence_start
-            pick_end = pick_start + p[k]
-            return_start = pick_end
-            return_end = return_start + rt_ret[k]
-            presence_end = return_start
-            if return_end > state.horizon:
-                return None
-
-            return_delayed = sc.delay_move(state, return_start, rt_ret[k])
-            if return_delayed != return_start:
-                return_start = return_delayed
-                return_end = return_start + rt_ret[k]
-                presence_end = return_start
-                if return_end > state.horizon:
-                    return None
-                if gap_start != find_earliest_gap(sc.local_intervals, presence_start, presence_end - presence_start):
-                    desired_presence = presence_start + 1
-                    continue
-            break
-
-        t_cursor = pick_end
-        sc.add_new_bin(
-            BinEvent(
-                sku=k,
-                copy_id=copy_id,
-                fetch_start=t_fetch,
-                fetch_end=fetch_end,
-                presence_start=presence_start,
-                presence_end=presence_end,
-                return_start=return_start,
-                return_end=return_end,
-                orders_served=[o],
-                pick_intervals=[(pick_start, pick_end)],
-            )
-        )
+        ev = _new_fetch_gap(o, k, t_cursor, state, sc)
+        if ev is None:
+            return None
+        t_cursor = ev.pick_intervals[0][1]
+        sc.add_new_bin(ev)
 
     start, end = sc.window(t_order_start)
-    # Reward shared picks by 50% of the saved retrieval + pick time
-    move_savings = sum(rt[k_sh] + p[k_sh] for (k_sh, *_rest) in sc.shared_picks)
-    return sc.to_plan(o, s, best_lane, start, end, alpha * end + beta * (end - start) - 0.5 * move_savings)
+    # score = alpha*end + beta*span - sharing bonuses (state.share: legacy 0.5*(rt+p), lambda*(rt+rt_ret))
+    return sc.to_plan(o, s, best_lane, start, end, sc.score(state, alpha, beta, start, end))
 
 
 # ======================================================================
@@ -202,10 +203,28 @@ def score_order_insertions(
     return c
 
 
-def _overlaps_moves(plan: OrderPlan, moves: list[tuple[int, int]]) -> bool:
+def _plan_moves(plan: OrderPlan) -> list[tuple[int, int]]:
+    """Robot moves a plan would add: fetch + return of its new bins, and the shifted return
+    of every shared bin whose presence it extends."""
+    moves = []
     for ev in plan.bin_events:
+        moves.append((ev.fetch_start, ev.fetch_end))
+        moves.append((ev.return_start, ev.return_end))
+    for _k, sh_ev, _ps, _pe, new_rs, new_re in plan.shared_picks:
+        if (new_rs, new_re) != (sh_ev.return_start, sh_ev.return_end):
+            moves.append((new_rs, new_re))
+    return moves
+
+
+def _overlaps_moves(plan: OrderPlan, moves: list[tuple[int, int]]) -> bool:
+    """Does any robot move of the (cached) plan overlap one of `moves`?
+
+    Must include extended returns of shared bins: before this was fixed, a cached plan whose
+    only conflicting move was such an extended return stayed cached and could break MoveCap.
+    """
+    for a, b in _plan_moves(plan):
         for ms, me in moves:
-            if max(ev.fetch_start, ms) < min(ev.fetch_end, me) or max(ev.return_start, ms) < min(ev.return_end, me):
+            if max(a, ms) < min(b, me):
                 return True
     return False
 
@@ -279,11 +298,22 @@ def run_rdi(
     regret_k: int = 2,
     use_lazy: bool = True,
     tiebreaker: str = "sum_rt_asc",
+    extend_share_window: bool = False,
+    share_reward: float = 0.0,
+    legacy_share_bonus: float = 0.5,
     exo: ExoState | None = None,
 ) -> HeuristicSolution:
-    """Regret-based Dynamic Insertion SGC. ``tiebreaker`` in TIEBREAKERS."""
+    """Regret-based Dynamic Insertion SGC. ``tiebreaker`` in TIEBREAKERS.
+
+    extend_share_window: wait for an existing bin of a SKU as long as the shared pick starts no
+    later than the order's own new fetch of that SKU would (default: at most rt[k] after the
+    picker is ready).
+    share_reward: lambda; plan score -= lambda * sum over shared picks of (rt[k] + rt_ret[k]).
+    legacy_share_bonus: weight of the original bonus, score -= w * sum over shared picks of (rt[k] + p[k]).
+    """
     O = inst.O
-    state = init_state(inst, horizon, exo)
+    share = ShareOptions(extend_window=extend_share_window, reward=share_reward, legacy_rt_p=legacy_share_bonus)
+    state = init_state(inst, horizon, exo, share)
     sharing_degrees = inst.sharing_degree
     sum_rts = {o: sum(inst.rt[k] for k in inst.req_sets[o]) for o in O}
 
@@ -332,5 +362,7 @@ def run_rdi(
         total_moves=sum(len(state.station_bin_events[s]) * 2 for s in inst.S),
         feasible=(len(unscheduled) == 0) and (makespan <= horizon),
         pick_events=pick_events,
-        meta={"heuristic": "rdi", "tiebreaker": tiebreaker, "regret_k": regret_k, "use_lazy": use_lazy},
+        meta={"heuristic": "rdi", "tiebreaker": tiebreaker, "regret_k": regret_k, "use_lazy": use_lazy,
+              "extend_share_window": extend_share_window, "share_reward": share_reward,
+              "legacy_share_bonus": legacy_share_bonus},
     )
