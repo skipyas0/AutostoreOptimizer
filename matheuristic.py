@@ -433,6 +433,11 @@ class Solver:
         return starting_point
 
     def run_solver(self):
+        # The time budget covers everything the run does: model construction,
+        # similarity matrix, strategy setup and all iterations. This matches the
+        # plain-CP baseline, whose budget also includes model extraction.
+        run_start_time = time.time()
+
         # run reset logic
         if self.experiment_config["backend"] == "docplex":
             self.mdl, self.handles, sp = prepare_model_docplex(
@@ -512,8 +517,9 @@ class Solver:
         old_freeze_constraints = []
 
         # start iterations
-        run_start_time = time.time()
         self.vlg.log_run_start(num_variables, var_to_idx, sp)
+        setup_time = time.time() - run_start_time
+        logger.info(f"Setup time before first iteration: {setup_time:.1f}s")
 
         n_iters = (
             self.experiment_config["iters"]
