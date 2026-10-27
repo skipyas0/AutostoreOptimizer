@@ -6,6 +6,26 @@ records its effect, measured with `tests/regression/equivalence.py --ref <previo
 
 ## Open
 
+### Subproblem LNS: shared bin visits
+In subproblem mode (`--lns-model subproblem`, `subproblem.py`) a bin visit is frozen as soon as it serves at least one
+frozen order. Its fetch, presence and return become fixed intervals in the subproblem. Two consequences:
+- **Active orders cannot join a frozen visit.** In the full-model LNS an active order can still pick from a visit
+  that also serves frozen orders (the visit may move as long as it covers the frozen picks). In a subproblem it
+  needs a new visit, so sharing with frozen orders is never created, and the subproblem never removes a fetch by
+  merging into one.
+- **The incumbent may not be representable.** If an active order currently picks from a frozen visit, its old pick
+  is dropped from the warm start, and the subproblem must give it a new visit. The incumbent's objective may then be
+  unreachable inside the subproblem. The frozen visit itself stays unchanged, so it is never shortened either.
+
+How often: rare on the benchmark instances (about 2 000 bin visits for about 2 010 order lines on the 600-order
+instances, so almost no sharing). Common on instances with few SKUs: in `tests/test_subproblem.py` (24 orders, 60
+SKUs) most random neighbourhoods contain such an order. The number per iteration is in `FrozenContext.shared_picks`
+and is logged at debug level.
+
+Possible fixes: close each neighbourhood under sharing (add every frozen order that shares a visit with an active
+order, as `_close_under_sharing` in the tests does), or pass frozen visits that serve active orders as joinable
+"exo visits" with fixed fetch/return but open picks.
+
 ### Sharing under PickCap = 1 is structurally limited
 With PickCap = 1, sharing a bin visit means picking *after* the previous order, so the presence must be stretched
 while the next order's picker is ready.

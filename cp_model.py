@@ -16,6 +16,8 @@ def build_model(
     exo_moves: list = None,  # list of (start, end) for F/R moves):
     batch_start_time: int = 0,
     objective_func: str = "makespan",
+    exo_station_bins: dict = None,  # station -> list of (start, end) bin presences
+    obj_offsets=None,  # subproblem.ObjectiveOffsets: frozen part of every KPI
 ):
     """
     Intervals per (s,k,e):
@@ -36,9 +38,17 @@ def build_model(
     exo_lanes = exo_lanes or defaultdict(list)
     exo_blocks = exo_blocks or defaultdict(list)
     exo_moves = exo_moves or []
+    exo_station_bins = exo_station_bins or {}
 
     mdl = CpoModel()
     O = sorted(orders_req.keys())
+
+    # Fixed window [first start, last end] of the frozen orders at each station.
+    # Added to the station-level spans so idle time / wages see the whole station.
+    exo_window = {}
+    if obj_offsets is not None:
+        for s, (st, en) in obj_offsets.station_window.items():
+            exo_window[s] = mdl.interval_var(start=st, end=en, name=f"exo_win_{s}")
 
     # Block out the past so the solver cannot backfill into previous batches
     if batch_start_time > 0:
@@ -215,6 +225,11 @@ def build_model(
     # (1) Exactly one bin present at any station s at any time
     for s in S:
         bins_here = [B[(s, k, e)] for k in active_K for e in range(U[k])]
+        # Bins of frozen visits still occupy the station's port
+        for st, en in exo_station_bins.get(s, []):
+            bins_here.append(
+                mdl.interval_var(start=st, end=en, name=f"exo_bin_{s}_{st}")
+            )
         if len(bins_here) >= 2:
             mdl.add(mdl.no_overlap(bins_here))
 
@@ -265,12 +280,19 @@ def build_model(
     station_shift_cost = {}
 
     for s in S:
+        station_members = [I_os[(o, s)] for o in O]
+        if s in exo_window:
+            station_members.append(exo_window[s])
+
         # Station is used (1) if at least one order is assigned to it, else (0)
-        is_used[s] = mdl.max([mdl.presence_of(I_os[(o, s)]) for o in O])
+        if s in exo_window:
+            is_used[s] = 1  # frozen orders already run here
+        else:
+            is_used[s] = mdl.max([mdl.presence_of(iv) for iv in station_members])
 
         # Shift bounds (default values protect absent intervals from corrupting min/max)
-        s_start = mdl.min([mdl.start_of(I_os[(o, s)], horizon) for o in O])
-        s_end = mdl.max([mdl.end_of(I_os[(o, s)], 0) for o in O])
+        s_start = mdl.min([mdl.start_of(iv, horizon) for iv in station_members])
+        s_end = mdl.max([mdl.end_of(iv, 0) for iv in station_members])
 
         shift_len[s] = mdl.integer_var(0, horizon, name=f"shift_len_{s}")
         station_shift_cost[s] = mdl.integer_var(0, horizon, name=f"shift_cost_{s}")
@@ -368,6 +390,9 @@ def build_model(
 
     # --- objective (makespan over station windows) ---
     per_order_end = [mdl.max([mdl.end_of(I_os[(o, s)]) for s in S]) for o in O]
+    if obj_offsets is not None and obj_offsets.makespan_lb > 0:
+        # Frozen orders end no earlier than this
+        per_order_end.append(obj_offsets.makespan_lb)
     makespan = mdl.max(per_order_end)
 
     # --- objective (number of bin fetches) ---
@@ -378,13 +403,23 @@ def build_model(
     # --- objective (total order flow time) ---
     total_flow_time = mdl.sum([mdl.end_of(I_os[(o, s)]) for o in O for s in S])
 
+    if obj_offsets is not None and obj_offsets.bin_fetches:
+        num_bin_fetches = num_bin_fetches + obj_offsets.bin_fetches
+    if obj_offsets is not None and obj_offsets.total_flow_time:
+        total_flow_time = total_flow_time + obj_offsets.total_flow_time
+
     # --- objective (idle time & max picks) ---
     station_spans = []
     station_idles = []
     station_pick_counts = []
     for s in S:
-        station_span = mdl.interval_var(optional=True, name=f"station_span_{s}")
-        mdl.add(mdl.span(station_span, [I_os[(o, s)] for o in O]))
+        station_span = mdl.interval_var(
+            optional=s not in exo_window, name=f"station_span_{s}"
+        )
+        span_members = [I_os[(o, s)] for o in O]
+        if s in exo_window:
+            span_members.append(exo_window[s])
+        mdl.add(mdl.span(station_span, span_members))
         station_spans.append(station_span)
 
         sum_pick_durations = mdl.sum(
@@ -393,14 +428,16 @@ def build_model(
             for k in orders_req[o]
             for e in range(U[k])
         )
-        station_idles.append(mdl.length_of(station_span) - sum_pick_durations)
-
         pick_count = mdl.sum(
             mdl.presence_of(P[(o, s, k, e)])
             for o in O
             for k in orders_req[o]
             for e in range(U[k])
         )
+        if obj_offsets is not None and obj_offsets.station_pick_count.get(s, 0):
+            sum_pick_durations = sum_pick_durations + obj_offsets.station_pick_time[s]
+            pick_count = pick_count + obj_offsets.station_pick_count[s]
+        station_idles.append(mdl.length_of(station_span) - sum_pick_durations)
         station_pick_counts.append(pick_count)
 
     idle_time = mdl.sum(station_idles)
@@ -629,7 +666,7 @@ def _compute_lane_remap(solution, S, L):
     return lane_remap
 
 
-def inject_warmstart(solution, pick_events: dict, mdl, handles):
+def inject_warmstart(solution, pick_events: dict, mdl, handles, remap_lanes: bool = True):
     """Build a CpoStartingPoint from a heuristic Solution.
 
     Parameters
@@ -642,6 +679,10 @@ def inject_warmstart(solution, pick_events: dict, mdl, handles):
         The ``CpoModel`` returned by ``build_model`` for the *same* problem instance.
     handles:
         The handles dict returned alongside *mdl* by ``build_model``.
+    remap_lanes:
+        Relabel lanes per station so the lane symmetry-breaking constraint holds.
+        Must be False for LNS subproblems: they have no symmetry breaking, and
+        relabelling would move orders onto lanes blocked by frozen orders.
 
     Returns a ``CpoStartingPoint`` ready to pass as
     ``mdl.solve(starting_point=sp, ...)``.
@@ -657,7 +698,7 @@ def inject_warmstart(solution, pick_events: dict, mdl, handles):
     U = handles["U"]
 
     # --- 0. Remap lanes to satisfy symmetry breaking constraint (A) ---
-    lane_remap = _compute_lane_remap(solution, S, L)
+    lane_remap = _compute_lane_remap(solution, S, L) if remap_lanes else {}
 
     # --- 1. Order windows and assignments ---
     for o in O:

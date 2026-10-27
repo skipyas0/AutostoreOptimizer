@@ -12,6 +12,7 @@ from loguru import logger
 
 import cp_model as docplex_model
 import cpp_cp_model
+import subproblem
 from heuristics import HeuristicSolution, validate_solution
 from cp_model_utils import (
     CppSolveResult,
@@ -21,6 +22,7 @@ from freezing_utils import (
     FreezeManager,
     create_partial_starting_point,
     generate_freeze_constraints,
+    get_associated_indices,
     get_optimized_set,
 )
 from instance import Instance
@@ -169,6 +171,39 @@ def prepare_model_cpp(config, instance, heur_sol, objective_func):
     )
 
 
+def prepare_model_subproblem(config, instance, heur_sol):
+    """Subproblem LNS: name-only handles for the full model, no full CP model.
+
+    Each iteration builds its own reduced model (see subproblem.py), so the full
+    model is never built or extracted.
+    """
+    handles = cpp_cp_model.build_handles(instance, config["horizon"])
+    heur_sol.check_warmstart(handles)
+    mock_sp = docplex_model.inject_warmstart(
+        heur_sol, heur_sol.pick_events, cpp_cp_model.MockCpoModel(), handles
+    )
+    return (
+        None,
+        handles,
+        CppSolveResult(
+            {
+                "status": "Feasible",
+                "objective": heur_sol.makespan,
+                "var_solutions": mock_sp.state_dict,
+                "kpis": {
+                    "makespan": heur_sol.makespan,
+                    "bin_fetches": sum(
+                        len(events) for events in heur_sol.bin_events.values()
+                    ),
+                    "total_flow_time": sum(
+                        end for s, ln, start, end in heur_sol.order_assignments.values()
+                    ),
+                },
+            }
+        ),
+    )
+
+
 class Solver:
     def __init__(self, experiment_config, instance_config=None, instance_path=None):
         (
@@ -185,6 +220,7 @@ class Solver:
         self.severity = 1
         self.stagnation_count = 0
         self.experiment_config = experiment_config
+        self.subproblem_mode = experiment_config.get("lns_model", "full") == "subproblem"
         self.cycling_schedule = []
         for phase in self.experiment_config["cp_objective_phase_schedule"]:
             if phase == "m":
@@ -213,7 +249,13 @@ class Solver:
         if target == self.cp_obj:
             return  # already have the correct objective
 
-        if self.experiment_config["backend"] == "docplex":
+        if self.subproblem_mode:
+            # Every subproblem is built with the current objective
+            logger.info(
+                f"Changing objective to '{target}', cycle index {self.cycle_ix}"
+            )
+            self.cp_obj = target
+        elif self.experiment_config["backend"] == "docplex":
             # 1. Safely remove the current objective from the model
             current_obj = mdl.get_objective()
             if current_obj is not None:
@@ -432,6 +474,56 @@ class Solver:
             )
         return starting_point
 
+    def solve_subproblem(self, active_orders, to_optimize, var_to_idx, strat_idx, impr_bound):
+        """Extract, build, solve and merge one subproblem, logging each stage's time."""
+        cfg = self.experiment_config
+        backend = cfg["backend"]
+        ctx = subproblem.extract_context(
+            self.current_solution, self.handles, self.instance, active_orders
+        )
+        skip = subproblem.violates_bound(ctx, self.cp_obj, impr_bound)
+        if not skip:
+            sub_mdl, sub_handles = subproblem.build_submodel(
+                ctx, backend, self.instance_config["horizon"], self.cp_obj
+            )
+        self.vlg.add_stat_to_current(
+            "constr_generate_time", self.vlg.time_diff_with_overwrite()
+        )
+        self.vlg.log_freeze_constr(to_optimize, var_to_idx, strat_idx)
+        if ctx.shared_picks:
+            logger.debug(
+                f"{len(ctx.shared_picks)} active pick(s) on frozen shared bin visits"
+            )
+
+        self.vlg.time_from_here()
+        if skip:
+            raw, progress = subproblem.infeasible_result(), []
+        else:
+            raw, progress = subproblem.solve_submodel(
+                sub_mdl, sub_handles, backend, self.cp_obj, impr_bound, cfg,
+                self.progress_callback,
+            )
+        self.vlg.log_solve_time(raw)
+
+        self.vlg.time_from_here()
+        if skip:
+            sol = raw
+        else:
+            sol = subproblem.to_full_result(
+                self.current_solution, ctx, raw, sub_handles, self.handles,
+                backend, self.cp_obj,
+            )
+            if cfg.get("validate_merges") and sol.is_solution():
+                problems = subproblem.check_merged(
+                    sol, self.handles, self.instance, self.instance_config["horizon"]
+                )
+                if problems:
+                    raise RuntimeError(
+                        f"Merged subproblem solution is invalid: {problems[:5]}"
+                    )
+        self.vlg.add_stat_to_current("merge_time", self.vlg.time_diff_with_overwrite())
+        return sol, progress
+
     def run_solver(self):
         # The time budget covers everything the run does: model construction,
         # similarity matrix, strategy setup and all iterations. This matches the
@@ -439,7 +531,11 @@ class Solver:
         run_start_time = time.time()
 
         # run reset logic
-        if self.experiment_config["backend"] == "docplex":
+        if self.subproblem_mode:
+            self.mdl, self.handles, sp = prepare_model_subproblem(
+                self.instance_config, self.instance, self.heur_sol
+            )
+        elif self.experiment_config["backend"] == "docplex":
             self.mdl, self.handles, sp = prepare_model_docplex(
                 self.instance_config,
                 self.instance,
@@ -457,6 +553,7 @@ class Solver:
         if (
             self.experiment_config["delta_freezing"]
             and self.experiment_config["backend"] != "cpp"
+            and not self.subproblem_mode
         ):
             self.freeze_manager = FreezeManager(
                 self.mdl,
@@ -486,13 +583,17 @@ class Solver:
 
         # prepare variable index sorted look-up for unfrozen set logging
         var_to_idx, num_variables = sort_variables(
-            self.mdl, sp, self.experiment_config["backend"], self.handles
+            self.mdl,
+            sp,
+            "cpp" if self.subproblem_mode else self.experiment_config["backend"],
+            self.handles,
         )
 
         # Listener/callback used to capture every solution discovered per subproblem.
         if self.experiment_config["backend"] == "docplex":
             self.progress_callback = IterationProgressCallback()
-            self.mdl.add_solver_callback(self.progress_callback)
+            if not self.subproblem_mode:  # subproblems attach it to each new model
+                self.mdl.add_solver_callback(self.progress_callback)
         else:
             self.progress_callback = None
 
@@ -553,12 +654,18 @@ class Solver:
             self.vlg.log_strategy(strat_name, strat_idx)
 
             # create to_optimize set with graph traversal
+            if self.subproblem_mode:
+                active_orders = get_associated_indices(
+                    self.handles, self.current_solution, strategy_results
+                )[0]
             to_optimize = get_optimized_set(
                 self.handles, self.current_solution, strategy_results
             )
 
             # generate freeze constraints from the to_optimize set
-            if self.experiment_config["backend"] == "cpp":
+            if self.subproblem_mode:
+                pass  # frozen part is passed to the subproblem as fixed data below
+            elif self.experiment_config["backend"] == "cpp":
                 to_optimize_names = {v.get_name() for v in to_optimize}
 
                 frozen_names, frozen_p, frozen_s, frozen_e = [], [], [], []
@@ -611,7 +718,8 @@ class Solver:
                 )
 
             # create starting point for the next iteration
-            starting_point = self.get_starting_point(to_optimize)
+            if not self.subproblem_mode:
+                starting_point = self.get_starting_point(to_optimize)
 
             cycle_per = self.experiment_config["cp_objective_phase_duration"]
             if cycle_per > 0 and (i + 1) % cycle_per == 0:
@@ -644,7 +752,11 @@ class Solver:
                 ):
                     impr_bound = int(self.best_max_picks - 1)
 
-            if self.experiment_config["backend"] == "docplex":
+            if self.subproblem_mode:
+                sol, progress = self.solve_subproblem(
+                    active_orders, to_optimize, var_to_idx, strat_idx, impr_bound
+                )
+            elif self.experiment_config["backend"] == "docplex":
                 # set iteration starting point
                 self.mdl.set_starting_point(starting_point)
                 # add and remove freeze constraints
@@ -699,7 +811,8 @@ class Solver:
                 raise ValueError(self.experiment_config["backend"])
 
             # log solution and run eps-greedy
-            self.vlg.log_solve_time(sol)
+            if not self.subproblem_mode:  # logged inside solve_subproblem
+                self.vlg.log_solve_time(sol)
             self.vlg.log_discovered_solutions(progress)
             prev_solution = self.current_solution
             status = self.rrt_acceptance(sol, sol.get_solve_status())
@@ -949,6 +1062,24 @@ if __name__ == "__main__":
         help="Exit iteration after finding the first solution (SolutionLimit=1)",
     )
 
+    parser.add_argument(
+        "--lns-model",
+        type=str,
+        default="full",
+        choices=["full", "subproblem"],
+        dest="lns_model",
+        help="full: freeze variables of the full CP model each iteration. "
+        "subproblem: build a reduced model with only the active orders "
+        "(frozen orders enter as fixed intervals and objective constants).",
+    )
+    parser.add_argument(
+        "--validate-merges",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        dest="validate_merges",
+        help="Subproblem mode: validate every merged solution and its KPIs (slow, for debugging)",
+    )
+
     args = parser.parse_args()
 
     # Check termination conditions
@@ -987,6 +1118,8 @@ if __name__ == "__main__":
             "cp_objective_phase_schedule": args.cp_objective_phase_schedule,
             "render_video": args.render_video,
             "only_first_sol": args.only_first_sol,
+            "lns_model": args.lns_model,
+            "validate_merges": args.validate_merges,
         }
         solver = Solver(
             experiment_config,

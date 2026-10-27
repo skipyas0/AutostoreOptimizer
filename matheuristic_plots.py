@@ -288,6 +288,7 @@ class VisualLogger:
             "solve_api_overhead": np.full(iters, -1.0, dtype=np.float64),
             "solve_cpp_presolve": np.full(iters, -1.0, dtype=np.float64),
             "solve_cpp_search": np.full(iters, -1.0, dtype=np.float64),
+            "merge_time": np.full(iters, -1.0, dtype=np.float64),
             "statuses": np.full(iters, -1, dtype=np.int32),
             "severity_increases": np.zeros(iters, dtype=np.int8),
             "strategy": np.full(iters, -1, dtype=np.int32),
@@ -571,6 +572,7 @@ class VisualLogger:
             self.current_iteration
         ]
 
+        merge_time = self.current_run_data["merge_time"][self.current_iteration]
         total_time = self.current_run_data["total_iter_time"][self.current_iteration]
         status_val = self.current_run_data["statuses"][self.current_iteration]
         best_res = self.current_run_data["best"][self.current_iteration]
@@ -604,7 +606,8 @@ class VisualLogger:
             f"Constr Gen {constr_generate_time:.3f}s, "
             f"Constr Update {constr_update_time:.3f}s, "
             f"Solve {solve_time:.3f}s, (API {solve_api_overhead:.3f}, Presolve {solve_cpp_presolve:.3f}, Search {solve_cpp_search:.3f})"
-            f"Total {total_time:.3f}s"
+            + (f", Merge {merge_time:.3f}s" if merge_time >= 0 else "")
+            + f" Total {total_time:.3f}s"
         )
         self.completed_iterations += 1
 

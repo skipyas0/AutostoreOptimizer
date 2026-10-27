@@ -101,7 +101,7 @@ See [HEURISTICS.md](HEURISTICS.md).
 | `cp_lns_core.cpp` + `setup.py` | The same model in C++ (CP Optimizer C++ API, pybind11). It avoids docplex overhead in the LNS loop. Build with `python setup.py mac` (macOS) or `python setup.py ubuntu` (Linux) to get the untracked `cp_lns_core*.so`. |
 | `cpp_cp_model.py` | Python wrapper with the same `build_model` / `inject_warmstart` interface as `cp_model.py`, plus `export_model` |
 | `cp_model_utils.py` | `CppSolveResult`, solution diffs (`build_solve_dict`, `Diff`), utilisation time series, `.cpo` canonicalisation and comparison |
-| `verify_cp_models.py` | Checks that the docplex and C++ models export identical `.cpo` |
+| `verify_cp_models.py` | Checks that the docplex and C++ models export identical `.cpo`. The shift-length/wages section exists only in docplex and always shows as a difference. Fixed intervals (frozen LNS data) are compared by their bounds |
 
 ### LNS matheuristic ("CP-based LNS", fix-and-optimize)
 | Module | Purpose |
@@ -109,6 +109,7 @@ See [HEURISTICS.md](HEURISTICS.md).
 | `matheuristic.py` | `Solver`: the LNS loop. Each iteration selects a neighbourhood, freezes the rest of the incumbent, re-solves with CP from a warm start, and applies acceptance, severity adaptation and objective switching. CLI: `python matheuristic.py <instance folder> --backend cpp …` |
 | `neighborhood_selection.py` | Selection strategies (random orders/SKUs, time slices, lane and MoveCap balancing, similar orders, refetched SKUs, history-based) and `StrategyManager` (adaptive weights) |
 | `freezing_utils.py` | Freezing policies: which variables of the incumbent are fixed, plus partial starting points |
+| `subproblem.py` | Subproblem mode (`--lns-model subproblem`). Instead of freezing variables of the full model, each iteration builds a reduced model with only the active orders. Frozen orders enter as fixed intervals (`exo_lanes`, `exo_station_bins`, `exo_blocks`, `exo_moves`) and objective constants (`ObjectiveOffsets`), and the result is merged back into the full solution. The full model is never built, so extraction cost scales with the neighbourhood, not the instance. Works with both backends. `--validate-merges` checks every merged solution. Open issue: shared bin visits (KNOWN_ISSUES.md) |
 | `matheuristic_plots.py` | `VisualLogger`: per-iteration logging, solution-delta "barcodes", KPI and convergence plots |
 | `precalculate_instances_for_lns.py` | Builds precalculated instance folders. It generates the instance, runs the warm-start heuristic (`--heuristic`, any registry name or `load_balanced_rdi` / `random_rdi` / `similarity_rdi` for the CP-based decomposition) and runs monolithic CP baselines per `--cp-seeds` |
 | `analyze_lns_experiments.py` | Aggregates LNS experiment folders into tables (LaTeX/PNG) |
@@ -142,7 +143,8 @@ constants ◄── instance ◄── datagen
 jaccard_similarity ◄── instance, heuristics.cfss, heuristics.partitioned_rdi
 heuristics ◄── cp_model_utils, matheuristic, decomposition, precalculate_instances_for_lns,
                benchmark_models, rl_order_assignment, trainset_generator
-cp_model ◄── cpp_cp_model, matheuristic, decomposition, heuristics.solution (lazy)
+cp_model ◄── cpp_cp_model, matheuristic, decomposition, subproblem (lazy), heuristics.solution (lazy)
+subproblem ◄── matheuristic
 cp_model_utils ◄── cpp_cp_model, matheuristic, matheuristic_plots, neighborhood_selection
 matheuristic ◄── decomposition (load_instance)
 neighborhood_selection ◄── matheuristic, heuristics.partitioned_rdi (lazy)
@@ -166,6 +168,8 @@ python precalculate_instances_for_lns.py --stations 4 --lanes 4 --orders 200 --s
 
 # run the LNS matheuristic on it
 python matheuristic.py GEN42-4-4-5000-200-20 --backend cpp --runs 5
+# ... solving reduced subproblems instead of the frozen full model (much faster on large instances)
+python matheuristic.py GEN42-4-4-5000-200-20 --backend cpp --runs 5 --lns-model subproblem
 
 # benchmark heuristics (+ RL checkpoints found as rl_agent_weights*.pth)
 python benchmark_models.py --num-instances 10 --methods all --skip-rl

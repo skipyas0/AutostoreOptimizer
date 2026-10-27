@@ -300,10 +300,25 @@ def canonicalize_cpo(cpo_path: str, output_path: str | None = None) -> str:
     for e, loc in p.get_all_expressions():
         clear_names(e)
 
+    def fixed_bounds(v):
+        """(start, end) of a present interval with fixed start and end, else None.
+
+        Fixed intervals (frozen LNS data such as exo_* intervals) are compared by
+        their bounds, because exporters name them differently.
+        """
+        if v.is_optional():
+            return None
+        st, en = v.get_start(), v.get_end()
+        if isinstance(st, tuple) and isinstance(en, tuple) and st[0] == st[1] and en[0] == en[1]:
+            return st[0], en[0]
+        return None
+
     # 2. Extract and canonicalize variable declarations
     var_decls = []
     for v in p.get_all_variables():
         if not isinstance(v, CpoIntervalVar):
+            continue
+        if fixed_bounds(v) is not None:
             continue
         vname = v.get_name()
         v_str = f'"{vname}" = intervalVar(optional'
@@ -331,6 +346,9 @@ def canonicalize_cpo(cpo_path: str, output_path: str | None = None) -> str:
 
     def canonical_expr_str(e):
         if isinstance(e, CpoIntervalVar):
+            fb = fixed_bounds(e)
+            if fb is not None:
+                return f"fixed({fb[0]},{fb[1]})"
             return f'"{e.get_name()}"'
         if isinstance(e, CpoValue):
             if isinstance(e.value, (list, tuple)):

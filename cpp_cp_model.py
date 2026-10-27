@@ -98,13 +98,97 @@ def apply_warmstart(mdl, sp):
     mdl.apply_warm_start(warm_names, warm_p, warm_s, warm_e)
 
 
-def inject_warmstart(solution, pick_events, mdl, handles):
+def inject_warmstart(solution, pick_events, mdl, handles, remap_lanes=True):
     """Injects warm start into C++ model using heuristic solution and handles."""
     import cp_model
     mock_mdl = MockCpoModel()
-    mock_sp = cp_model.inject_warmstart(solution, pick_events, mock_mdl, handles)
+    mock_sp = cp_model.inject_warmstart(
+        solution, pick_events, mock_mdl, handles, remap_lanes=remap_lanes
+    )
     apply_warmstart(mdl, mock_sp)
     return mock_sp
+
+
+def _index_sets(instance):
+    """Order list, per-SKU demand and copy counts shared by the model and its handles."""
+    S, L, K, orders_req, rt, p, N = instance
+    O = sorted(orders_req.keys())
+    orders_demanding_sku = defaultdict(set)
+    need_count = defaultdict(int)
+    for o in O:
+        for k in orders_req[o]:
+            orders_demanding_sku[k].add(o)
+            need_count[k] += 1
+    active_K = [k for k in K if need_count[k] > 0]
+    U = {k: need_count[k] for k in K}
+    return O, orders_demanding_sku, active_K, U
+
+
+def build_handles(instance, horizon: int) -> dict:
+    """Name-only handles (MockIntervalVar) for every interval variable of the full model.
+
+    Used on its own by the subproblem LNS, which never builds the full CP model:
+    strategies, logging and solution conversion only need variable names.
+    """
+    S, L, K, orders_req, rt, p, N = instance
+    O, orders_demanding_sku, active_K, U = _index_sets(instance)
+
+    I_os, I_os_lane = {}, {}
+    for o in O:
+        for s in S:
+            I_os[(o, s)] = MockIntervalVar(f"I_os[{o},{s}]")
+            for ln in L:
+                I_os_lane[(o, s, ln)] = MockIntervalVar(f"I_os_lane[{o},{s},{ln}]")
+
+    C = {}
+    for o in O:
+        for k in orders_req[o]:
+            for s in S:
+                C[(o, k, s)] = MockIntervalVar(f"C[{o},{k},{s}]")
+
+    P, F, R, B, Block = {}, {}, {}, {}, {}
+    for s in S:
+        for k in active_K:
+            for e in range(U[k]):
+                for o in orders_demanding_sku[k]:
+                    P[(o, s, k, e)] = MockIntervalVar(f"P[{o},{s},{k},{e}]")
+
+                F[(s, k, e)] = MockIntervalVar(f"F[{s},{k},{e}]")
+                R[(s, k, e)] = MockIntervalVar(f"R[{s},{k},{e}]")
+                B[(s, k, e)] = MockIntervalVar(f"B[{s},{k},{e}]")
+                Block[(s, k, e)] = MockIntervalVar(f"Block[{s},{k},{e}]")
+
+    all_intervals_flat = {}
+    for dic in [I_os, I_os_lane, C, P, F, R, B, Block]:
+        for val in dic.values():
+            all_intervals_flat[val.get_name()] = val
+
+    return {
+        "I_os_lane": I_os_lane,
+        "I_os": I_os,
+        "C": C,
+        "P": P,
+        "F": F,
+        "R": R,
+        "B": B,
+        "Block": Block,
+        "U": U,
+        "orders_req": orders_req,
+        "rt": rt,
+        "rt_return": instance.rt_ret,
+        "p": p,
+        "S": S,
+        "L": L,
+        "K": K,
+        "active_K": active_K,
+        "orders_demanding_sku": orders_demanding_sku,
+        "O": O,
+        "N": N,
+        "move_cap": instance.movecap,
+        "pick_cap": getattr(instance, "pickcap", None),
+        "horizon": horizon,
+        "all_intervals_flat": all_intervals_flat,
+    }
 
 
 def build_model(
@@ -116,27 +200,30 @@ def build_model(
     exo_moves: list = None,  # list of (start, end) for F/R moves
     batch_start_time: int = 0,
     objective_func: str = "makespan",
+    exo_station_bins: dict = None,  # station -> list of (start, end) bin presences
+    obj_offsets=None,  # subproblem.ObjectiveOffsets: frozen part of every KPI
 ):
     S, L, K, orders_req, rt, p, N = instance
     move_cap = instance.movecap
-    pick_cap = getattr(instance, 'pickcap', None)
+    pick_cap = getattr(instance, "pickcap", None)
     rt_return = instance.rt_ret
-    
+    O, orders_demanding_sku, active_K, U = _index_sets(instance)
+
     exo_lanes = exo_lanes or defaultdict(list)
     exo_blocks = exo_blocks or defaultdict(list)
     exo_moves = exo_moves or []
+    exo_station_bins = exo_station_bins or {}
 
-    O = sorted(orders_req.keys())
-
-    orders_demanding_sku = defaultdict(set)
-    need_count = defaultdict(int)
-    for o in O:
-        for k in orders_req[o]:
-            orders_demanding_sku[k].add(o)
-            need_count[k] += 1
-    active_K = [k for k in K if need_count[k] > 0]
-
-    U = {k: need_count[k] for k in K}
+    if obj_offsets is None:
+        makespan_lb, fetches_off, flow_off = 0, 0, 0
+        station_window, station_pick_time, station_pick_count = {}, {}, {}
+    else:
+        makespan_lb = obj_offsets.makespan_lb
+        fetches_off = obj_offsets.bin_fetches
+        flow_off = obj_offsets.total_flow_time
+        station_window = obj_offsets.station_window
+        station_pick_time = obj_offsets.station_pick_time
+        station_pick_count = obj_offsets.station_pick_count
 
     # Initialize the Pybind11 C++ model
     cpp_model = cp_lns_core.CpLnsModel(
@@ -159,68 +246,16 @@ def build_model(
         exo_moves,
         batch_start_time,
         objective_func,
+        exo_station_bins,
+        makespan_lb,
+        fetches_off,
+        flow_off,
+        station_window,
+        station_pick_time,
+        station_pick_count,
     )
 
-    # Reconstruct handles dictionary with MockIntervalVar
-    I_os, I_os_lane = {}, {}
-    for o in O:
-        for s in S:
-            I_os[(o, s)] = MockIntervalVar(f"I_os[{o},{s}]")
-            for ln in L:
-                I_os_lane[(o, s, ln)] = MockIntervalVar(f"I_os_lane[{o},{s},{ln}]")
-
-    C = {}
-    for o in O:
-        for k in orders_req[o]:
-            for s in S:
-                C[(o, k, s)] = MockIntervalVar(f"C[{o},{k},{s}]")
-
-    P, F, R, B, Block = {}, {}, {}, {}, {}
-    for s in S:
-        for k in active_K:
-            for e in range(U[k]):
-                for o in O:
-                    if k in orders_req[o]:
-                        P[(o, s, k, e)] = MockIntervalVar(f"P[{o},{s},{k},{e}]")
-
-                F[(s, k, e)] = MockIntervalVar(f"F[{s},{k},{e}]")
-                R[(s, k, e)] = MockIntervalVar(f"R[{s},{k},{e}]")
-                B[(s, k, e)] = MockIntervalVar(f"B[{s},{k},{e}]")
-                Block[(s, k, e)] = MockIntervalVar(f"Block[{s},{k},{e}]")
-
-    all_intervals_flat = {}
-    for dic in [I_os, I_os_lane, C, P, F, R, B, Block]:
-        for val in dic.values():
-            all_intervals_flat[val.get_name()] = val
-
-    handles = {
-        "I_os_lane": I_os_lane,
-        "I_os": I_os,
-        "C": C,
-        "P": P,
-        "F": F,
-        "R": R,
-        "B": B,
-        "Block": Block,
-        "U": U,
-        "orders_req": orders_req,
-        "rt": rt,
-        "rt_return": rt_return,
-        "p": p,
-        "S": S,
-        "L": L,
-        "K": K,
-        "active_K": active_K,
-        "orders_demanding_sku": orders_demanding_sku,
-        "O": O,
-        "N": N,
-        "move_cap": move_cap,
-        "pick_cap": pick_cap,
-        "horizon": horizon,
-        "all_intervals_flat": all_intervals_flat,
-    }
-
-    return CppModelWrapper(cpp_model), handles
+    return CppModelWrapper(cpp_model), build_handles(instance, horizon)
 
 
 class CppModelWrapper:

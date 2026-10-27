@@ -177,6 +177,17 @@ private:
     std::string make_key_s_k_e(const std::string& prefix, int s, int k, int e) { return prefix + "[" + std::to_string(s) + "," + std::to_string(k) + "," + std::to_string(e) + "]"; }
     std::string make_key_o_s_k_e(const std::string& prefix, int o, int s, int k, int e) { return prefix + "[" + std::to_string(o) + "," + std::to_string(s) + "," + std::to_string(k) + "," + std::to_string(e) + "]"; }
 
+    // Present interval fixed to [st, en) (frozen part of an LNS subproblem)
+    IloIntervalVar make_fixed(int st, int en, const std::string& name) {
+        IloIntervalVar iv(env, en - st);
+        iv.setStartMin(st);
+        iv.setStartMax(st);
+        iv.setEndMin(en);
+        iv.setEndMax(en);
+        iv.setName(name.c_str());
+        return iv;
+    }
+
 public:
     IloObjective active_obj;
     IloObjective bin_fetches_obj;
@@ -208,7 +219,16 @@ public:
                const std::map<int, std::vector<std::pair<int, int>>>& exo_blocks,
                const std::vector<std::pair<int, int>>& exo_moves,
                int batch_start_time,
-               const std::string& objective_func) {
+               const std::string& objective_func,
+               // LNS subproblem: frozen bin presences per station and the frozen
+               // part of every KPI (all empty / zero for the full model)
+               const std::map<int, std::vector<std::pair<int, int>>>& exo_station_bins,
+               int makespan_lb,
+               int fetches_offset,
+               int flow_offset,
+               const std::map<int, std::pair<int, int>>& station_window,
+               const std::map<int, int>& station_pick_time,
+               const std::map<int, int>& station_pick_count) {
         
         model = IloModel(env);
         cp = IloCP(model);
@@ -490,6 +510,14 @@ public:
                     bins_here.add(vars[make_key_s_k_e("B", s, k, e)]);
                 }
             }
+            // Bins of frozen visits still occupy the station's port
+            auto exo_bins_it = exo_station_bins.find(s);
+            if (exo_bins_it != exo_station_bins.end()) {
+                for (const auto& st_en : exo_bins_it->second) {
+                    bins_here.add(make_fixed(st_en.first, st_en.second,
+                        "exo_bin_" + std::to_string(s) + "_" + std::to_string(st_en.first)));
+                }
+            }
             if (bins_here.getSize() >= 2) {
                 model.add(IloNoOverlap(env, bins_here));
             }
@@ -572,6 +600,10 @@ public:
             }
             per_order_ends[i] = IloMax(ends);
         }
+        if (makespan_lb > 0) {
+            // Frozen orders end no earlier than this
+            per_order_ends.add(IloIntExpr(env, makespan_lb));
+        }
         
         makespan_expr = IloMax(per_order_ends);
         makespan_obj = IloMinimize(env, makespan_expr);
@@ -584,6 +616,9 @@ public:
                 }
             }
         }
+        if (fetches_offset != 0) {
+            bin_fetches_expr += fetches_offset;
+        }
         bin_fetches_obj = IloMinimize(env, bin_fetches_expr);
         
         total_flow_time_expr = IloIntExpr(env);
@@ -592,18 +627,33 @@ public:
                 total_flow_time_expr += IloEndOf(vars[make_key("I_os", o, s)]);
             }
         }
+        if (flow_offset != 0) {
+            total_flow_time_expr += flow_offset;
+        }
         total_flow_time_obj = IloMinimize(env, total_flow_time_expr);
         
         idle_time_expr = IloIntExpr(env);
         IloIntExprArray pick_counts(env);
 
         for (int s : S) {
+            auto window_it = station_window.find(s);
+            bool has_window = window_it != station_window.end();
+
             IloIntervalVar station_span(env);
-            station_span.setOptional();
+            std::string span_name = "station_span_" + std::to_string(s);
+            station_span.setName(span_name.c_str());
+            if (!has_window) {
+                station_span.setOptional();
+            }
             
             IloIntervalVarArray s_orders(env);
             for (int o : O) {
                 s_orders.add(vars[make_key("I_os", o, s)]);
+            }
+            if (has_window) {
+                // Fixed window of the frozen orders at this station
+                s_orders.add(make_fixed(window_it->second.first, window_it->second.second,
+                                        "exo_win_" + std::to_string(s)));
             }
             model.add(IloSpan(env, station_span, s_orders));
             
@@ -623,6 +673,11 @@ public:
                         }
                     }
                 }
+            }
+            auto frozen_picks_it = station_pick_count.find(s);
+            if (frozen_picks_it != station_pick_count.end() && frozen_picks_it->second != 0) {
+                pick_sum += station_pick_time.at(s);
+                pick_count += frozen_picks_it->second;
             }
             idle_time_expr += IloLengthOf(station_span) - pick_sum;
             pick_counts.add(pick_count);
@@ -938,7 +993,9 @@ PYBIND11_MODULE(cp_lns_core, m) {
         .def("clear", &ProgressCollectorCallback::clear);
 
     py::class_<CpLnsModel>(m, "CpLnsModel", py::dynamic_attr())
-        .def(py::init<std::vector<int>, std::vector<int>, std::vector<int>, std::map<int, std::vector<int>>, std::map<int, int>, std::map<int, int>, std::map<int, int>, std::optional<int>, std::optional<int>, std::map<int, int>, std::vector<int>, std::map<int, int>, int, bool, std::map<std::pair<int, int>, std::vector<std::pair<int, int>>>, std::map<int, std::vector<std::pair<int, int>>>, std::vector<std::pair<int, int>>, int, std::string>())
+        .def(py::init<std::vector<int>, std::vector<int>, std::vector<int>, std::map<int, std::vector<int>>, std::map<int, int>, std::map<int, int>, std::map<int, int>, std::optional<int>, std::optional<int>, std::map<int, int>, std::vector<int>, std::map<int, int>, int, bool, std::map<std::pair<int, int>, std::vector<std::pair<int, int>>>, std::map<int, std::vector<std::pair<int, int>>>, std::vector<std::pair<int, int>>, int, std::string,
+                      std::map<int, std::vector<std::pair<int, int>>>, int, int, int,
+                      std::map<int, std::pair<int, int>>, std::map<int, int>, std::map<int, int>>())
         .def("apply_warm_start", &CpLnsModel::apply_warm_start)
         .def("apply_delta_freezing", &CpLnsModel::apply_delta_freezing)
         .def("solve", &CpLnsModel::solve,
