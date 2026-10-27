@@ -2093,7 +2093,8 @@ class VisualLogger:
             color="red",
             linestyle="--",
             alpha=0.5,
-            label=f"Time Limit ({time_limit}s)",
+            label=f"Time Limit ({time_limit}s, "
+            f"{self.experiment_config.get('iter_time_mode', 'total')})",
         )
 
         plt.tight_layout()

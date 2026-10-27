@@ -1,3 +1,58 @@
+import threading
+
+from docplex.cp.solver.cpo_callback import (
+    EVENT_END_EXTRACTION,
+    EVENT_END_SOLVE,
+    CpoCallback,
+)
+
+ITER_TIME_MODES = ("search", "total")
+
+
+def cp_time_limits(cfg, remaining=None):
+    """CP limits for one LNS iteration: (engine TimeLimit, search-only limit).
+
+    ``iter_time_mode`` decides what ``iter_time_limit`` bounds:
+      * "total":  the whole CP call (extraction + presolve + search), which is what
+                  CP Optimizer's TimeLimit does. Search-only limit is None.
+      * "search": only the search, measured from the end of extraction. The engine
+                  TimeLimit becomes a hard cap: the remaining run budget
+                  (``remaining``), or None (no cap) when the run has no time limit.
+    Configs saved before the option existed ran in "total" mode.
+    """
+    limit = cfg["iter_time_limit"]
+    if cfg.get("iter_time_mode", "total") == "total":
+        return limit, None
+    return remaining, limit
+
+
+class SearchTimeLimitCallback(CpoCallback):
+    """docplex counterpart of the C++ SearchTimeLimitCallback.
+
+    Starts a timer when extraction ends and aborts the search when it expires,
+    so only search time counts against ``limit``. ``limit=None`` disables it.
+    """
+
+    def __init__(self, limit=None):
+        super().__init__()
+        self.limit = limit
+        self._timer = None
+
+    def invoke(self, solver, event, sres):
+        if event == EVENT_END_EXTRACTION and self.limit is not None:
+            self._cancel()
+            self._timer = threading.Timer(self.limit, solver.abort_search)
+            self._timer.daemon = True
+            self._timer.start()
+        elif event == EVENT_END_SOLVE:
+            self._cancel()
+
+    def _cancel(self):
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+
+
 def sort_variables(mdl, sp, backend="docplex", handles=None):
     if backend == "cpp":
 

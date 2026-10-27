@@ -27,7 +27,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass, field
 
-from cp_model_utils import CppSolveResult
+from cp_model_utils import CppSolveResult, SearchTimeLimitCallback, cp_time_limits
 from heuristics import HeuristicSolution, validate_solution
 from heuristics.heuristic_utils import BinEvent
 
@@ -248,20 +248,29 @@ def build_submodel(ctx: FrozenContext, backend: str, horizon: int, objective: st
     return mdl, handles
 
 
-def solve_submodel(mdl, handles, backend, objective, impr_bound, cfg, progress_callback=None):
-    """Solve the reduced model. Returns (result, progress records)."""
+def solve_submodel(mdl, handles, backend, objective, impr_bound, cfg, progress_callback=None,
+                   limits=None):
+    """Solve the reduced model. Returns (result, progress records).
+
+    ``limits`` = (engine TimeLimit, search-only limit), see ``cp_time_limits``;
+    computed from ``cfg`` without a run budget when omitted.
+    """
+    time_limit, search_limit = limits if limits is not None else cp_time_limits(cfg)
     if backend == "docplex":
         if impr_bound != -1:
             mdl.add(handles[objective] <= impr_bound)
         kwargs = {
-            "TimeLimit": cfg["iter_time_limit"],
             "LogVerbosity": "Quiet",
             "Workers": cfg["workers"],
             "Presolve": cfg["presolve"],
             "SearchType": cfg["search_type"],
         }
+        if time_limit is not None:
+            kwargs["TimeLimit"] = time_limit
         if cfg.get("only_first_sol", False):
             kwargs["SolutionLimit"] = 1
+        if search_limit is not None:
+            mdl.add_solver_callback(SearchTimeLimitCallback(search_limit))
         progress = []
         if progress_callback is not None:
             mdl.add_solver_callback(progress_callback)
@@ -272,7 +281,7 @@ def solve_submodel(mdl, handles, backend, objective, impr_bound, cfg, progress_c
         return sol, progress
 
     res = mdl.solve(
-        cfg["iter_time_limit"],
+        time_limit if time_limit is not None else -1,
         impr_bound,
         cfg["workers"],
         cfg["presolve"],
@@ -280,6 +289,7 @@ def solve_submodel(mdl, handles, backend, objective, impr_bound, cfg, progress_c
         cfg.get("only_first_sol", False),
         collect_progress=True,
         collect_deltas=False,
+        search_time_limit=search_limit if search_limit is not None else -1,
     )
     return res, res.get("progress") or []
 
@@ -385,7 +395,7 @@ def to_full_result(solution, ctx, sub_sol, sub_handles, handles, backend, object
 
 
 def solve_iteration(solution, handles, instance, active_orders, *, backend, horizon,
-                    objective, impr_bound, cfg, progress_callback=None):
+                    objective, impr_bound, cfg, progress_callback=None, limits=None):
     """One complete subproblem iteration: extract, build, solve, merge.
 
     Returns (CppSolveResult on the full model, progress records, FrozenContext).
@@ -395,7 +405,7 @@ def solve_iteration(solution, handles, instance, active_orders, *, backend, hori
         return infeasible_result(), [], ctx
     mdl, sub_handles = build_submodel(ctx, backend, horizon, objective)
     sub_sol, progress = solve_submodel(mdl, sub_handles, backend, objective, impr_bound, cfg,
-                                       progress_callback)
+                                       progress_callback, limits)
     result = to_full_result(solution, ctx, sub_sol, sub_handles, handles, backend, objective)
     return result, progress, ctx
 

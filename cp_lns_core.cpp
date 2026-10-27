@@ -11,6 +11,9 @@
 #include <fstream>
 #include <mutex>
 #include <optional>
+#include <thread>
+#include <condition_variable>
+#include <chrono>
 
 namespace py = pybind11;
 
@@ -159,6 +162,49 @@ public:
 
     size_t size() const {
         return records_.size();
+    }
+};
+
+// Limits the search phase only: a timer starts when extraction ends and aborts
+// the search after `limit` seconds. The engine TimeLimit stays as a hard cap on
+// the whole solve (extraction + presolve + search).
+class SearchTimeLimitCallback : public IloCP::Callback {
+private:
+    double limit_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool done_ = false;
+    std::thread timer_;
+
+public:
+    explicit SearchTimeLimitCallback(double limit) : limit_(limit) {}
+    ~SearchTimeLimitCallback() { stop(); }
+
+    virtual void invoke(IloCP cp, IloCP::Callback::Reason reason) override {
+        if (reason == IloCP::Callback::EndExtraction) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (done_ || timer_.joinable()) return;
+            timer_ = std::thread([this, cp]() {
+                bool expired;
+                {
+                    std::unique_lock<std::mutex> lk(mutex_);
+                    expired = !cv_.wait_for(lk, std::chrono::duration<double>(limit_),
+                                            [this] { return done_; });
+                }
+                if (expired) cp.abortSearch();
+            });
+        } else if (reason == IloCP::Callback::EndSolve) {
+            stop();
+        }
+    }
+
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            done_ = true;
+        }
+        cv_.notify_all();
+        if (timer_.joinable() && timer_.get_id() != std::this_thread::get_id()) timer_.join();
     }
 };
 
@@ -805,8 +851,9 @@ public:
         bulk_add.end();
     }
     
-    py::dict solve(double time_limit, int improvement_bound = -1, int workers = 1, std::string presolve = "Auto", std::string search_type = "Auto", bool only_first_sol = false, int random_seed = -1, std::string log_verbosity = "Quiet", const std::string& log_filename = "", bool collect_progress = false, bool collect_deltas = true) {
-        cp.setParameter(IloCP::TimeLimit, time_limit);
+    py::dict solve(double time_limit, int improvement_bound = -1, int workers = 1, std::string presolve = "Auto", std::string search_type = "Auto", bool only_first_sol = false, int random_seed = -1, std::string log_verbosity = "Quiet", const std::string& log_filename = "", bool collect_progress = false, bool collect_deltas = true, double search_time_limit = -1) {
+        // time_limit <= 0 means no engine limit (search_time_limit then bounds the search)
+        cp.setParameter(IloCP::TimeLimit, time_limit > 0 ? time_limit : IloInfinity);
         cp.setParameter(IloCP::Workers, workers);
         if (random_seed >= 0) {
             cp.setParameter(IloCP::RandomSeed, random_seed);
@@ -876,10 +923,21 @@ public:
             cp.addCallback(progress_collector.get());
         }
 
+        std::unique_ptr<SearchTimeLimitCallback> search_limiter;
+        cp.clearAbort();
+        if (search_time_limit > 0) {
+            search_limiter = std::make_unique<SearchTimeLimitCallback>(search_time_limit);
+            cp.addCallback(search_limiter.get());
+        }
+
         bool found = false;
         try {
             found = cp.solve();
         } catch (...) {
+            if (search_limiter) {
+                search_limiter->stop();
+                try { cp.removeCallback(search_limiter.get()); } catch (...) {}
+            }
             if (collect_progress) {
                 try { cp.removeCallback(progress_collector.get()); } catch (...) {}
             }
@@ -895,6 +953,10 @@ public:
             throw;
         }
 
+        if (search_limiter) {
+            search_limiter->stop();
+            cp.removeCallback(search_limiter.get());
+        }
         if (collect_progress) {
             cp.removeCallback(progress_collector.get());
         }
@@ -1009,7 +1071,8 @@ PYBIND11_MODULE(cp_lns_core, m) {
              py::arg("log_verbosity") = "Quiet",
              py::arg("log_filename") = "",
              py::arg("collect_progress") = false,
-             py::arg("collect_deltas") = true)
+             py::arg("collect_deltas") = true,
+             py::arg("search_time_limit") = -1.0)
         .def("get_progress_records", &CpLnsModel::get_progress_records)
         .def("export_model", &CpLnsModel::export_model, py::arg("filename"))
         .def("set_objective", &CpLnsModel::set_objective, py::arg("target"));

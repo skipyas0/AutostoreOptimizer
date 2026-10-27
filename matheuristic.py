@@ -15,7 +15,10 @@ import cpp_cp_model
 import subproblem
 from heuristics import HeuristicSolution, validate_solution
 from cp_model_utils import (
+    ITER_TIME_MODES,
     CppSolveResult,
+    SearchTimeLimitCallback,
+    cp_time_limits,
     sort_variables,
 )
 from freezing_utils import (
@@ -474,6 +477,14 @@ class Solver:
             )
         return starting_point
 
+    def cp_time_limits(self):
+        """(engine TimeLimit, search-only limit) for the next CP call."""
+        remaining = None
+        if self.experiment_config.get("time_limit") is not None:
+            elapsed = time.time() - self.run_start_time
+            remaining = max(self.experiment_config["time_limit"] - elapsed, 0.1)
+        return cp_time_limits(self.experiment_config, remaining)
+
     def solve_subproblem(self, active_orders, to_optimize, var_to_idx, strat_idx, impr_bound):
         """Extract, build, solve and merge one subproblem, logging each stage's time."""
         cfg = self.experiment_config
@@ -501,7 +512,7 @@ class Solver:
         else:
             raw, progress = subproblem.solve_submodel(
                 sub_mdl, sub_handles, backend, self.cp_obj, impr_bound, cfg,
-                self.progress_callback,
+                self.progress_callback, self.cp_time_limits(),
             )
         self.vlg.log_solve_time(raw)
 
@@ -529,6 +540,7 @@ class Solver:
         # similarity matrix, strategy setup and all iterations. This matches the
         # plain-CP baseline, whose budget also includes model extraction.
         run_start_time = time.time()
+        self.run_start_time = run_start_time
 
         # run reset logic
         if self.subproblem_mode:
@@ -592,8 +604,10 @@ class Solver:
         # Listener/callback used to capture every solution discovered per subproblem.
         if self.experiment_config["backend"] == "docplex":
             self.progress_callback = IterationProgressCallback()
-            if not self.subproblem_mode:  # subproblems attach it to each new model
+            if not self.subproblem_mode:  # subproblems attach their own to each new model
                 self.mdl.add_solver_callback(self.progress_callback)
+                self.search_limiter = SearchTimeLimitCallback()
+                self.mdl.add_solver_callback(self.search_limiter)
         else:
             self.progress_callback = None
 
@@ -777,13 +791,15 @@ class Solver:
 
                 # run solve on partially frozen model
                 self.vlg.time_from_here()
+                time_limit, self.search_limiter.limit = self.cp_time_limits()
                 solve_kwargs = {
-                    "TimeLimit": self.experiment_config["iter_time_limit"],
                     "LogVerbosity": "Quiet",
                     "Workers": self.experiment_config["workers"],
                     "Presolve": self.experiment_config["presolve"],
                     "SearchType": self.experiment_config["search_type"],
                 }
+                if time_limit is not None:
+                    solve_kwargs["TimeLimit"] = time_limit
                 if self.experiment_config.get("only_first_sol", False):
                     solve_kwargs["SolutionLimit"] = 1
 
@@ -795,8 +811,9 @@ class Solver:
                 self.vlg.log_freeze_constr(to_optimize, var_to_idx, strat_idx)
 
                 self.vlg.time_from_here()
+                time_limit, search_limit = self.cp_time_limits()
                 result_dict = self.mdl.solve(
-                    self.experiment_config["iter_time_limit"],
+                    time_limit if time_limit is not None else -1,
                     impr_bound,
                     self.experiment_config["workers"],
                     self.experiment_config["presolve"],
@@ -804,6 +821,7 @@ class Solver:
                     self.experiment_config.get("only_first_sol", False),
                     collect_progress=True,
                     collect_deltas=False,
+                    search_time_limit=search_limit if search_limit is not None else -1,
                 )
                 sol = CppSolveResult(result_dict)
                 progress = result_dict.get("progress") or []
@@ -915,7 +933,19 @@ if __name__ == "__main__":
         type=float,
         default=2.0,
         dest="iter_time_limit",
-        help="Per-iteration time limit in seconds (default: 2.0)",
+        help="Per-iteration CP time limit in seconds; what it covers is set by "
+        "--iter-time-mode (default: 2.0)",
+    )
+    parser.add_argument(
+        "--iter-time-mode",
+        type=str,
+        default="search",
+        choices=list(ITER_TIME_MODES),
+        dest="iter_time_mode",
+        help="What --iter-time-limit bounds. 'search': only the CP search, timed from "
+        "the end of model extraction (extraction/presolve are not counted; the run "
+        "--time-limit stays a hard cap). 'total': the whole CP call incl. extraction, "
+        "i.e. CP Optimizer's TimeLimit (behaviour of experiment 1). (default: search)",
     )
     parser.add_argument(
         "--workers",
@@ -1099,6 +1129,7 @@ if __name__ == "__main__":
             "severity_backup": args.severity_backup,
             "max_severity": args.max_severity,
             "iter_time_limit": args.iter_time_limit,
+            "iter_time_mode": args.iter_time_mode,
             "delta_freezing": args.delta_freezing,
             "starting_point_for_frozen": args.starting_point_for_frozen,
             "rrt_threshold": args.rrt_threshold,
