@@ -13,7 +13,6 @@ from loguru import logger
 import cp_model as docplex_model
 import cpp_cp_model
 import subproblem
-from heuristics import HeuristicSolution, validate_solution
 from cp_model_utils import (
     ITER_TIME_MODES,
     CppSolveResult,
@@ -28,6 +27,7 @@ from freezing_utils import (
     get_associated_indices,
     get_optimized_set,
 )
+from heuristics import HeuristicSolution, validate_solution
 from instance import Instance
 from jaccard_similarity import build_similarity_matrix
 from matheuristic_plots import Status, VisualLogger
@@ -223,7 +223,7 @@ class Solver:
         self.severity = 1
         self.stagnation_count = 0
         self.experiment_config = experiment_config
-        self.subproblem_mode = experiment_config.get("lns_model", "full") == "subproblem"
+        self.subproblem_mode = experiment_config["lns_model"] == "subproblem"
         self.cycling_schedule = []
         for phase in self.experiment_config["cp_objective_phase_schedule"]:
             if phase == "m":
@@ -485,7 +485,9 @@ class Solver:
             remaining = max(self.experiment_config["time_limit"] - elapsed, 0.1)
         return cp_time_limits(self.experiment_config, remaining)
 
-    def solve_subproblem(self, active_orders, to_optimize, var_to_idx, strat_idx, impr_bound):
+    def solve_subproblem(
+        self, active_orders, to_optimize, var_to_idx, strat_idx, impr_bound
+    ):
         """Extract, build, solve and merge one subproblem, logging each stage's time."""
         cfg = self.experiment_config
         backend = cfg["backend"]
@@ -511,8 +513,14 @@ class Solver:
             raw, progress = subproblem.infeasible_result(), []
         else:
             raw, progress = subproblem.solve_submodel(
-                sub_mdl, sub_handles, backend, self.cp_obj, impr_bound, cfg,
-                self.progress_callback, self.cp_time_limits(),
+                sub_mdl,
+                sub_handles,
+                backend,
+                self.cp_obj,
+                impr_bound,
+                cfg,
+                self.progress_callback,
+                self.cp_time_limits(),
             )
         self.vlg.log_solve_time(raw)
 
@@ -521,8 +529,13 @@ class Solver:
             sol = raw
         else:
             sol = subproblem.to_full_result(
-                self.current_solution, ctx, raw, sub_handles, self.handles,
-                backend, self.cp_obj,
+                self.current_solution,
+                ctx,
+                raw,
+                sub_handles,
+                self.handles,
+                backend,
+                self.cp_obj,
             )
             if cfg.get("validate_merges") and sol.is_solution():
                 problems = subproblem.check_merged(
@@ -604,7 +617,9 @@ class Solver:
         # Listener/callback used to capture every solution discovered per subproblem.
         if self.experiment_config["backend"] == "docplex":
             self.progress_callback = IterationProgressCallback()
-            if not self.subproblem_mode:  # subproblems attach their own to each new model
+            if (
+                not self.subproblem_mode
+            ):  # subproblems attach their own to each new model
                 self.mdl.add_solver_callback(self.progress_callback)
                 self.search_limiter = SearchTimeLimitCallback()
                 self.mdl.add_solver_callback(self.search_limiter)
