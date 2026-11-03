@@ -1,4 +1,3 @@
-from loguru import logger
 import random
 from collections import defaultdict
 from collections.abc import Callable
@@ -586,26 +585,42 @@ class StrategyManager:
                 ),
                 strategy_random_skus(self.handles, p=default_percent * sev),
             ),
-            # "refetched_skus": lambda sev: combine_strategies(strategy_ending_timeslice_mix(self.handles, self.current_solution, default_timeslice_width, p=0),strategy_frequently_refetched_skus(
-            #     self.handles,
-            #     self.current_solution,
-            #     p=default_percent * sev,
-            #     weighted=False,
-            # )),
-            # "cycle_time_weighted_refetched_skus": lambda sev: (
-            #     combine_strategies(strategy_ending_timeslice_mix(self.handles, self.current_solution, default_timeslice_width, p=0),strategy_frequently_refetched_skus(
-            #         self.handles,
-            #         self.current_solution,
-            #         p=default_percent * sev,
-            #         weighted=True,
-            #     )
-            # )),
-            # "longest_orders": lambda sev: combine_strategies(strategy_ending_timeslice_mix(self.handles, self.current_solution, default_timeslice_width, p=0),strategy_longest_orders(
-            #     self.handles, self.current_solution, p=default_percent * sev
-            # )),
-            # "strategy_ending_timeslice_mix": lambda sev: strategy_ending_timeslice_mix(
-            #     self.handles, self.current_solution, length=default_timeslice_width * sev, p=0.5*default_percent * sev
-            # ),
+            "refetched_skus": lambda sev: combine_strategies(
+                strategy_ending_timeslice_mix(
+                    self.handles, self.current_solution, default_timeslice_width, p=0
+                ),
+                strategy_frequently_refetched_skus(
+                    self.handles,
+                    self.current_solution,
+                    p=default_percent * sev,
+                    weighted=False,
+                ),
+            ),
+            "cycle_time_weighted_refetched_skus": lambda sev: combine_strategies(
+                strategy_ending_timeslice_mix(
+                    self.handles, self.current_solution, default_timeslice_width, p=0
+                ),
+                strategy_frequently_refetched_skus(
+                    self.handles,
+                    self.current_solution,
+                    p=default_percent * sev,
+                    weighted=True,
+                ),
+            ),
+            "longest_orders": lambda sev: combine_strategies(
+                strategy_ending_timeslice_mix(
+                    self.handles, self.current_solution, default_timeslice_width, p=0
+                ),
+                strategy_longest_orders(
+                    self.handles, self.current_solution, p=default_percent * sev
+                ),
+            ),
+            "strategy_ending_timeslice_mix": lambda sev: strategy_ending_timeslice_mix(
+                self.handles,
+                self.current_solution,
+                length=default_timeslice_width * sev,
+                p=0.5 * default_percent * sev,
+            ),
             "history_selection_frequency": lambda sev: combine_strategies(
                 strategy_ending_timeslice_mix(
                     self.handles, self.current_solution, default_timeslice_width, p=0
@@ -622,11 +637,13 @@ class StrategyManager:
                     self.handles, self.vlg, p=0.5 * default_percent * sev
                 ),
             ),
-            # "random_orders_and_skus": lambda sev: combine_strategies(
-            #     strategy_random_orders(self.handles, p=0.5 * default_percent * sev),
-            #     strategy_random_skus(self.handles, p=0.5 * default_percent * sev),
-            #     strategy_ending_timeslice_mix(self.handles, self.current_solution, default_timeslice_width, p=0)
-            # ),
+            "random_orders_and_skus": lambda sev: combine_strategies(
+                strategy_random_orders(self.handles, p=0.5 * default_percent * sev),
+                strategy_random_skus(self.handles, p=0.5 * default_percent * sev),
+                strategy_ending_timeslice_mix(
+                    self.handles, self.current_solution, default_timeslice_width, p=0
+                ),
+            ),
             "random_lanes": lambda sev: combine_strategies(
                 strategy_ending_timeslice_mix(
                     self.handles, self.current_solution, default_timeslice_width, p=0
@@ -643,44 +660,64 @@ class StrategyManager:
                     self.handles, self.current_solution, default_n_lanes + sev
                 ),
             ),
-            # "single_timeslice": lambda sev: combine_strategies(strategy_ending_timeslice_mix(self.handles, self.current_solution, default_timeslice_width, p=0),strategy_multi_random_timeslice(
-            #     self.handles, self.current_solution, 1, default_timeslice_width * sev
-            # )),
-            # "double_timeslice": lambda sev: combine_strategies(strategy_ending_timeslice_mix(self.handles, self.current_solution, default_timeslice_width, p=0),strategy_multi_random_timeslice(
-            #     self.handles, self.current_solution, 2, default_timeslice_width * sev
-            # )),
-            # "triple_timeslice": lambda sev: combine_strategies(strategy_ending_timeslice_mix(self.handles, self.current_solution, default_timeslice_width, p=0),strategy_multi_random_timeslice(
-            #     self.handles, self.current_solution, 3, default_timeslice_width * sev
-            # )),
-            "movecap_balancing_timeslice": lambda sev: (
-                combine_strategies(
-                    strategy_ending_timeslice_mix(
-                        self.handles,
-                        self.current_solution,
-                        default_timeslice_width,
-                        p=0,
-                    ),
-                    strategy_movecap_balancing_slices(
-                        self.handles,
-                        self.current_solution,
-                        default_timeslice_width * sev,
-                    ),
-                )
+            "single_timeslice": lambda sev: combine_strategies(
+                strategy_ending_timeslice_mix(
+                    self.handles, self.current_solution, default_timeslice_width, p=0
+                ),
+                strategy_multi_random_timeslice(
+                    self.handles,
+                    self.current_solution,
+                    1,
+                    default_timeslice_width * sev,
+                ),
             ),
-            "pickface_balancing_station_timeslice": lambda sev: (
-                combine_strategies(
-                    strategy_ending_timeslice_mix(
-                        self.handles,
-                        self.current_solution,
-                        default_timeslice_width,
-                        p=0,
-                    ),
-                    strategy_pickface_balancing_station_slices(
-                        self.handles,
-                        self.current_solution,
-                        default_timeslice_width * sev,
-                    ),
-                )
+            "double_timeslice": lambda sev: combine_strategies(
+                strategy_ending_timeslice_mix(
+                    self.handles, self.current_solution, default_timeslice_width, p=0
+                ),
+                strategy_multi_random_timeslice(
+                    self.handles,
+                    self.current_solution,
+                    2,
+                    default_timeslice_width * sev,
+                ),
+            ),
+            "triple_timeslice": lambda sev: combine_strategies(
+                strategy_ending_timeslice_mix(
+                    self.handles, self.current_solution, default_timeslice_width, p=0
+                ),
+                strategy_multi_random_timeslice(
+                    self.handles,
+                    self.current_solution,
+                    3,
+                    default_timeslice_width * sev,
+                ),
+            ),
+            "movecap_balancing_timeslice": lambda sev: combine_strategies(
+                strategy_ending_timeslice_mix(
+                    self.handles,
+                    self.current_solution,
+                    default_timeslice_width,
+                    p=0,
+                ),
+                strategy_movecap_balancing_slices(
+                    self.handles,
+                    self.current_solution,
+                    default_timeslice_width * sev,
+                ),
+            ),
+            "pickface_balancing_station_timeslice": lambda sev: combine_strategies(
+                strategy_ending_timeslice_mix(
+                    self.handles,
+                    self.current_solution,
+                    default_timeslice_width,
+                    p=0,
+                ),
+                strategy_pickface_balancing_station_slices(
+                    self.handles,
+                    self.current_solution,
+                    default_timeslice_width * sev,
+                ),
             ),
         }
 
