@@ -21,6 +21,7 @@ Conventions
 
 import argparse
 import glob
+from datetime import datetime
 import os
 import re
 
@@ -127,7 +128,9 @@ def load(exp_dir):
                                 extraction=extr, final=final,
                                 first_sol_time=inc[0][0] if inc else np.nan))
 
-        exp = sorted(glob.glob(os.path.join(d, "experiments", "*")))[-1]
+        # latest experiment (folder names are DD-MM-YYYY_HH-MM-SS, not sortable as text)
+        exp = max(glob.glob(os.path.join(d, "experiments", "*")),
+                  key=lambda x: datetime.strptime(os.path.basename(x), "%d-%m-%Y_%H-%M-%S"))
         df = pd.read_pickle(os.path.join(exp, "experiment_dataframe.pkl"))
         with open(os.path.join(exp, "run_1.log")) as f:
             log = f.read()

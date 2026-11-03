@@ -203,6 +203,9 @@ def build_model(
     exo_station_bins: dict = None,  # station -> list of (start, end) bin presences
     obj_offsets=None,  # subproblem.ObjectiveOffsets: frozen part of every KPI
 ):
+    if objective_func not in CPP_OBJECTIVES:
+        # the C++ model would silently fall back to makespan
+        raise ValueError(f"C++ model does not support objective '{objective_func}'")
     S, L, K, orders_req, rt, p, N = instance
     move_cap = instance.movecap
     pick_cap = getattr(instance, "pickcap", None)
@@ -258,7 +261,15 @@ def build_model(
     return CppModelWrapper(cpp_model), build_handles(instance, horizon)
 
 
+CPP_OBJECTIVES = ("makespan", "bin_fetches", "total_flow_time", "idle_time", "max_picks")
+
+
 class CppModelWrapper:
+    def set_objective(self, target):
+        if target not in CPP_OBJECTIVES:
+            raise ValueError(f"C++ model does not support objective '{target}'")
+        self._cpp_model.set_objective(target)
+
     def __init__(self, cpp_model):
         self._cpp_model = cpp_model
         self._listener = None

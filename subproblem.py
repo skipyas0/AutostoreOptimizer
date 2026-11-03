@@ -102,6 +102,35 @@ def _present(var_sols, var):
     return None
 
 
+def close_under_sharing(solution, handles, active_orders) -> list:
+    """Add every order that shares a bin visit with an active order (fixed point).
+
+    After the closure no bin visit serves both active and frozen orders, so the
+    incumbent restricted to the active orders is a complete, feasible warm start
+    (``FrozenContext.shared_picks`` is empty) and the subproblem can always
+    reproduce the incumbent's KPIs.
+    """
+    vs = solution.var_sols
+    P, B = handles["P"], handles["B"]
+    demand = handles["orders_demanding_sku"]
+    active = set(active_orders)
+    visits = []  # orders served by each shared visit
+    for (s, k, e), b_var in B.items():
+        if _present(vs, b_var) is None:
+            continue
+        served = [o for o in demand[k] if _present(vs, P[(o, s, k, e)]) is not None]
+        if len(served) > 1:
+            visits.append(set(served))
+    changed = True
+    while changed:
+        changed = False
+        for served in visits:
+            if served & active and not served <= active:
+                active |= served
+                changed = True
+    return sorted(active)
+
+
 def extract_context(solution, handles, instance, active_orders) -> FrozenContext:
     """Split the incumbent into the active part (warm start) and the frozen part (exo data)."""
     vs = solution.var_sols

@@ -133,6 +133,19 @@ def unfreeze_bin_attributes(handles, active_o, active_e):
     return unfrozen
 
 
+LNS_VAR_GROUPS = ("I_os", "I_os_lane", "C", "P", "F", "R", "B", "Block")
+
+
+def lns_decision_vars(handles):
+    """Interval variables an LNS neighbourhood can free (see unfreeze_*_attributes).
+
+    A solve result also contains auxiliary variables (station_span_*, shift_len_*,
+    shift_cost_*). They are fully determined by the decision variables and must
+    never be frozen: a frozen station span pins every station's makespan.
+    """
+    return {v for key in LNS_VAR_GROUPS for v in handles[key].values()}
+
+
 class FreezeManager:
     def __init__(self, mdl, backend="docplex", horizon=None):
         self.mdl = mdl
@@ -142,9 +155,12 @@ class FreezeManager:
         self.active_constraints = {}
         self.active_frozen_vars = set()
 
-    def apply_delta_freezing(self, solution, to_optimize, all_intervals_flat):
+    def apply_delta_freezing(self, solution, to_optimize, handles):
         # 1. Identify the target state
-        all_vars = {v.get_var() for v in solution.get_all_var_solutions()}
+        decision = lns_decision_vars(handles)
+        all_vars = {
+            v.get_var() for v in solution.get_all_var_solutions() if v.get_var() in decision
+        }
         target_frozen_vars = all_vars - to_optimize
         current_frozen_vars = set(self.active_constraints.keys())
 
@@ -192,11 +208,12 @@ class FreezeManager:
 def generate_freeze_constraints(model, solution, handles, to_optimize):
     logger.debug(" -- resulted in {} variables for optimization", len(to_optimize))
     freeze_constraints = []
+    decision = lns_decision_vars(handles)
     for var_sol in solution.get_all_var_solutions():
         var = var_sol.get_var()
 
         # Check if the variable object itself is in the set
-        if var in to_optimize:
+        if var in to_optimize or var not in decision:
             continue
 
         if "Interval" in var.type.name:

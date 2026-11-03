@@ -12,8 +12,18 @@ import numpy as np
 import pandas as pd
 
 
+def _is_finished_experiment(path):
+    """Timestamp-named folder with a saved config (unfinished runs have none)."""
+    try:
+        datetime.strptime(os.path.basename(path), "%d-%m-%Y_%H-%M-%S")
+    except ValueError:
+        return False
+    return os.path.isfile(f"{path}/experiment_config.json")
+
+
 def find_experiment_folders(instances, experiment):
     # find target config
+    target_config = None
     for instance in instances:
         if os.path.isdir(
             f"precalculated_instances/{instance}/experiments/{experiment}"
@@ -36,7 +46,11 @@ def find_experiment_folders(instances, experiment):
     instance_experiments = {}
     for instance in instances:
         print(f"Looking for target config in experiments of instance {instance}")
-        exp_folders = os.listdir(f"precalculated_instances/{instance}/experiments/")
+        exp_folders = [
+            x
+            for x in os.listdir(f"precalculated_instances/{instance}/experiments/")
+            if _is_finished_experiment(f"precalculated_instances/{instance}/experiments/{x}")
+        ]
         sorted_exp_folders = sorted(
             exp_folders,
             key=lambda x: datetime.strptime(x, "%d-%m-%Y_%H-%M-%S"),

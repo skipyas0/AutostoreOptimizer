@@ -592,7 +592,7 @@ class StrategyManager:
                 strategy_frequently_refetched_skus(
                     self.handles,
                     self.current_solution,
-                    p=default_percent * sev,
+                    p=0.01 * sev,  # use default percent = 1%
                     weighted=False,
                 ),
             ),
@@ -603,7 +603,7 @@ class StrategyManager:
                 strategy_frequently_refetched_skus(
                     self.handles,
                     self.current_solution,
-                    p=default_percent * sev,
+                    p=0.01 * sev,  # use default percent = 1%
                     weighted=True,
                 ),
             ),
@@ -733,7 +733,7 @@ class StrategyManager:
             ],
             "random_orders": ["random_orders"],
             "bottlenecks": [
-                "frequently_refetched_skus",
+                "refetched_skus",
                 "cycle_time_weighted_refetched_skus",
                 "longest_orders",
                 "history_selection_frequency",

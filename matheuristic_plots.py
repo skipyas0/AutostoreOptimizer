@@ -154,14 +154,22 @@ class VisualLogger:
     def __init__(
         self, instance_folder, instance_config, experiment_config, instance=None
     ):
-        self.experiment_timestamp = datetime.now().strftime("%d-%m-%Y_%H-%M-%S")
 
         self.instance = instance
         self.instance_folder = instance_folder
         self.instance_config = instance_config
         self.experiment_config = experiment_config
-        self.path = f"{self.instance_folder}/experiments/{self.experiment_timestamp}"
-        os.makedirs(self.path, exist_ok=True)
+        # Runs started in the same second (parallel / array jobs) must not share a
+        # folder: wait for a free timestamp (the name format is parsed by analysis scripts)
+        os.makedirs(f"{self.instance_folder}/experiments", exist_ok=True)
+        while True:
+            self.experiment_timestamp = datetime.now().strftime("%d-%m-%Y_%H-%M-%S")
+            self.path = f"{self.instance_folder}/experiments/{self.experiment_timestamp}"
+            try:
+                os.makedirs(self.path)
+                break
+            except FileExistsError:
+                time.sleep(0.2 + 0.05 * (os.getpid() % 7))  # no global RNG use
 
         self.logger_start_time = time.perf_counter()
         self.last_time = self.logger_start_time

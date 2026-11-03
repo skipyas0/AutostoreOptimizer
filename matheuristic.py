@@ -129,6 +129,24 @@ def load_instance(instance_config=None, instance_folder=None):
     return instance, heur_sol, instance_folder, instance_config
 
 
+def heuristic_kpis(heur_sol, instance):
+    """All five model KPIs of a heuristic solution (same definitions as the CP models)."""
+    span, pick_time, pick_count = {}, {}, {}
+    for o, (s, ln, start, end) in heur_sol.order_assignments.items():
+        lo, hi = span.get(s, (start, end))
+        span[s] = (min(lo, start), max(hi, end))
+    for (o, s, k) in heur_sol.pick_events:
+        pick_time[s] = pick_time.get(s, 0) + instance.p[k]
+        pick_count[s] = pick_count.get(s, 0) + 1
+    return {
+        "makespan": heur_sol.makespan,
+        "bin_fetches": sum(len(events) for events in heur_sol.bin_events.values()),
+        "total_flow_time": sum(a[3] for a in heur_sol.order_assignments.values()),
+        "idle_time": sum(hi - lo - pick_time.get(s, 0) for s, (lo, hi) in span.items()),
+        "max_picks": max(pick_count.values(), default=0),
+    }
+
+
 def prepare_model_docplex(config, instance, heur_sol, objective_func):
 
     mdl, handles = docplex_model.build_model(
@@ -160,15 +178,7 @@ def prepare_model_cpp(config, instance, heur_sol, objective_func):
                 "status": "Feasible",
                 "objective": heur_sol.makespan,
                 "var_solutions": mock_sp.state_dict,
-                "kpis": {
-                    "makespan": heur_sol.makespan,
-                    "bin_fetches": sum(
-                        len(events) for events in heur_sol.bin_events.values()
-                    ),
-                    "total_flow_time": sum(
-                        end for s, ln, start, end in heur_sol.order_assignments.values()
-                    ),
-                },
+                "kpis": heuristic_kpis(heur_sol, instance),
             }
         ),
     )
@@ -193,15 +203,7 @@ def prepare_model_subproblem(config, instance, heur_sol):
                 "status": "Feasible",
                 "objective": heur_sol.makespan,
                 "var_solutions": mock_sp.state_dict,
-                "kpis": {
-                    "makespan": heur_sol.makespan,
-                    "bin_fetches": sum(
-                        len(events) for events in heur_sol.bin_events.values()
-                    ),
-                    "total_flow_time": sum(
-                        end for s, ln, start, end in heur_sol.order_assignments.values()
-                    ),
-                },
+                "kpis": heuristic_kpis(heur_sol, instance),
             }
         ),
     )
@@ -241,11 +243,25 @@ class Solver:
             else:
                 raise ValueError(phase)
 
+        if "total_wages" in self.cycling_schedule + [experiment_config["cp_objective"]] and (
+            experiment_config["backend"] != "docplex" or self.subproblem_mode
+        ):
+            raise ValueError(
+                "total_wages ('w') needs --backend docplex --lns-model full "
+                "(the C++ model and subproblem offsets do not implement it)"
+            )
         self.cp_obj = experiment_config["cp_objective"]
-        self.cycle_ix = self.cycling_schedule.index(self.cp_obj)
+        self.cycle_ix = self._initial_cycle_ix()
         for run in range(self.experiment_config["runs"]):
             self.run_solver()
         self.vlg.save_experiment()
+
+    def _initial_cycle_ix(self):
+        """Position of --cp-objective in the schedule (0 if it is not in it)."""
+        obj = self.experiment_config["cp_objective"]
+        if obj in self.cycling_schedule:
+            return self.cycling_schedule.index(obj)
+        return 0
 
     def update_iteration_objective(self, mdl, target="makespan"):
         """Swaps the active objective function for the current LNS iteration."""
@@ -291,6 +307,27 @@ class Solver:
             )
             mdl.set_objective(target)
             self.cp_obj = target
+
+    def improvement_bound(self):
+        """Upper bound on the active objective for the next CP call (-1 = none).
+
+        'current' (default): the incumbent's own value minus one, as for makespan.
+        'best' (behaviour before Nov 2026): the best value of that KPI seen so far
+        in the run. Acceptance is by makespan only, so for the other objectives the
+        incumbent drifts away from that best and the bound soon becomes
+        unreachable inside a neighbourhood (the iteration then times out).
+        """
+        if not self.experiment_config["improvement_constr"]:
+            return -1
+        if self.cp_obj == "makespan":
+            return int(self.current_result - 1)
+        if self.experiment_config.get("improvement_ref", "current") == "best":
+            ref = getattr(self, f"best_{self.cp_obj}", -1)
+        else:
+            ref = self.current_solution.get_kpis().get(self.cp_obj, -1)
+        if ref is None or ref == -1:
+            return -1
+        return int(ref - 1)
 
     def rrt_acceptance(self, sol_object, solve_status=None):
         """
@@ -346,7 +383,12 @@ class Solver:
 
             if incumbent > self.current_result + 1e-6:
                 if solve_status != "Feasible" and self.cp_obj == "makespan":
-                    raise AssertionError
+                    # Only possible when the subproblem cannot represent the
+                    # incumbent (subproblem mode with --no-close-sharing)
+                    logger.warning(
+                        f"Optimal makespan subproblem is worse than the incumbent "
+                        f"({incumbent} > {self.current_result})"
+                    )
                 status = Status.Feasible_Degradation
             elif incumbent >= self.current_result:
                 status = (
@@ -446,7 +488,7 @@ class Solver:
             to_add, to_remove = self.freeze_manager.apply_delta_freezing(
                 self.current_solution,
                 to_optimize,
-                self.handles.get("all_intervals_flat"),
+                self.handles,
             )
             freeze_constraints = self.freeze_manager.active_constraints
             logger.info(
@@ -457,7 +499,7 @@ class Solver:
                 self.mdl,
                 self.current_solution,
                 self.handles,
-                strategy_results,
+                to_optimize,
             )
             to_remove = old_freeze_constraints
             freeze_constraints = to_add
@@ -629,13 +671,16 @@ class Solver:
         self.severity = 1
         self.stagnation_count = 0
 
+        # Per-run state: every run starts from the heuristic with the configured
+        # objective (the model above was built with it) at the start of the cycle.
+        self.cp_obj = self.experiment_config["cp_objective"]
+        self.cycle_ix = self._initial_cycle_ix()
+        start_kpis = heuristic_kpis(self.heur_sol, self.instance)
         self.best_result = self.heur_sol.makespan
-        self.best_bin_fetches = sum(
-            len(events) for events in self.heur_sol.bin_events.values()
-        )
-        self.best_total_flow_time = sum(
-            end for s, ln, start, end in self.heur_sol.order_assignments.values()
-        )
+        self.best_bin_fetches = start_kpis["bin_fetches"]
+        self.best_total_flow_time = start_kpis["total_flow_time"]
+        self.best_idle_time = start_kpis["idle_time"]
+        self.best_max_picks = start_kpis["max_picks"]
 
         self.best_solution = sp
         self.current_solution = self.best_solution
@@ -687,6 +732,12 @@ class Solver:
                 active_orders = get_associated_indices(
                     self.handles, self.current_solution, strategy_results
                 )[0]
+                if self.experiment_config.get("close_sharing", True):
+                    # The logged unfrozen set (to_optimize) stays the strategy's
+                    # selection, comparable with runs without the closure.
+                    active_orders = subproblem.close_under_sharing(
+                        self.current_solution, self.handles, active_orders
+                    )
             to_optimize = get_optimized_set(
                 self.handles, self.current_solution, strategy_results
             )
@@ -756,30 +807,7 @@ class Solver:
                 next_obj = self.cycling_schedule[self.cycle_ix]
                 self.update_iteration_objective(self.mdl, next_obj)
 
-            impr_bound = -1
-            if self.experiment_config["improvement_constr"]:
-                if self.cp_obj == "makespan":
-                    impr_bound = int(self.current_result - 1)
-                elif (
-                    self.cp_obj == "bin_fetches"
-                    and getattr(self, "best_bin_fetches", -1) != -1
-                ):
-                    impr_bound = int(self.best_bin_fetches - 1)
-                elif (
-                    self.cp_obj == "total_flow_time"
-                    and getattr(self, "best_total_flow_time", -1) != -1
-                ):
-                    impr_bound = int(self.best_total_flow_time - 1)
-                elif (
-                    self.cp_obj == "idle_time"
-                    and getattr(self, "best_idle_time", -1) != -1
-                ):
-                    impr_bound = int(self.best_idle_time - 1)
-                elif (
-                    self.cp_obj == "max_picks"
-                    and getattr(self, "best_max_picks", -1) != -1
-                ):
-                    impr_bound = int(self.best_max_picks - 1)
+            impr_bound = self.improvement_bound()
 
             if self.subproblem_mode:
                 sol, progress = self.solve_subproblem(
@@ -800,9 +828,9 @@ class Solver:
                     self.obj_constraint = None
 
                 if impr_bound != -1:
-                    self.obj_constraint = self.mdl.add(
-                        self.handles[self.cp_obj] <= impr_bound
-                    )
+                    # keep the expression: CpoModel.add() returns None
+                    self.obj_constraint = self.handles[self.cp_obj] <= impr_bound
+                    self.mdl.add(self.obj_constraint)
 
                 # run solve on partially frozen model
                 self.vlg.time_from_here()
@@ -911,7 +939,7 @@ if __name__ == "__main__":
         "--iters",
         type=int,
         default=None,
-        help="Number of iterations per run (default: 300)",
+        help="Number of iterations per run (exactly one of --iters / --time-limit is required)",
     )
     parser.add_argument(
         "--stagnation-th",
@@ -933,7 +961,7 @@ if __name__ == "__main__":
         type=str,
         default="none",
         choices=["none", "new_best", "status"],
-        help="Presolve setting for CP Optimizer",
+        help="Unused (kept only so old experiment configs stay comparable)",
     )
 
     parser.add_argument(
@@ -987,7 +1015,7 @@ if __name__ == "__main__":
         "--strat-preset",
         type=str,
         default="all",
-        choices=["all", "shaw_random", "random_balance", "random_orders"],
+        choices=["all", "shaw_random", "random_balance", "random_orders", "bottlenecks", "seem_to_work_best"],
         help="Which strategies are used during optimization (presets defined in neighborhood_selection.py)",
     )
 
@@ -1032,7 +1060,7 @@ if __name__ == "__main__":
         action=argparse.BooleanOptionalAction,
         default=True,
         dest="delta_freezing",
-        help="Use delta freezing for updating the freeze constraints (default: True)",
+        help="Use delta freezing for updating the freeze constraints",
     )
 
     parser.add_argument(
@@ -1040,7 +1068,7 @@ if __name__ == "__main__":
         action=argparse.BooleanOptionalAction,
         default=False,
         dest="improvement_constr",
-        help="Add improvement of the makespan over current as a new constraint in each iteration (default: True)",
+        help="Require each CP call to improve the active objective by at least 1 (see --improvement-ref)",
     )
 
     parser.add_argument(
@@ -1048,7 +1076,7 @@ if __name__ == "__main__":
         action=argparse.BooleanOptionalAction,
         default=True,
         dest="starting_point_for_frozen",
-        help="Initialize the starting point for frozen variables too (default: True)",
+        help="Initialize the starting point for frozen variables too",
     )
 
     parser.add_argument(
@@ -1118,6 +1146,25 @@ if __name__ == "__main__":
         "(frozen orders enter as fixed intervals and objective constants).",
     )
     parser.add_argument(
+        "--close-sharing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        dest="close_sharing",
+        help="Subproblem mode: add every frozen order that shares a bin visit with an "
+        "active order to the neighbourhood, so the subproblem can always reproduce the "
+        "incumbent (see KNOWN_ISSUES.md, 'Subproblem LNS: shared bin visits')",
+    )
+    parser.add_argument(
+        "--improvement-ref",
+        type=str,
+        default="current",
+        choices=["current", "best"],
+        dest="improvement_ref",
+        help="With --improvement-constr, what a non-makespan objective must improve on: "
+        "the incumbent's value ('current', as for makespan) or the best value seen in the "
+        "run ('best', behaviour before Nov 2026) (default: current)",
+    )
+    parser.add_argument(
         "--validate-merges",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -1166,6 +1213,8 @@ if __name__ == "__main__":
             "only_first_sol": args.only_first_sol,
             "lns_model": args.lns_model,
             "validate_merges": args.validate_merges,
+            "close_sharing": args.close_sharing,
+            "improvement_ref": args.improvement_ref,
         }
         solver = Solver(
             experiment_config,

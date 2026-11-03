@@ -126,11 +126,11 @@ class TestNeighborhoodSelection(unittest.TestCase):
             weighted_jaccard_matrix={},
             strategy_preset="bottlenecks",
         )
-        self.assertIn("frequently_refetched_skus", manager.active_strats)
+        self.assertIn("refetched_skus", manager.active_strats)
         self.assertIn("cycle_time_weighted_refetched_skus", manager.active_strats)
         self.assertIn("longest_orders", manager.active_strats)
 
-        res_refetched = manager.active_strats["frequently_refetched_skus"](1)
+        res_refetched = manager.active_strats["refetched_skus"](1)
         self.assertTrue(len(res_refetched.seed_skus) > 0)
 
         res_longest = manager.active_strats["longest_orders"](1)

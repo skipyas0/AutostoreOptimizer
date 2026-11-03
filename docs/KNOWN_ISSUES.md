@@ -6,7 +6,7 @@ records its effect, measured with `tests/regression/equivalence.py --ref <previo
 
 ## Open
 
-### Subproblem LNS: shared bin visits
+### Subproblem LNS: shared bin visits (mitigated by `--close-sharing`, default on)
 In subproblem mode (`--lns-model subproblem`, `subproblem.py`) a bin visit is frozen as soon as it serves at least one
 frozen order. Its fetch, presence and return become fixed intervals in the subproblem. Two consequences:
 - **Active orders cannot join a frozen visit.** In the full-model LNS an active order can still pick from a visit
@@ -14,17 +14,35 @@ frozen order. Its fetch, presence and return become fixed intervals in the subpr
   needs a new visit, so sharing with frozen orders is never created, and the subproblem never removes a fetch by
   merging into one.
 - **The incumbent may not be representable.** If an active order currently picks from a frozen visit, its old pick
-  is dropped from the warm start, and the subproblem must give it a new visit. The incumbent's objective may then be
-  unreachable inside the subproblem. The frozen visit itself stays unchanged, so it is never shortened either.
+  is dropped from the warm start, and the subproblem must give it a new visit. The starting point is then worse than
+  the incumbent in every KPI (one extra fetch per dropped pick, often more flow time, sometimes more makespan).
 
-How often: rare on the benchmark instances (about 2 000 bin visits for about 2 010 order lines on the 600-order
-instances, so almost no sharing). Common on instances with few SKUs: in `tests/test_subproblem.py` (24 orders, 60
-SKUs) most random neighbourhoods contain such an order. The number per iteration is in `FrozenContext.shared_picks`
-and is logged at debug level.
+How often (measured Nov 2026): 43% of the strategies' neighbourhoods on the 600-order benchmark instance
+(`GEN4-15-3-28750-600-40`) contain such a pick, and most neighbourhoods on instances with ≤ 1000 SKUs. Without a fix,
+every such iteration starts behind the incumbent; with `--improvement-constr` the `bin_fetches` / `idle_time` /
+`total_flow_time` phases then almost never find a solution, and accepted solutions slowly lose bin sharing.
 
-Possible fixes: close each neighbourhood under sharing (add every frozen order that shares a visit with an active
-order, as `_close_under_sharing` in the tests does), or pass frozen visits that serve active orders as joinable
-"exo visits" with fixed fetch/return but open picks.
+**Mitigation:** `--close-sharing` (default) adds every frozen order that shares a visit with an active order to the
+neighbourhood (`subproblem.close_under_sharing`, fixed point). The warm start then reproduces the incumbent exactly
+(all five KPIs, checked in `tests/test_subproblem.py`). It grows neighbourhoods by about 2.5% on the benchmark
+instance and costs about 0.03 s per iteration. The logged unfrozen set (`num_optimized`, barcodes) stays the
+strategy's selection. `--no-close-sharing` restores the behaviour of the subproblem experiments before Nov 2026.
+The first consequence (no new sharing with frozen orders) remains; a fix would pass frozen visits that serve active
+orders as joinable "exo visits" with fixed fetch/return but open picks.
+
+### Acceptance is by makespan only
+`Solver.rrt_acceptance` compares makespans, whatever the active objective. In a `bin_fetches` / `total_flow_time` /
+`idle_time` phase, a solution that improves that KPI at equal makespan is logged as `*_No_Improve` (and accepted); one
+that also worsens makespan beyond the RRT threshold is rejected. To see whether such phases work, compare the
+phase's KPI (`current_<kpi>` columns of `experiment_dataframe.pkl`) before and after each iteration, not the status.
+
+### Refetched-SKU strategies select most of the instance
+`refetched_skus` and `cycle_time_weighted_refetched_skus` (re-enabled in `df6a647`) pick the top `default_percent`
+of SKUs by number of fetches, and every order needing one of them becomes active. The most refetched SKUs are the
+popular ones, so on the 600-order benchmark instance they select about 470–500 of 600 orders (all other strategies:
+24–150). One such iteration took 140–170 s (presolve of an almost full model) with `--iter-time-limit 5`, as
+`--iter-time-mode search` does not bound extraction / presolve. Since the code freeze both use a fixed `p = 0.01 * severity`
+(independent of `--default-percent`); they still select about 340 of 600 orders at severity 1.
 
 ### Sharing under PickCap = 1 is structurally limited
 With PickCap = 1, sharing a bin visit means picking *after* the previous order, so the presence must be stretched
@@ -122,7 +140,24 @@ Partitioned RDI with zero orders returns an empty feasible solution.
 | Benchmark: infeasible monolithic solutions got `W_k = 0`; `movecap=None` crashed the metrics | `W_k` is always the assigned workload; infeasible stations get the 50000 makespan penalty; `movecap` can no longer be None | `4d3f486` |
 | RDI lazy cache could commit a stale plan that broke MoveCap: when deciding which cached plans to re-plan after a commit, only *new* bin moves were compared, not the shifted return of an extended shared bin. It did not occur in the regression grid with default settings, but did with the sharing options (`MoveCap violation: 5 > 4`) | `_plan_moves` includes extended shared-bin returns; regression test `test_rdi_lazy_cache_keeps_movecap_with_extensions` | after `4d3f486` |
 
+Found in the pre-code-freeze audit (Nov 2026); runs with these settings from before are affected as noted:
+
+| Issue | Resolution |
+|---|---|
+| docplex full-model LNS: after the first iteration, auxiliary variables of the solve result (`station_span_*`, `shift_len_*`, `shift_cost_*`) were frozen with the rest, pinning every station's span, so makespan could not improve (every iteration `Optimal_No_Improve` / `Infeasible`). Since `b3f3bad` (9 Oct 2026); the C++ backend was not affected | `freezing_utils.lns_decision_vars`: only LNS decision variables are frozen. Test `tests/test_lns_full_docplex.py` |
+| docplex full-model LNS with `--improvement-constr`: the bound constraint was never removed (`CpoModel.add` returns `None`), so bounds piled up (with objective cycling: bounds on every KPI at once → infeasible) | the expression is kept and removed before the next solve |
+| docplex full-model LNS with `--no-delta-freezing` crashed (the strategy result was passed instead of the variable set) | passes `to_optimize` |
+| `--improvement-constr` bounded non-makespan objectives by the *best* value seen in the run, makespan by the *current* one. With makespan acceptance the incumbent drifts away from those bests, so the bound soon became unreachable (iterations time out with `Unknown`) | `--improvement-ref current` (default) bounds every objective by the incumbent's value; `best` restores the old behaviour |
+| `--runs > 1`: the objective, the cycle position and `best_idle_time` / `best_max_picks` carried over from the previous run (run 2 started mid-cycle, and the improvement bound could refer to the wrong objective) | reset at the start of every run |
+| `--cp-objective X` crashed when X was not in `--cp-objective-phase-schedule` | starts at the first phase |
+| The initial solution had no `idle_time` / `max_picks` KPIs, so their first phases had no improvement bound | `matheuristic.heuristic_kpis` (same definitions as the CP models) |
+| A `w` (wages) phase with `--backend cpp` or in subproblem mode silently optimised makespan | rejected with an error; the C++ wrapper rejects unknown objectives |
+| Two runs started in the same second on the same instance wrote into the same experiment folder | `VisualLogger` waits for a free timestamp (folder name format unchanged) |
+| `--strat-preset bottlenecks` silently dropped `refetched_skus` (old name) | preset fixed; `bottlenecks` and `seem_to_work_best` are now CLI choices |
+| `analyze_experiment1.py` picked the "latest" experiment by text sort of `DD-MM-YYYY` names; `analyze_lns_experiments.py` crashed on unfinished experiment folders | sort by parsed date; unfinished folders are skipped |
+
 ## Removed dead code
+
 
 - `compute_U`, `static_priority_sort` (now `Rule("sharing_degree", False)`)
 - `compute_dirty_set` (RDI), `score_cluster_at_station` / `snapshot_state` (CFSS)

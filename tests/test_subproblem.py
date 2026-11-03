@@ -96,6 +96,16 @@ def _close_under_sharing(sol, handles, active):
     return sorted(active)
 
 
+def test_close_under_sharing(setup):
+    """Production closure = reference fixed point; afterwards no shared frozen visit."""
+    inst, handles, sol = setup
+    for active in _random_neighbourhoods(handles, 10, seed=3):
+        closed = subproblem.close_under_sharing(sol, handles, active)
+        assert closed == _close_under_sharing(sol, handles, active)
+        assert set(active) <= set(closed)
+        assert not subproblem.extract_context(sol, handles, inst, closed).shared_picks
+
+
 def test_all_orders_subproblem_is_full_model(setup, tmp_path):
     inst, handles, sol = setup
     ctx = subproblem.extract_context(sol, handles, inst, handles["O"])
@@ -115,7 +125,7 @@ def test_warm_start_reproduces_incumbent(setup, backend):
     checked = 0
     for active in _random_neighbourhoods(handles, 8, seed=0):
         # Shared frozen visits make the incumbent unrepresentable (see KNOWN_ISSUES)
-        active = _close_under_sharing(sol, handles, active)
+        active = subproblem.close_under_sharing(sol, handles, active)
         ctx = subproblem.extract_context(sol, handles, inst, active)
         assert not ctx.shared_picks
         mdl, sub_handles = subproblem.build_submodel(ctx, backend, H, "makespan")
@@ -128,6 +138,9 @@ def test_warm_start_reproduces_incumbent(setup, backend):
         reported = merged.get_kpis()
         for name, value in current.items():
             assert reported[name] == value, (name, active)
+        # idle_time / max_picks of the start solution come from matheuristic.heuristic_kpis
+        for name in ("idle_time", "max_picks"):
+            assert reported[name] == sol.get_kpis()[name], (name, active)
         checked += 1
     assert checked == 8
 
@@ -167,8 +180,9 @@ def test_bound_shortcut(setup):
     assert not subproblem.violates_bound(ctx, "makespan", hs.makespan - 1)
 
 
+@pytest.mark.parametrize("cycling", [False, True], ids=["makespan", "cycling"])
 @pytest.mark.parametrize("backend", BACKENDS)
-def test_lns_end_to_end(tmp_path, backend):
+def test_lns_end_to_end(tmp_path, backend, cycling):
     from matheuristic import Solver
 
     inst = generate_data(num_stations=2, lanes_per_station=2, num_orders=16, num_skus=40,
@@ -194,12 +208,21 @@ def test_lns_end_to_end(tmp_path, backend):
         "default_percent": 0.2, "cp_objective": "makespan",
         "cp_objective_phase_duration": 0, "cp_objective_phase_schedule": "m",
         "render_video": False, "only_first_sol": False,
-        "lns_model": "subproblem", "validate_merges": True,
+        "lns_model": "subproblem", "validate_merges": True, "close_sharing": True,
+        "improvement_ref": "current",
     }
+    if cycling:
+        cfg.update(runs=2, iters=8, cp_objective_phase_duration=1,
+                   cp_objective_phase_schedule="mfbi")
     solver = Solver(cfg, instance_path=str(folder))
     assert solver.best_result <= heur.makespan
     final = HeuristicSolution.from_cp(solver.best_solution, solver.handles)
     assert final.validate(inst, horizon=H) == []
+    if cycling:
+        # every run starts at the beginning of the objective cycle
+        seqs = [list(g.cp_obj) for _, g in solver.vlg.df.groupby("run_id")]
+        assert len(seqs) == 2 and seqs[0] == seqs[1], seqs
+        assert set(seqs[0]) == {"makespan", "total_flow_time", "bin_fetches", "idle_time"}
 
 
 @pytest.mark.skipif("cpp" not in BACKENDS, reason="C++ extension not built")
