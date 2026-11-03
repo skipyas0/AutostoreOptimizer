@@ -36,14 +36,6 @@ orders as joinable "exo visits" with fixed fetch/return but open picks.
 that also worsens makespan beyond the RRT threshold is rejected. To see whether such phases work, compare the
 phase's KPI (`current_<kpi>` columns of `experiment_dataframe.pkl`) before and after each iteration, not the status.
 
-### Refetched-SKU strategies select most of the instance
-`refetched_skus` and `cycle_time_weighted_refetched_skus` (re-enabled in `df6a647`) pick the top `default_percent`
-of SKUs by number of fetches, and every order needing one of them becomes active. The most refetched SKUs are the
-popular ones, so on the 600-order benchmark instance they select about 470–500 of 600 orders (all other strategies:
-24–150). One such iteration took 140–170 s (presolve of an almost full model) with `--iter-time-limit 5`, as
-`--iter-time-mode search` does not bound extraction / presolve. Since the code freeze both use a fixed `p = 0.01 * severity`
-(independent of `--default-percent`); they still select about 340 of 600 orders at severity 1.
-
 ### Sharing under PickCap = 1 is structurally limited
 With PickCap = 1, sharing a bin visit means picking *after* the previous order, so the presence must be stretched
 while the next order's picker is ready.
@@ -154,6 +146,7 @@ Found in the pre-code-freeze audit (Nov 2026); runs with these settings from bef
 | A `w` (wages) phase with `--backend cpp` or in subproblem mode silently optimised makespan | rejected with an error; the C++ wrapper rejects unknown objectives |
 | Two runs started in the same second on the same instance wrote into the same experiment folder | `VisualLogger` waits for a free timestamp (folder name format unchanged) |
 | `--strat-preset bottlenecks` silently dropped `refetched_skus` (old name) | preset fixed; `bottlenecks` and `seem_to_work_best` are now CLI choices |
+| `refetched_skus` / `cycle_time_weighted_refetched_skus` (re-enabled in `df6a647`) took all of the top `default_percent` SKUs by refetches. These are the popular SKUs, so about 470–500 of 600 orders became active on the benchmark instance (other strategies: 24–150), and one iteration took 140–170 s with `--iter-time-limit 5` | `match_random_demand`: a random subset of those top SKUs whose total demand (orders needing the SKU) stays within the expected demand of `strategy_random_skus` at the same `p`. Now about 170 orders and 11–12 s per iteration on the benchmark instance, the same size as `random_skus` |
 | `analyze_experiment1.py` picked the "latest" experiment by text sort of `DD-MM-YYYY` names; `analyze_lns_experiments.py` crashed on unfinished experiment folders | sort by parsed date; unfinished folders are skipped |
 
 ## Removed dead code

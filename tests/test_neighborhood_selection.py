@@ -67,6 +67,7 @@ class TestNeighborhoodSelection(unittest.TestCase):
             "rt": {1: 10, 2: 2, 3: 50},
             "p": {1: 2, 2: 1, 3: 5},
             "rt_return": {1: 10, 2: 2, 3: 50},
+            "orders_demanding_sku": {1: [101], 2: [102], 3: [103]},
         }
 
         # Order 101 flow time: 100 - 10 = 90
@@ -117,6 +118,27 @@ class TestNeighborhoodSelection(unittest.TestCase):
 
         res_k2 = strategy_cycle_time_weighted_refetched_skus(self.handles, self.solution, k=2)
         self.assertEqual(res_k2.seed_skus, {3, 1})
+
+    def test_refetched_skus_match_random_demand(self):
+        # Fetch ranking 2 > 3 > 1; demand = number of orders needing the SKU
+        demand = {1: [101], 2: [101, 102, 103, 104], 3: [102]}  # total 6
+        handles = {**self.handles, "orders_demanding_sku": demand}
+        # p=2/3 -> pool {2, 3}; budget = 2/3 * 6 = 4 -> {2} or {3}, never both
+        seen = set()
+        for _ in range(30):
+            res = strategy_frequently_refetched_skus(
+                handles, self.solution, p=2 / 3, match_random_demand=True
+            )
+            self.assertIn(frozenset(res.seed_skus), {frozenset({2}), frozenset({3})})
+            seen.add(frozenset(res.seed_skus))
+        self.assertEqual(len(seen), 2)  # random subset, not always the top SKU
+
+        # Top SKU alone exceeds the budget -> still one SKU (the least demanded of the pool)
+        res = strategy_frequently_refetched_skus(
+            {**handles, "orders_demanding_sku": {1: [], 2: list(range(5)), 3: list(range(5))}},
+            self.solution, p=0.34, match_random_demand=True,
+        )
+        self.assertEqual(res.seed_skus, {2})
 
     def test_strategy_manager_registration(self):
         manager = StrategyManager(

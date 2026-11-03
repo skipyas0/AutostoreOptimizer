@@ -298,11 +298,17 @@ def is_interval_present(solution, var) -> bool:
 
 
 def strategy_frequently_refetched_skus(
-    handles, solution, k=None, p=None, weighted: bool = False
+    handles, solution, k=None, p=None, weighted: bool = False,
+    match_random_demand: bool = False,
 ) -> SelectionResult:
     """
     Selects top p% (or k) SKUs with the highest number of refetches.
     If weighted is True, counts total cycle time cost instead: (r + p + r_return) * num_refetch.
+
+    match_random_demand: the top SKUs are the popular ones, so taking all of them
+    activates most orders. Instead, take a random subset of the top SKUs whose total
+    demand (number of orders needing the SKU) stays within the expected demand of the
+    same number of SKUs drawn at random (what strategy_random_skus selects).
     """
     if solution is None:
         return SelectionResult()
@@ -365,8 +371,25 @@ def strategy_frequently_refetched_skus(
     )
 
     candidate_skus = [sku for sku in sorted_skus if scores[sku] > 0]
-    seed_k = set(candidate_skus[:n_select])
-    return SelectionResult(seed_skus=seed_k)
+    pool = candidate_skus[:n_select]
+    if match_random_demand and pool:
+        return SelectionResult(seed_skus=_demand_matched_subset(handles, pool, n_select))
+    return SelectionResult(seed_skus=set(pool))
+
+
+def _demand_matched_subset(handles, pool, n_select):
+    """Random subset of ``pool`` within the expected demand of n_select random SKUs."""
+    demand = {k: len(handles["orders_demanding_sku"][k]) for k in handles["active_K"]}
+    budget = n_select / len(demand) * sum(demand.values())
+    order = random.sample(pool, len(pool))
+    chosen, total = set(), 0
+    for sku in order:
+        if total + demand[sku] <= budget:
+            chosen.add(sku)
+            total += demand[sku]
+    if not chosen:  # every top SKU alone exceeds the budget: take the least demanded
+        chosen.add(min(order, key=lambda sku: demand[sku]))
+    return chosen
 
 
 def strategy_cycle_time_weighted_refetched_skus(
@@ -592,8 +615,9 @@ class StrategyManager:
                 strategy_frequently_refetched_skus(
                     self.handles,
                     self.current_solution,
-                    p=0.01 * sev,  # use default percent = 1%
+                    p=default_percent * sev,
                     weighted=False,
+                    match_random_demand=True,
                 ),
             ),
             "cycle_time_weighted_refetched_skus": lambda sev: combine_strategies(
@@ -603,8 +627,9 @@ class StrategyManager:
                 strategy_frequently_refetched_skus(
                     self.handles,
                     self.current_solution,
-                    p=0.01 * sev,  # use default percent = 1%
+                    p=default_percent * sev,
                     weighted=True,
+                    match_random_demand=True,
                 ),
             ),
             "longest_orders": lambda sev: combine_strategies(
