@@ -1016,7 +1016,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--cp-objective-phase-duration",
         type=int,
-        default="0",
+        default=0,
         help="Every how many iterations to switch the CP objective (0 means no cycling)",
     )
 
@@ -1072,7 +1072,7 @@ if __name__ == "__main__":
         type=float,
         default=0.05,
         dest="rrt_threshold",
-        help="Record-to-Record Travel threshold percentage (default: 0.05 means accept if within 5% of best)",
+        help="Record-to-Record Travel threshold percentage (default: 0.05 means accept if within 5%% of best)",
     )
 
     parser.add_argument(
