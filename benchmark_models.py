@@ -20,6 +20,8 @@ plus timings). Default methods (same labels as before the heuristics refactor):
  10. Load-balanced Share SGC         heuristics: lb_sgc_share
  11. Full Share RDI                  heuristics: rdi_share
  12. Load-balanced Share RDI         heuristics: partitioned_rdi_load_balanced_share
+ 13. Load-balanced Full RDI          heuristics: rdi_lb          (stations above average workload ignored)
+ 14. Load-balanced Full Share RDI    heuristics: rdi_lb_share
 
 ``--methods`` selects a subset by label number/registry name, or ``all`` to add
 EXTRA_METHODS (RDI tiebreakers, AMA, CFSS). All heuristics use horizon 10000.
@@ -126,8 +128,8 @@ def generate_benchmark_instance(
 
     s = rng.randint(2, max_s)
     l = rng.randint(2, max_l)
-    o = rng.randint(2, 8) * o_mul
-    m = rng.randint(4, 8) * m_mul
+    o = 400  # rng.randint(2, 8) * o_mul
+    m = 40  # rng.randint(4, 8) * m_mul
     sku = rng.randint(8, 15) * sku_mul
 
     instance = generate_data(
@@ -338,10 +340,18 @@ DEFAULT_METHODS: dict[str, Callable[[Instance], HeuristicSolution]] = {
         run_heuristic, "lb_sgc_singles", horizon=BENCH_HORIZON
     ),
     "9. Standard Share SGC": partial(run_heuristic, "sgc_share", horizon=BENCH_HORIZON),
-    "10. Load-balanced Share SGC": partial(run_heuristic, "lb_sgc_share", horizon=BENCH_HORIZON),
+    "10. Load-balanced Share SGC": partial(
+        run_heuristic, "lb_sgc_share", horizon=BENCH_HORIZON
+    ),
     "11. Full Share RDI": partial(run_heuristic, "rdi_share", horizon=BENCH_HORIZON),
     "12. Load-balanced Share RDI": partial(
         run_heuristic, "partitioned_rdi_load_balanced_share", horizon=BENCH_HORIZON
+    ),
+    "13. Load-balanced Full RDI": partial(
+        run_heuristic, "rdi_lb", horizon=BENCH_HORIZON
+    ),
+    "14. Load-balanced Full Share RDI": partial(
+        run_heuristic, "rdi_lb_share", horizon=BENCH_HORIZON
     ),
 }
 
@@ -517,7 +527,7 @@ def parse_args():
         nargs="*",
         default=None,
         help="Subset of methods: default labels' leading numbers (1-6), registry names "
-        "(e.g. sgc rdi cfss ama_two_phase), or 'all' (defaults + EXTRA_METHODS). Default: 1-12.",
+        "(e.g. sgc rdi cfss ama_two_phase), or 'all' (defaults + EXTRA_METHODS). Default: 1-14.",
     )
     parser.add_argument(
         "--scale",
@@ -571,6 +581,8 @@ def select_methods(args) -> dict[str, Callable[[Instance], HeuristicSolution]]:
     if args.skip_full_rdi:
         methods.pop("4. Full RDI (No Decomposition)", None)
         methods.pop("11. Full Share RDI", None)
+        methods.pop("13. Load-balanced Full RDI", None)
+        methods.pop("14. Load-balanced Full Share RDI", None)
     if args.skip_rdi:
         methods = {k: v for k, v in methods.items() if not is_rdi_method(k)}
     if args.skip_decomposition:
