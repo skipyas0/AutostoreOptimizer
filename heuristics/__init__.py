@@ -46,6 +46,13 @@ HEURISTICS: dict[str, tuple[Callable[..., HeuristicSolution], dict]] = {
     "rdi_share": (run_rdi, {"extend_share_window": True, "share_reward": 1.0, "legacy_share_bonus": 0.0}),
     "rdi_share_window": (run_rdi, {"extend_share_window": True}),
     "rdi_share_reward": (run_rdi, {"share_reward": 1.0, "legacy_share_bonus": 0.0}),
+    # load-balanced RDI: stations above the average picking workload are ignored
+    # (NB: "lb_rdi"/"load_balanced_rdi" in LNS precalculation configs mean the CP decomposition)
+    "rdi_lb": (run_rdi, {"load_balanced": True}),
+    "rdi_lb_share": (
+        run_rdi,
+        {"load_balanced": True, "extend_share_window": True, "share_reward": 1.0, "legacy_share_bonus": 0.0},
+    ),
     "partitioned_rdi_random": (run_partitioned_rdi, {"partition": "random"}),
     "partitioned_rdi_similarity": (run_partitioned_rdi, {"partition": "similarity"}),
     "partitioned_rdi_load_balanced": (run_partitioned_rdi, {"partition": "load_balanced"}),

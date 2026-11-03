@@ -18,6 +18,13 @@ The per-station planner (``plan_order_gap_filling``) differs from SGC's:
   * new bins are placed into the earliest pickface gap (gap filling) instead
     of after the last presence;
   * its score rewards shared picks: ``alpha*end + beta*(end-start) - 0.5*sum(rt+p of shared SKUs)``.
+
+``load_balanced=True`` (like load-balanced SGC): before each selection, stations whose
+committed picking workload (sum of p over committed order lines) is above the current
+average are treated as non-existent — every order's best station, second score and regret
+are taken over the remaining stations only. Plans at hidden stations stay cached (and are
+kept up to date), so a station is usable again as soon as it drops to the average. If no
+order has a feasible plan on the allowed stations, that selection uses all stations.
 """
 
 from __future__ import annotations
@@ -56,9 +63,14 @@ class InsertionScores:
     best_plan: OrderPlan | None
     regret: float
 
-    def refresh(self, regret_k: int) -> None:
-        """Recompute best/second/regret from station_scores."""
-        feasible = sorted((score, s) for s, score in self.station_scores.items() if score < float("inf"))
+    def refresh(self, regret_k: int, allowed: set[int] | None = None) -> None:
+        """Recompute best/second/regret from station_scores (only over `allowed` stations if given)."""
+        scores = (
+            self.station_scores
+            if allowed is None
+            else {s: sc for s, sc in self.station_scores.items() if s in allowed}
+        )
+        feasible = sorted((score, s) for s, score in scores.items() if score < float("inf"))
         if not feasible:
             self.best_score = float("inf")
             self.second_score = float("inf")
@@ -69,7 +81,7 @@ class InsertionScores:
             self.best_score, self.best_station = feasible[0]
             self.second_score = feasible[1][0] if len(feasible) > 1 else float("inf")
             self.best_plan = self.station_plans[self.best_station]
-            self.regret = compute_regret_k(self.station_scores, regret_k)
+            self.regret = compute_regret_k(scores, regret_k)
 
 
 def compute_regret_k(station_scores: dict[int, float], k: int) -> float:
@@ -301,9 +313,13 @@ def run_rdi(
     extend_share_window: bool = False,
     share_reward: float = 0.0,
     legacy_share_bonus: float = 0.5,
+    load_balanced: bool = False,
     exo: ExoState | None = None,
 ) -> HeuristicSolution:
     """Regret-based Dynamic Insertion SGC. ``tiebreaker`` in TIEBREAKERS.
+
+    load_balanced: ignore stations whose committed picking workload is above the average
+    (see module docstring); falls back to all stations if no order fits on the others.
 
     extend_share_window: wait for an existing bin of a SKU as long as the shared pick starts no
     later than the order's own new fetch of that SKU would (default: at most rt[k] after the
@@ -324,8 +340,21 @@ def run_rdi(
 
     order_assignments: dict[int, tuple[int, int, int, int]] = {}
     pick_events: dict[tuple[int, int, int], tuple[int, int]] = {}
+    station_workload = {s: 0.0 for s in inst.S}
+    n_fallbacks = 0
 
     while unscheduled:
+        if load_balanced:
+            # stations above the average workload "don't exist" for this selection
+            avg = sum(station_workload.values()) / len(inst.S)
+            allowed = {s for s, w in station_workload.items() if w <= avg}
+            for o in unscheduled:
+                cached[o].refresh(regret_k, allowed)
+            if all(cached[o].best_plan is None for o in unscheduled):
+                n_fallbacks += 1  # nothing fits on the allowed stations: consider all
+                for o in unscheduled:
+                    cached[o].refresh(regret_k)
+
         best_o, best_key = None, None
         for o in unscheduled:  # in order-id order; the first of exactly tied candidates wins
             c = cached[o]
@@ -349,6 +378,7 @@ def run_rdi(
         plan = cached[best_o].best_plan
         commit_plan(plan, state)
         record_plan(plan, order_assignments, pick_events)
+        station_workload[plan.station] += sum(inst.p.get(k, 0) for k in inst.orders_req[best_o])
         del unscheduled[best_o]
         if not unscheduled:
             break
@@ -364,5 +394,6 @@ def run_rdi(
         pick_events=pick_events,
         meta={"heuristic": "rdi", "tiebreaker": tiebreaker, "regret_k": regret_k, "use_lazy": use_lazy,
               "extend_share_window": extend_share_window, "share_reward": share_reward,
-              "legacy_share_bonus": legacy_share_bonus},
+              "legacy_share_bonus": legacy_share_bonus,
+              **({"load_balanced": True, "n_fallbacks": n_fallbacks} if load_balanced else {})},
     )

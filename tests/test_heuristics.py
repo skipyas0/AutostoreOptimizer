@@ -363,3 +363,47 @@ def test_rdi_lazy_cache_keeps_movecap_with_extensions():
     # not considered when deciding which cached plans to re-plan
     sol = run_rdi(big, extend_share_window=True, share_reward=2.0, legacy_share_bonus=0.0)
     assert sol.validate(big) == []
+
+
+# ---------------------------------------------------------------------------
+# Load-balanced RDI
+# ---------------------------------------------------------------------------
+
+
+def test_insertion_scores_refresh_masks_stations():
+    from heuristics.rdi import InsertionScores
+
+    c = InsertionScores(0, {0: 5.0, 1: 7.0, 2: 10.0}, {0: "p0", 1: "p1", 2: "p2"}, 0, 0, -1, None, 0)
+    c.refresh(2)
+    assert (c.best_station, c.best_plan, c.regret) == (0, "p0", 2.0)
+    c.refresh(2, allowed={1, 2})  # station 0 "doesn't exist"
+    assert (c.best_station, c.best_plan, c.second_score, c.regret) == (1, "p1", 10.0, 3.0)
+    c.refresh(2, allowed={2})
+    assert (c.best_station, c.regret) == (2, float("inf"))  # single option -> regret inf
+
+
+def test_rdi_load_balanced_never_commits_to_overloaded_station(monkeypatch):
+    import heuristics.rdi as rdi_mod
+
+    four = generate_data(num_stations=4, lanes_per_station=2, num_orders=40, num_skus=8000,
+                         seed=5, pick_touch_time=4, movecap=12)
+    load = {s: 0.0 for s in four.S}
+    over = []
+    orig = rdi_mod.commit_plan
+
+    def spy(plan, state):
+        avg = sum(load.values()) / len(load)
+        if load[plan.station] > avg:
+            over.append(plan.order)
+        load[plan.station] += sum(four.p[k] for k in four.orders_req[plan.order])
+        orig(plan, state)
+
+    monkeypatch.setattr(rdi_mod, "commit_plan", spy)
+    sol = run_rdi(four, load_balanced=True)
+    assert sol.feasible and sol.validate(four) == []
+    assert sol.meta["n_fallbacks"] == 0 and over == []
+    lb_spread = max(load.values()) - min(load.values())
+
+    load = {s: 0.0 for s in four.S}
+    run_rdi(four)  # plain RDI, same spy
+    assert lb_spread <= max(load.values()) - min(load.values())

@@ -52,6 +52,7 @@ CLI: `python -m heuristics --list`, `python -m heuristics <name> [--orders 40 ..
 | `ama_two_phase_share` | `run_ama(mode="two_phase", extend_share_window=True, share_reward=1.0)` |
 | `rdi` / `rdi_sharing_degree` / `rdi_best_score` | `run_rdi(tiebreaker="sum_rt_asc" / "sharing_degree" / "best_score")` |
 | `rdi_share` | `run_rdi(extend_share_window=True, share_reward=1.0, legacy_share_bonus=0.0)` |
+| `rdi_lb` / `rdi_lb_share` | `run_rdi(load_balanced=True)` / with the `rdi_share` options |
 | `rdi_share_window` / `rdi_share_reward` | ablations: window only (legacy bonus kept) / `share_reward=1.0, legacy_share_bonus=0.0` |
 | `partitioned_rdi_{random,similarity,load_balanced}` | `run_partitioned_rdi(partition=...)` (seed 0) |
 | `partitioned_rdi_load_balanced_share` | as above with the `rdi_share` options |
@@ -179,8 +180,19 @@ Gap-filling planner (`plan_order_gap_filling`):
   remaining SKU into the **earliest pickface gap** (it does not only append after the last presence).
 - Score: `alpha*end + beta*(end-start) - 0.5 * Σ_shared (rt+p)`.
 
+**Load balancing** (`load_balanced=True`, mirrors load-balanced SGC). Before each selection, stations whose
+committed picking workload (Σ p over committed order lines) is above the current average are treated as
+non-existent. Every order's best station, second score and regret are computed over the remaining stations only.
+Plans at hidden stations stay cached and are kept up to date, so a station is usable again as soon as it falls back
+to the average. If no order fits on the allowed stations, that selection uses all of them; `meta["n_fallbacks"]`
+counts how often this happened.
+
+On 10 benchmark instances, load balancing cuts the benchmark's pick-imbalance metric from 166 to 5 (LB-SGC: 8) at
++1.8% makespan, which is still 2.4% better than LB-SGC. Combined with the share options (`rdi_lb_share`), imbalance
+is 7 and makespan is +1.4% vs `rdi_share`.
+
 Parameters: `horizon, alpha, beta, regret_k, use_lazy, tiebreaker, extend_share_window, share_reward,
-legacy_share_bonus (default 0.5), exo`. `run_partitioned_rdi` passes all RDI parameters through.
+legacy_share_bonus (default 0.5), load_balanced, exo`. `run_partitioned_rdi` passes all RDI parameters through.
 
 ### Bin-sharing options (SGC and RDI)
 
