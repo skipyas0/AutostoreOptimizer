@@ -646,6 +646,7 @@ class Solver:
             default_percent=self.experiment_config["default_percent"],
             default_n_lanes=self.experiment_config["default_n_lanes"],
             default_timeslice_width=self.experiment_config["default_timeslice_width"],
+            tail_mode=self.experiment_config.get("combine_strat_with_tail", "all"),
         )
 
         # prepare variable index sorted look-up for unfrozen set logging
@@ -722,9 +723,19 @@ class Solver:
                 self.vlg.add_stat_to_current("severity_increases", 1)
                 self.stagnation_count = 0
 
+            # Objective of this iteration (before the neighbourhood: the tail option
+            # depends on it). Freezing and warm starts do not depend on the objective.
+            cycle_per = self.experiment_config["cp_objective_phase_duration"]
+            if cycle_per > 0 and (i + 1) % cycle_per == 0:
+                self.cycle_ix = (self.cycle_ix + 1) % len(self.cycling_schedule)
+                next_obj = self.cycling_schedule[self.cycle_ix]
+                self.update_iteration_objective(self.mdl, next_obj)
+
             self.vlg.time_from_here()
             strat_idx, strat_name, strat_lambda = strategy_manager.choose_strat()
-            strategy_results = strat_lambda(self.severity)
+            strategy_results = strategy_manager.select(
+                strat_name, strat_lambda, self.severity, self.cp_obj
+            )
             self.vlg.log_strategy(strat_name, strat_idx)
 
             # create to_optimize set with graph traversal
@@ -800,12 +811,6 @@ class Solver:
             # create starting point for the next iteration
             if not self.subproblem_mode:
                 starting_point = self.get_starting_point(to_optimize)
-
-            cycle_per = self.experiment_config["cp_objective_phase_duration"]
-            if cycle_per > 0 and (i + 1) % cycle_per == 0:
-                self.cycle_ix = (self.cycle_ix + 1) % len(self.cycling_schedule)
-                next_obj = self.cycling_schedule[self.cycle_ix]
-                self.update_iteration_objective(self.mdl, next_obj)
 
             impr_bound = self.improvement_bound()
 
@@ -1146,6 +1151,16 @@ if __name__ == "__main__":
         "(frozen orders enter as fixed intervals and objective constants).",
     )
     parser.add_argument(
+        "--combine-strat-with-tail",
+        type=str,
+        default="all",
+        choices=["none", "makespan", "all"],
+        dest="combine_strat_with_tail",
+        help="Add the orders at the tail of the schedule (last default-timeslice-width/2) "
+        "to the chosen strategy's neighbourhood: 'none' never, 'makespan' only while the "
+        "objective is makespan, 'all' always (default: all, the behaviour so far)",
+    )
+    parser.add_argument(
         "--close-sharing",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1213,6 +1228,7 @@ if __name__ == "__main__":
             "only_first_sol": args.only_first_sol,
             "lns_model": args.lns_model,
             "validate_merges": args.validate_merges,
+            "combine_strat_with_tail": args.combine_strat_with_tail,
             "close_sharing": args.close_sharing,
             "improvement_ref": args.improvement_ref,
         }

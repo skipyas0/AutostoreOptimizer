@@ -5,6 +5,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from neighborhood_selection import (
+    SelectionResult,
     StrategyManager,
     strategy_cycle_time_weighted_refetched_skus,
     strategy_frequently_refetched_skus,
@@ -139,6 +140,27 @@ class TestNeighborhoodSelection(unittest.TestCase):
             self.solution, p=0.34, match_random_demand=True,
         )
         self.assertEqual(res.seed_skus, {2})
+
+    def test_tail_modes(self):
+        """Tail = orders ending in the last width/2 of the schedule (+1 random order)."""
+        def manager(mode):
+            return StrategyManager(self.handles, self.solution, None, {}, "all",
+                                   tail_mode=mode, default_timeslice_width=100)
+
+        strat = lambda sev: SelectionResult(seed_skus={1})  # noqa: E731
+        cases = [("none", "makespan", False), ("none", "bin_fetches", False),
+                 ("makespan", "makespan", True), ("makespan", "bin_fetches", False),
+                 ("all", "makespan", True), ("all", "bin_fetches", True)]
+        for mode, objective, tail in cases:
+            res = manager(mode).select("random_skus", strat, 1, objective)
+            self.assertEqual(res.seed_skus, {1})
+            # makespan 200, tail window [150, 200]: order 103 ends at 200
+            self.assertEqual(103 in res.seed_orders, tail, (mode, objective))
+            self.assertEqual(bool(res.seed_orders), tail, (mode, objective))
+        # the tail strategy itself is never combined with the tail
+        self.assertFalse(manager("all").uses_tail("strategy_ending_timeslice_mix", "makespan"))
+        with self.assertRaises(ValueError):
+            manager("sometimes")
 
     def test_strategy_manager_registration(self):
         manager = StrategyManager(
