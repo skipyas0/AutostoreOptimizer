@@ -745,14 +745,15 @@ class StrategyManager:
     def select(self, strat_name: str, strat: Callable, severity: int, objective: str):
         """Run the chosen strategy, combined with the schedule tail if ``tail_mode`` says so.
 
-        The tail is the orders ending in the last ``default_timeslice_width / 2`` of the
-        schedule plus one random order (``strategy_ending_timeslice_mix`` with p=0), as
-        when every strategy was wrapped with it. It is evaluated first, as before.
+        The tail is the orders running in the last ``default_timeslice_width / 2`` of
+        the schedule (until Nov 2026 it also held one random order, from
+        ``strategy_ending_timeslice_mix`` with p=0).
         """
         if not self.uses_tail(strat_name, objective):
             return strat(severity)
-        tail = strategy_ending_timeslice_mix(
-            self.handles, self.current_solution, self.tail_width, p=0
+        order_intervals, makespan = get_order_intervals(self.handles, self.current_solution)
+        tail = orders_in_timeslice(
+            order_intervals, makespan - self.tail_width // 2, makespan
         )
         return combine_strategies(tail, strat(severity))
 
