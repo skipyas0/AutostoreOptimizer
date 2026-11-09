@@ -185,6 +185,7 @@ python tests/regression/equivalence.py              # vs. HEAD; --ref <commit> f
 | Folder | Content |
 |---|---|
 | `tests/` | `test_heuristics.py` (new API), `test_instance.py`, other module tests, `regression/` (equivalence harness) |
+| `seq_vs_sched/` | Self-contained experiment: fetch-minimal assignment+sequencing CP model vs. the makespan scheduling model (imports the main code, never modifies it). See `seq_vs_sched/README.md` |
 | `scripts/` | One-off tools. `migrate_heuristic_pickles.py` is current; `run_custom_warmstart*.py` are legacy and import removed modules |
 | `analyze_heuristics/`, `benchmarking/` | Legacy analysis and benchmark scripts built on the removed `solve_heuristic_instance` APIs (broken) |
 | `learning_ama_archive/` | Archived AMA dataset, plots and decision trees |
