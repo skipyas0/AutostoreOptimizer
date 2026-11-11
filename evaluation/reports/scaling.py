@@ -1,19 +1,18 @@
-"""Tables and figures for benchmark_lns_scaling.py.
+"""LNS overhead scaling: full model vs. subproblem (data from benchmark_lns_scaling.py).
 
-Usage: python analyze_lns_scaling.py [results/lns_scaling]
-Writes to <dir>/analysis: table_scaling.{csv,md}, table_breakeven.{csv,md},
-fig_overhead_vs_size, fig_overhead_composition, fig_breakeven_fraction (.pdf/.png).
+Reads <dir>/lns_iterations.csv, lns_runs.csv and (optional) nbh_sweep.csv and writes
+tables (table_scaling, table_breakeven) and figures (fig_overhead_vs_size,
+fig_overhead_composition, fig_breakeven_fraction) to the output folder.
 """
 
 import os
-import sys
 
-import matplotlib
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
-import numpy as np  # noqa: E402
-import pandas as pd  # noqa: E402
+from .. import style
+from ..tables import write_table
 
 BLUE, ORANGE = "#2a78d6", "#eb6834"
 MODEL_COLORS = {"full": BLUE, "subproblem": ORANGE}
@@ -29,26 +28,8 @@ SIZE_RAMP = ["#86b6ef", "#6da7ec", "#5598e7", "#3987e5", "#2a78d6", "#256abf",
              "#1c5cab", "#184f95", "#104281", "#0d366b"]
 INK, MUTED, GRID = "#1f1f1e", "#6b6a64", "#e4e3de"
 
-plt.rcParams.update({
-    "font.size": 10, "axes.edgecolor": MUTED, "axes.labelcolor": INK,
-    "xtick.color": MUTED, "ytick.color": MUTED, "axes.spines.top": False,
-    "axes.spines.right": False, "axes.grid": True, "grid.color": GRID,
-    "grid.linewidth": 0.8, "legend.frameon": False, "lines.linewidth": 2,
-})
-
-
 def _size_label(stations, orders):
     return f"{stations}/{orders}"
-
-
-def _md_table(df, floatfmt="{:.2f}"):
-    cols = list(df.columns)
-    out = ["| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)]
-    for _, r in df.iterrows():
-        cells = [floatfmt.format(v) if isinstance(v, (float, np.floating)) else str(v)
-                 for v in r]
-        out.append("| " + " | ".join(cells) + " |")
-    return "\n".join(out) + "\n"
 
 
 def load(root):
@@ -142,9 +123,7 @@ def fig_overhead_vs_size(agg, out):
     ax.set_title("LNS overhead outside the CP search", loc="left", color=INK)
     ax.legend(loc="upper left")
     fig.tight_layout()
-    for ext in ("pdf", "png"):
-        fig.savefig(os.path.join(out, f"fig_overhead_vs_size.{ext}"), dpi=200)
-    plt.close(fig)
+    style.save(fig, out, "fig_overhead_vs_size")
 
 
 def fig_composition(it, out):
@@ -169,9 +148,7 @@ def fig_composition(it, out):
     axes[0].set_ylabel("Median time per iteration [s]")
     axes[1].legend(loc="upper left")
     fig.tight_layout()
-    for ext in ("pdf", "png"):
-        fig.savefig(os.path.join(out, f"fig_overhead_composition.{ext}"), dpi=200)
-    plt.close(fig)
+    style.save(fig, out, "fig_overhead_composition")
 
 
 def fig_breakeven(nbh, agg, out):
@@ -197,37 +174,28 @@ def fig_breakeven(nbh, agg, out):
     ax.legend(title="stations/orders", ncol=2, fontsize=8, title_fontsize=8,
               loc="lower right")
     fig.tight_layout()
-    for ext in ("pdf", "png"):
-        fig.savefig(os.path.join(out, f"fig_breakeven_fraction.{ext}"), dpi=200)
-    plt.close(fig)
+    style.save(fig, out, "fig_breakeven_fraction")
 
 
-def main():
-    root = sys.argv[1] if len(sys.argv) > 1 else "results/lns_scaling"
-    out = os.path.join(root, "analysis")
-    os.makedirs(out, exist_ok=True)
+def run(root, out=None, png_tables=False):
+    out = out or os.path.join(root, "analysis")
+    style.apply()
     it, runs, nbh = load(root)
     agg, table = scaling_table(it, runs)
-    table.to_csv(os.path.join(out, "table_scaling.csv"), index=False)
-    with open(os.path.join(out, "table_scaling.md"), "w") as f:
-        f.write(_md_table(table))
-    print(_md_table(table))
+    rnd = lambda df: df.round(3)
+    write_table(rnd(table), out, "table_scaling",
+                "Per-iteration overhead outside the CP search (median), full model vs. "
+                "subproblem", png=png_tables)
     fig_overhead_vs_size(agg, out)
     fig_composition(it, out)
     if nbh is not None:
         be = breakeven(nbh, agg)
-        be.to_csv(os.path.join(out, "table_breakeven.csv"), index=False)
-        with open(os.path.join(out, "table_breakeven.md"), "w") as f:
-            f.write(_md_table(be))
-        print(_md_table(be))
+        write_table(rnd(be), out, "table_breakeven",
+                    "Order fraction at which the subproblem overhead reaches the full "
+                    "model's", png=png_tables)
         fig_breakeven(nbh, agg, out)
-
-    # Does full-model extraction depend on the neighbourhood size? (per instance)
     full = it[it.lns_model == "full"]
     corr = full.groupby("size").apply(
         lambda d: d["solve_cpp_presolve"].corr(d["num_optimized"]), include_groups=False)
     print("corr(full extraction, #optimized vars) per size:\n", corr.round(2).to_string())
-
-
-if __name__ == "__main__":
-    main()
+    return out

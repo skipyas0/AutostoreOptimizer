@@ -48,6 +48,7 @@ docplex config --upgrade <PATH_TO_CPLEX_STUDIO>
 ├── rl_order_assignment.py            # RL order->station assignment
 ├── trainset_generator.py             # AMA dispatching-rule dataset
 ├── benchmark_models.py               # heuristic / RL benchmark
+├── evaluation/                       # experiment evaluation suite: python -m evaluation
 ├── schedule_visualizer.py            # Plotly Gantt charts
 ├── docs/                             # documentation
 ├── tests/                            # pytest suite + tests/regression (equivalence vs. reference commit)
@@ -89,3 +90,12 @@ python precalculate_instances_for_lns.py --stations 4 --lanes 4 --orders 200 --s
 python matheuristic.py GEN42-4-4-5000-200-20 --backend cpp
 python benchmark_models.py --num-instances 10 --methods all --skip-rl
 ```
+
+### Evaluating experiments
+
+```bash
+python -m evaluation compare precalculated_instances/<experiment root> --out results/<name>
+python -m evaluation scaling results/lns_scaling
+```
+
+See [evaluation/README.md](evaluation/README.md).

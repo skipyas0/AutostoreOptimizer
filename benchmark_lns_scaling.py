@@ -16,7 +16,7 @@ Part B ("nbh"):  subproblem only, random neighbourhoods of fixed order fractions
 Usage:
   python benchmark_lns_scaling.py                       # both parts, default sweep
   python benchmark_lns_scaling.py --parts lns --sizes 1x25,5x150
-  python analyze_lns_scaling.py results/lns_scaling     # tables + figures
+  python -m evaluation scaling results/lns_scaling     # tables + figures
 """
 
 import argparse
