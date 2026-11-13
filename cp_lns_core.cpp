@@ -240,11 +240,13 @@ public:
     IloObjective total_flow_time_obj;
     IloObjective idle_time_obj;
     IloObjective max_picks_obj;
+    IloObjective sum_makespans_obj;
     IloIntExpr makespan_expr;
     IloIntExpr bin_fetches_expr;
     IloIntExpr total_flow_time_expr;
     IloIntExpr idle_time_expr;
     IloIntExpr max_picks_expr;
+    IloIntExpr sum_makespans_expr;
     std::map<std::string, IloIntExpr> kpi_exprs;
 
     CpLnsModel(const std::vector<int>& S,
@@ -679,6 +681,7 @@ public:
         total_flow_time_obj = IloMinimize(env, total_flow_time_expr);
         
         idle_time_expr = IloIntExpr(env);
+        sum_makespans_expr = IloIntExpr(env);
         IloIntExprArray pick_counts(env);
 
         for (int s : S) {
@@ -702,6 +705,8 @@ public:
                                         "exo_win_" + std::to_string(s)));
             }
             model.add(IloSpan(env, station_span, s_orders));
+            // Station makespan (0 if unused); the span includes the frozen window
+            sum_makespans_expr += IloEndOf(station_span);
             
             IloIntExpr pick_sum(env);
             IloIntExpr pick_count(env);
@@ -731,6 +736,7 @@ public:
         idle_time_obj = IloMinimize(env, idle_time_expr);
         max_picks_expr = IloMax(pick_counts);
         max_picks_obj = IloMinimize(env, max_picks_expr);
+        sum_makespans_obj = IloMinimize(env, sum_makespans_expr);
 
         // Expose the underlying expressions as model KPIs so that the value of every
         // KPI can be queried for each intermediate (best-so-far) solution.
@@ -739,12 +745,14 @@ public:
         cp.addKPI(total_flow_time_expr, "total_flow_time");
         cp.addKPI(idle_time_expr, "idle_time");
         cp.addKPI(max_picks_expr, "max_picks");
+        cp.addKPI(sum_makespans_expr, "sum_makespans");
 
         kpi_exprs["makespan"] = makespan_expr;
         kpi_exprs["bin_fetches"] = bin_fetches_expr;
         kpi_exprs["total_flow_time"] = total_flow_time_expr;
         kpi_exprs["idle_time"] = idle_time_expr;
         kpi_exprs["max_picks"] = max_picks_expr;
+        kpi_exprs["sum_makespans"] = sum_makespans_expr;
         
         if (objective_func == "bin_fetches") {
             active_obj = bin_fetches_obj;
@@ -754,6 +762,8 @@ public:
             active_obj = idle_time_obj;
         } else if (objective_func == "max_picks") {
             active_obj = max_picks_obj;
+        } else if (objective_func == "sum_makespans") {
+            active_obj = sum_makespans_obj;
         } else {
             active_obj = makespan_obj;
         }
@@ -773,6 +783,8 @@ public:
             active_obj = idle_time_obj;
         } else if (target == "max_picks") {
             active_obj = max_picks_obj;
+        } else if (target == "sum_makespans") {
+            active_obj = sum_makespans_obj;
         } else {
             active_obj = makespan_obj;
         }
@@ -911,6 +923,8 @@ public:
                 impr_constr = (idle_time_expr <= improvement_bound);
             } else if (active_obj.getImpl() == max_picks_obj.getImpl()) {
                 impr_constr = (max_picks_expr <= improvement_bound);
+            } else if (active_obj.getImpl() == sum_makespans_obj.getImpl()) {
+                impr_constr = (sum_makespans_expr <= improvement_bound);
             } else {
                 impr_constr = (makespan_expr <= improvement_bound);
             }
@@ -991,6 +1005,7 @@ public:
             kpis["total_flow_time"] = cp.getValue(total_flow_time_expr);
             kpis["idle_time"] = cp.getValue(idle_time_expr);
             kpis["max_picks"] = cp.getValue(max_picks_expr);
+            kpis["sum_makespans"] = cp.getValue(sum_makespans_expr);
             result["kpis"] = kpis;
 
             py::dict var_sols;

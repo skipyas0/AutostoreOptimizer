@@ -59,6 +59,8 @@ class ObjectiveOffsets:
             return self.total_flow_time
         if kpi == "max_picks":
             return max(self.station_pick_count.values(), default=0)
+        if kpi == "sum_makespans":
+            return sum(end for _, end in self.station_window.values())
         return None
 
 
@@ -417,7 +419,8 @@ def to_full_result(solution, ctx, sub_sol, sub_handles, handles, backend, object
         result["var_solutions"] = merge(solution, ctx, sub_sol, sub_handles, handles)
         kpis = dict(sub_sol.get_kpis() or {})
         result["kpis"] = {k: kpis[k] for k in
-                          ("makespan", "bin_fetches", "total_flow_time", "idle_time", "max_picks")
+                          ("makespan", "bin_fetches", "total_flow_time", "idle_time", "max_picks",
+                           "sum_makespans")
                           if k in kpis}
         result["objective"] = result["kpis"].get(objective)
     return CppSolveResult(result)
@@ -444,10 +447,14 @@ def check_merged(result, handles, instance, horizon) -> list[str]:
     hs = HeuristicSolution.from_cp(result, handles)
     problems = list(validate_solution(hs, instance, horizon=horizon))
     kpis = result.get_kpis()
+    station_end = defaultdict(int)
+    for s, _, _, end in hs.order_assignments.values():
+        station_end[s] = max(station_end[s], end)
     expected = {
         "makespan": hs.makespan,
         "bin_fetches": sum(len(v) for v in hs.bin_events.values()),
         "total_flow_time": sum(a[3] for a in hs.order_assignments.values()),
+        "sum_makespans": sum(station_end.values()),
     }
     for name, value in expected.items():
         if name in kpis and abs(kpis[name] - value) > 1e-6:

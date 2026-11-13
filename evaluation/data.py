@@ -9,6 +9,7 @@ metrics and plots never need to know where a number came from:
     t, v     anytime trajectory: times [s] and best makespan found by then
              (np arrays, t ascending, v non-increasing)
     final    best makespan at the end of the run
+    solution path of the final solution pickle (may not exist; see solutions.py)
 
 To add a method, write a loader that returns rows in this format and append them.
 
@@ -141,7 +142,8 @@ def load_heuristics(d, meta):
         t, v = make_traj([(rt, ms)])
         rows.append(dict(method=HEURISTIC_NAMES.get(tag, tag), family="heuristic",
                          instance=meta["instance"], run=1, t=t, v=v, final=ms,
-                         runtime=rt, is_start=os.path.basename(path) == "heuristic_summary.txt"))
+                         runtime=rt, is_start=os.path.basename(path) == "heuristic_summary.txt",
+                         solution=path[:-len("_summary.txt")] + "_solution.pkl"))
     return rows
 
 
@@ -181,7 +183,8 @@ def load_cp(d, meta, start_value=np.nan):
         t, v = make_traj(([(0.0, start_value)] if warm else []) + inc)
         rows.append(dict(method="CP", family="cp", instance=meta["instance"], run=k,
                          t=t, v=v, final=v[-1] if len(v) else np.nan,
-                         extraction=extraction, first_sol_time=first_t, warm_start=warm))
+                         extraction=extraction, first_sol_time=first_t, warm_start=warm,
+                         solution=os.path.join(d, f"cp_solution_{k}.pkl")))
     return rows
 
 
@@ -321,7 +324,8 @@ def load_lns(d, meta, start_value):
                 warnings.warn(f"{e} run {rid}: trajectory does not reach the logged best")
             runs.append(dict(config_key=key, family="lns", instance=meta["instance"],
                              run=int(rid), t=t, v=v, final=v[-1], end_time=end,
-                             setup_time=setup, n_iters=len(rdf)))
+                             setup_time=setup, n_iters=len(rdf),
+                             solution=os.path.join(e, f"run{int(rid)}-solution.pkl")))
             prev = np.minimum.accumulate(np.concatenate([[start_value], rdf.best.values[:-1]]))
             phase = _phase_objective_columns(rdf, start_value)
             it = rdf.drop(columns=[c for c in ITER_DROP if c in rdf.columns])

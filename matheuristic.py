@@ -130,7 +130,7 @@ def load_instance(instance_config=None, instance_folder=None):
 
 
 def heuristic_kpis(heur_sol, instance):
-    """All five model KPIs of a heuristic solution (same definitions as the CP models)."""
+    """All model KPIs of a heuristic solution (same definitions as the CP models)."""
     span, pick_time, pick_count = {}, {}, {}
     for o, (s, ln, start, end) in heur_sol.order_assignments.items():
         lo, hi = span.get(s, (start, end))
@@ -144,6 +144,7 @@ def heuristic_kpis(heur_sol, instance):
         "total_flow_time": sum(a[3] for a in heur_sol.order_assignments.values()),
         "idle_time": sum(hi - lo - pick_time.get(s, 0) for s, (lo, hi) in span.items()),
         "max_picks": max(pick_count.values(), default=0),
+        "sum_makespans": sum(hi for _, hi in span.values()),
     }
 
 
@@ -238,6 +239,8 @@ class Solver:
                 self.cycling_schedule.append("idle_time")
             elif phase == "p":
                 self.cycling_schedule.append("max_picks")
+            elif phase == "s":
+                self.cycling_schedule.append("sum_makespans")
             elif phase == "w":
                 self.cycling_schedule.append("total_wages")
             else:
@@ -299,6 +302,9 @@ class Solver:
             elif target == "max_picks":
                 mdl.minimize(self.handles["max_picks"])
                 self.cp_obj = "max_picks"
+            elif target == "sum_makespans":
+                mdl.minimize(self.handles["sum_makespans"])
+                self.cp_obj = "sum_makespans"
             else:
                 raise ValueError(f"Unknown objective target: {target}")
         elif self.experiment_config["backend"] == "cpp":
@@ -436,6 +442,7 @@ class Solver:
         curr_flow = cur_kpis.get("total_flow_time", -1)
         curr_idle = cur_kpis.get("idle_time", -1)
         curr_picks = cur_kpis.get("max_picks", -1)
+        curr_sum_ms = cur_kpis.get("sum_makespans", -1)
 
         if curr_fetches != -1 and (
             self.best_bin_fetches == -1 or curr_fetches < self.best_bin_fetches
@@ -460,6 +467,12 @@ class Solver:
         ):
             self.best_max_picks = curr_picks
 
+        if curr_sum_ms != -1 and (
+            getattr(self, "best_sum_makespans", -1) == -1
+            or curr_sum_ms < getattr(self, "best_sum_makespans", -1)
+        ):
+            self.best_sum_makespans = curr_sum_ms
+
         self.vlg.add_stat_to_current(
             "current_makespan", cur_kpis.get("makespan", self.current_result)
         )
@@ -467,6 +480,7 @@ class Solver:
         self.vlg.add_stat_to_current("current_total_flow_time", curr_flow)
         self.vlg.add_stat_to_current("current_idle_time", curr_idle)
         self.vlg.add_stat_to_current("current_max_picks", curr_picks)
+        self.vlg.add_stat_to_current("current_sum_makespans", curr_sum_ms)
 
         self.vlg.add_stat_to_current(
             "best_makespan", best_kpis.get("makespan", self.best_result)
@@ -480,6 +494,9 @@ class Solver:
         )
         self.vlg.add_stat_to_current(
             "best_max_picks", getattr(self, "best_max_picks", -1)
+        )
+        self.vlg.add_stat_to_current(
+            "best_sum_makespans", getattr(self, "best_sum_makespans", -1)
         )
         self.vlg.add_stat_to_current("cp_obj", self.cp_obj)
 
@@ -682,6 +699,7 @@ class Solver:
         self.best_total_flow_time = start_kpis["total_flow_time"]
         self.best_idle_time = start_kpis["idle_time"]
         self.best_max_picks = start_kpis["max_picks"]
+        self.best_sum_makespans = start_kpis["sum_makespans"]
 
         self.best_solution = sp
         self.current_solution = self.best_solution
@@ -1020,7 +1038,7 @@ if __name__ == "__main__":
         "--strat-preset",
         type=str,
         default="all",
-        choices=["all", "shaw_random", "random_balance", "random_orders", "bottlenecks", "seem_to_work_best"],
+        choices=["all", "shaw_random", "random_balance", "random_orders", "bottlenecks", "bin_sharing", "seem_to_work_best"],
         help="Which strategies are used during optimization (presets defined in neighborhood_selection.py)",
     )
 
@@ -1042,6 +1060,7 @@ if __name__ == "__main__":
             "total_flow_time",
             "idle_time",
             "max_picks",
+            "sum_makespans",
         ],
         help="Objective function for the underlying CP model.",
     )
@@ -1057,7 +1076,7 @@ if __name__ == "__main__":
         "--cp-objective-phase-schedule",
         type=str,
         default="m",
-        help="Manual design of the objective schedule. Use a string like 'mmfmb' where 'm' is a makespan phase, 'f' is a flow time phase, 'b' is a number of bin fetches phase, 'i' is an idle time phase, and 'p' is a max picks phase.",
+        help="Manual design of the objective schedule. Use a string like 'mmfmb' where 'm' is a makespan phase, 'f' is a flow time phase, 'b' is a number of bin fetches phase, 'i' is an idle time phase, 'p' is a max picks phase, and 's' is a sum of station makespans phase.",
     )
 
     parser.add_argument(

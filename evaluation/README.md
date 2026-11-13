@@ -42,6 +42,9 @@ Output (`--out`, default `results/compare_<root>`):
 | fig02_final_gap | final gap per run (box + dots) | same |
 | fig03_mean_rank | mean rank (all + per size) | same |
 | fig04_per_instance | heatmap of the mean final gap | same |
+| t12_solution_structure | final solutions per size: fetch/pick ratio, fetches and robot work vs. start, refetches, robot/picker utilisation, workload/makespan imbalance, unused stations | same |
+| fig11_solution_structure | the same metrics, one marker per size class | same |
+| fig12_robot_work_vs_utilisation | robot work vs. robot utilisation, both relative to the start; diagonals = equal makespan change | same |
 
 Other outputs (no full/reduced pair):
 
@@ -54,7 +57,8 @@ Other outputs (no full/reduced pair):
 | t09_makespan_improvement_share, fig08 | share of each config's total best-makespan reduction by strategy, split by phase |
 | t10_strategies_other_objectives, fig09, fig10 | configs with objective cycling, **non-makespan phases**: rate of improving the phase objective, share of its total improvement, acceptance, makespan cost |
 | t11_cp_startup | CP extraction time, first incumbent time, warm-started runs |
-| data/ | `runs.csv`, `lns_iterations.csv.gz` |
+| fig13_lns_bin_fetches_over_time | bin fetches of the LNS best solution over time vs. the final CP/heuristic fetch counts |
+| data/ | `runs.csv`, `lns_iterations.csv.gz`, `solution_metrics.csv` (one row per final solution; also the cache) |
 
 "Best LNS" is the config with the lowest mean final gap over instances.
 
@@ -84,6 +88,25 @@ Strategy metrics per iteration (phase = the objective the CP optimised, `cp_obj`
   first incumbent. A heuristic is one point at its own runtime.
 - At a time point, runs without a solution yet (heuristics before their runtime) are
   excluded from the mean and counted in the table ("k/n w/o sol.").
+
+### Solution structure
+
+Computed from the final solution of every run (`solutions.py`): heuristics
+`heuristic_<name>_solution.pkl`, CP `cp_solution_<k>.pkl`, LNS
+`experiments/<date>/run<k>-solution.pkl`. A solution whose makespan differs from the
+logged final value triggers a warning. Results are cached in `data/solution_metrics.csv`
+by file path, mtime and size, so reruns only read new or changed files.
+
+- **Fetch / pick ratio**: bin visits / order lines (1 = no bin serves two lines).
+- **Refetches**: visits of a SKU that was already fetched before, in % of visits
+  (any station; *same-station*: back to the same station).
+- **Robot utilisation**: Σ(rt + rt_ret) over visits / (MoveCap · makespan). Fetches and
+  returns have fixed durations and share MoveCap robots, so
+  makespan = robot work / (MoveCap · utilisation), which fig12 plots.
+- **Picker utilisation**: Σ pick times / (stations · pickcap · makespan).
+- **Workload imbalance**: (max − mean) / mean of the pick time per station.
+- **Makespan imbalance**: (makespan − earliest station end) / makespan. A station
+  without picks ends at 0, so unused stations give 100 % (also counted separately).
 
 ## `scaling`: full model vs. subproblem overhead
 

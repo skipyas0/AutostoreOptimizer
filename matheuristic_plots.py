@@ -30,7 +30,9 @@ class Status(IntEnum):
 
 
 # KPIs recorded for every discovered solution (order used for reporting).
-KPI_ORDER = ("makespan", "bin_fetches", "total_flow_time", "idle_time", "max_picks")
+KPI_ORDER = (
+    "makespan", "bin_fetches", "total_flow_time", "idle_time", "max_picks", "sum_makespans"
+)
 
 
 def _coerce_kpis(kpis):
@@ -281,11 +283,13 @@ class VisualLogger:
             "current_total_flow_time": np.full(iters, -1, dtype=np.float64),
             "current_idle_time": np.full(iters, -1, dtype=np.float64),
             "current_max_picks": np.full(iters, -1, dtype=np.float64),
+            "current_sum_makespans": np.full(iters, -1, dtype=np.float64),
             "best_makespan": np.full(iters, -1, dtype=np.float64),
             "best_bin_fetches": np.full(iters, -1, dtype=np.float64),
             "best_total_flow_time": np.full(iters, -1, dtype=np.float64),
             "best_idle_time": np.full(iters, -1, dtype=np.float64),
             "best_max_picks": np.full(iters, -1, dtype=np.float64),
+            "best_sum_makespans": np.full(iters, -1, dtype=np.float64),
             "cp_obj": np.full(iters, "", dtype=object),
             "num_optimized": np.full(iters, -1, dtype=np.int32),
             "total_iter_time": np.full(iters, -1.0, dtype=np.float64),

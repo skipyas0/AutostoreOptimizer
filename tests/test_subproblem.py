@@ -138,8 +138,9 @@ def test_warm_start_reproduces_incumbent(setup, backend):
         reported = merged.get_kpis()
         for name, value in current.items():
             assert reported[name] == value, (name, active)
-        # idle_time / max_picks of the start solution come from matheuristic.heuristic_kpis
-        for name in ("idle_time", "max_picks"):
+        # idle_time / max_picks / sum_makespans of the start solution come from
+        # matheuristic.heuristic_kpis
+        for name in ("idle_time", "max_picks", "sum_makespans"):
             assert reported[name] == sol.get_kpis()[name], (name, active)
         checked += 1
     assert checked == 8
@@ -159,6 +160,29 @@ def test_improving_iterations_stay_valid(setup, backend):
             continue
         assert subproblem.check_merged(result, handles, inst, H) == []
         assert result.get_kpis()["makespan"] <= bound
+        sol = result
+        improved += 1
+    assert improved >= 1
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_sum_makespans_objective(setup, backend):
+    """sum_makespans subproblems improve the sum of station makespans with correct KPIs."""
+    inst, handles, sol = setup
+    improved = 0
+    for active in _random_neighbourhoods(handles, 10, seed=4):
+        active = subproblem.close_under_sharing(sol, handles, active)
+        bound = int(sol.get_kpis()["sum_makespans"]) - 1
+        result, _, ctx = subproblem.solve_iteration(
+            sol, handles, inst, active, backend=backend, horizon=H,
+            objective="sum_makespans", impr_bound=bound, cfg=CFG,
+        )
+        assert ctx.offsets.lower_bound("sum_makespans") <= sol.get_kpis()["sum_makespans"]
+        if not result.is_solution():
+            continue
+        # check_merged recomputes sum_makespans from the merged schedule
+        assert subproblem.check_merged(result, handles, inst, H) == []
+        assert result.get_kpis()["sum_makespans"] <= bound
         sol = result
         improved += 1
     assert improved >= 1
@@ -213,7 +237,7 @@ def test_lns_end_to_end(tmp_path, backend, cycling):
     }
     if cycling:
         cfg.update(runs=2, iters=8, cp_objective_phase_duration=1,
-                   cp_objective_phase_schedule="mfbi")
+                   cp_objective_phase_schedule="mfbis")
     solver = Solver(cfg, instance_path=str(folder))
     assert solver.best_result <= heur.makespan
     final = HeuristicSolution.from_cp(solver.best_solution, solver.handles)
@@ -222,7 +246,8 @@ def test_lns_end_to_end(tmp_path, backend, cycling):
         # every run starts at the beginning of the objective cycle
         seqs = [list(g.cp_obj) for _, g in solver.vlg.df.groupby("run_id")]
         assert len(seqs) == 2 and seqs[0] == seqs[1], seqs
-        assert set(seqs[0]) == {"makespan", "total_flow_time", "bin_fetches", "idle_time"}
+        assert set(seqs[0]) == {"makespan", "total_flow_time", "bin_fetches", "idle_time",
+                                "sum_makespans"}
 
 
 @pytest.mark.skipif("cpp" not in BACKENDS, reason="C++ extension not built")

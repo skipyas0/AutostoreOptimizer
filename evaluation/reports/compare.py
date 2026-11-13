@@ -19,13 +19,15 @@ import pandas as pd
 
 from .. import metrics, plots, style
 from ..configs import assign_lns_methods, config_params_table, config_table
-from ..data import load_root
+from ..data import instance_dirs, load_root
+from ..solutions import METRICS, solution_metrics
 from ..tables import fmt_num, mean_std, to_markdown, write_table
 
 
 OBJ_LABELS = {"makespan": "makespan", "total_flow_time": "flow time",
               "bin_fetches": "bin fetches", "idle_time": "idle time",
-              "max_picks": "max picks", "total_wages": "wages"}
+              "max_picks": "max picks", "sum_makespans": "sum of station makespans",
+              "total_wages": "wages"}
 
 
 def obj_label(obj):
@@ -50,7 +52,7 @@ def _gap_cell(v):
 class Comparison:
     def __init__(self, root, out, time_points=(60, 300, 900), reduced_baselines=("CP", "RDI"),
                  pattern="GEN*", png_tables=False, select=None):
-        self.root, self.out = root, out
+        self.root, self.out, self.pattern = root, out, pattern
         self.time_points = list(time_points)
         self.reduced_baselines = list(reduced_baselines)
         self.png_tables = png_tables
@@ -357,6 +359,101 @@ class Comparison:
                     "the start heuristic from t = 0, so this time counts as solution time")
 
     # ------------------------------------------------------------------ #
+    # Solution structure
+    # ------------------------------------------------------------------ #
+    STRUCT_COLS = ["fetch_pick_ratio", "fetches_vs_start_pct", "refetch_pct",
+                   "same_station_refetch_pct", "robot_work_vs_start_pct", "robot_util_pct",
+                   "picker_util_pct", "workload_imb_pct", "makespan_imb_pct", "unused_stations"]
+    STRUCT_LABELS = {"fetches_vs_start_pct": ("Fetches vs. start", "%"),
+                     "robot_work_vs_start_pct": ("Robot work vs. start", "%")}
+
+    def load_solutions(self):
+        """Structure metrics of every final solution on disk (cached in data/)."""
+        dirs = {os.path.basename(d): d for d in instance_dirs(self.root, self.pattern)}
+        sol = solution_metrics(self.runs, dirs, os.path.join(self.dat, "solution_metrics.csv"))
+        if not len(sol):
+            self.sol = sol
+            return sol
+        sol["size"] = sol.instance.map(self.instances.set_index("instance")["size"])
+        sol["gap_final"] = 100 * (sol.makespan - sol.instance.map(
+            self.runs.groupby("instance").bks.first())) / sol.instance.map(
+            self.runs.groupby("instance").bks.first())
+        start = sol[sol.method == self.start_name].set_index("instance")
+        sol["fetches_vs_start_pct"] = 100 * (sol.fetches / sol.instance.map(start.fetches) - 1)
+        sol["robot_work_vs_start_pct"] = 100 * (
+            sol.robot_work / sol.instance.map(start.robot_work) - 1)
+        missing = self.runs[~self.runs.solution.isin(sol.solution)] \
+            .groupby("method").size() if "solution" in self.runs else pd.Series(dtype=int)
+        if len(missing):
+            warnings.warn("runs without a solution file (left out of the structure "
+                          f"metrics): {missing.to_dict()}")
+        self.sol = sol
+        return sol
+
+    def _struct_label(self, col):
+        label, unit = self.STRUCT_LABELS.get(col) or METRICS[col]
+        return f"{label} [{unit}]" if unit else label
+
+    def table_solution_structure(self):
+        sol = self.sol
+        if not len(sol):
+            return
+        cols = ["gap_final"] + self.STRUCT_COLS
+        inst = sol.groupby(["method", "size", "instance"])[cols].mean().reset_index()
+        for variant, methods in self.variants():
+            rows = []
+            for size in self.sizes:
+                for m in methods:
+                    g = inst[(inst["size"] == size) & (inst.method == m)]
+                    if not len(g):
+                        continue
+                    row = {"Size": size, "Method": m, "Gap [%]": mean_std(g.gap_final)}
+                    for c in self.STRUCT_COLS:
+                        row[self._struct_label(c)] = mean_std(
+                            g[c], "{:.3f}" if c == "fetch_pick_ratio" else "{:.1f}")
+                    rows.append(row)
+            self._write(pd.DataFrame(rows), f"t12_solution_structure_{variant}",
+                        "Structure of the final solutions (mean ± std over the instances of a "
+                        "size class; LNS and CP: mean over runs first). Start = "
+                        f"{self.start_name}, the LNS start. Refetches: repeat visits of an "
+                        "already fetched SKU; utilisation: busy share of the robot capacity "
+                        "(MoveCap) and of the pickers over the makespan; imbalance: "
+                        "(max - mean) / mean of the station pick workload and "
+                        "(makespan - earliest station end) / makespan; unused stations: "
+                        "stations without any pick")
+
+    def figures_solution_structure(self):
+        sol = self.sol
+        if not len(sol):
+            return
+        labels = {**METRICS, **self.STRUCT_LABELS}
+        cols = [c for c in self.STRUCT_COLS
+                if c not in ("same_station_refetch_pct", "unused_stations")]
+        for variant, methods in self.variants():
+            plots.solution_structure(sol, methods, self.look, self.sizes, cols, labels,
+                                     self.fig,
+                                     f"fig11_solution_structure_{variant}",
+                                     title="Structure of the final solutions")
+            if self.start_name:
+                plots.work_vs_utilisation(
+                    sol, methods, self.look, self.sizes, self.start_name, self.fig,
+                    f"fig12_robot_work_vs_utilisation_{variant}",
+                    title="Makespan = robot work / (MoveCap · robot utilisation): "
+                          f"change of both vs. {self.start_name}")
+        if len(self.iters) and self.start_name:
+            start = sol[sol.method == self.start_name].set_index("instance").fetches.to_dict()
+            other = sol[sol.family != "lns"]
+            refs = (other.groupby(["method", "family", "size", "instance"])
+                    .fetches_vs_start_pct.mean().groupby(["method", "family", "size"]).mean()
+                    .rename("value").reset_index())
+            refs = refs[refs.method != self.start_name]
+            plots.lns_fetches_over_time(self.iters, self.lns, self.look, self.sizes, start,
+                                        refs, self.time_limit, self.fig,
+                                        "fig13_lns_bin_fetches_over_time",
+                                        title="Bin fetches of the LNS best solution over time "
+                                              "(dashed: final CP and heuristic solutions)")
+
+    # ------------------------------------------------------------------ #
     # Figures
     # ------------------------------------------------------------------ #
     def figures(self, strat_ms=None, share=None, other=None):
@@ -470,7 +567,10 @@ class Comparison:
         share = self.table_makespan_improvement_share()
         other = self.table_strategies_other_objectives()
         self.table_cp_startup()
+        self.load_solutions()
+        self.table_solution_structure()
         self.figures(strat_ms, share, other)
+        self.figures_solution_structure()
         self.data()
         self.readme()
         return self

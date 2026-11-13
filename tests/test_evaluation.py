@@ -124,6 +124,29 @@ class TestTrajectories(unittest.TestCase):
         self.assertEqual(final, 95.0)
 
 
+class TestSolutionMetrics(unittest.TestCase):
+    def test_metrics_from_var_dict(self):
+        from types import SimpleNamespace
+        from evaluation.solutions import _from_var_dict, metrics
+        inst = SimpleNamespace(S=[0, 1, 2], rt={7: 3, 8: 4}, rt_ret={7: 1, 8: 2}, movecap=2,
+                               pickcap=1)
+        on = lambda a, b: {"present": True, "start": a, "end": b}  # noqa: E731
+        vs = {"B[0,7,0]": on(3, 6), "B[0,7,1]": on(8, 10), "B[1,7,0]": on(3, 5),
+              "B[1,8,0]": on(4, 9), "Block[0,7,0]": on(0, 7), "B[2,8,1]": {"present": False},
+              "P[0,0,7,0]": on(3, 5), "P[1,0,7,1]": on(8, 10), "P[2,0,7,0]": on(5, 6),
+              "P[3,1,7,0]": on(3, 5), "P[4,1,8,0]": on(5, 8)}
+        m = metrics(*_from_var_dict(vs), inst)
+        self.assertEqual((m["makespan"], m["fetches"], m["lines"]), (10, 4, 5))
+        self.assertAlmostEqual(m["fetch_pick_ratio"], 0.8)
+        self.assertAlmostEqual(m["refetch_pct"], 50.0)            # 4 visits, 2 SKUs
+        self.assertAlmostEqual(m["same_station_refetch_pct"], 25.0)  # (0, 7) twice
+        self.assertAlmostEqual(m["robot_util_pct"], 100 * (3 * 4 + 6) / (2 * 10))
+        self.assertAlmostEqual(m["picker_util_pct"], 100 * 10 / (3 * 10))
+        self.assertEqual(m["unused_stations"], 1)
+        self.assertAlmostEqual(m["makespan_imb_pct"], 100.0)
+        self.assertAlmostEqual(m["workload_imb_pct"], 100 * (5 - 10 / 3) / (10 / 3))
+
+
 class TestConfigs(unittest.TestCase):
     def test_missing_key_gets_old_default(self):
         a = dict(BASE_CFG)  # no combine_strat_with_tail -> "all"

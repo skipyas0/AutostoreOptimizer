@@ -25,6 +25,13 @@ FORMATTERS = {
     "iter_time_limit": lambda c: f"iter={c['iter_time_limit']:g}s",
     "strat_choice": lambda c: f"choice={c['strat_choice']}",
     "strat_preset": lambda c: f"strats={c['strat_preset']}",
+    "cp_objective": _objective,  # the first phase of the schedule
+    "default_percent": lambda c: f"nbh={100 * c['default_percent']:g}%",
+    "rrt_threshold": lambda c: f"rrt={c['rrt_threshold']:g}",
+    "stagnation_th": lambda c: f"stag={c['stagnation_th']}" if c["stagnation_th"] < 1e5 else "",
+    "workers": lambda c: f"{c['workers']} workers",
+    "iters": lambda c: f"{c['iters']} iters" if c.get("iters") else "",
+    "time_limit": lambda c: "" if c.get("time_limit") else "no time limit",
 }
 
 
@@ -48,7 +55,7 @@ def config_table(experiments, prefix="LNS"):
         for k in differing:
             f = FORMATTERS.get(k, lambda c, k=k: f"{k}={c.get(k)}")
             p = f(c)
-            if p not in parts:
+            if p and p not in parts:
                 parts.append(p)
         labels.append(" · ".join(parts) if parts else "default")
     g["method"] = [f"{prefix}-{i + 1}" for i in range(len(g))]

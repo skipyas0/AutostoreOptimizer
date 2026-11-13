@@ -28,7 +28,10 @@ neighbourhood (`subproblem.close_under_sharing`, fixed point). The warm start th
 instance and costs about 0.03 s per iteration. The logged unfrozen set (`num_optimized`, barcodes) stays the
 strategy's selection. `--no-close-sharing` restores the behaviour of the subproblem experiments before Nov 2026.
 The first consequence (no new sharing with frozen orders) remains; a fix would pass frozen visits that serve active
-orders as joinable "exo visits" with fixed fetch/return but open picks.
+orders as joinable "exo visits" with fixed fetch/return but open picks. The `bin_sharing` strategies
+(`refetched_sku_pick_slices`, `refetched_sku_fetch_density`, `fetch_pick_ratio_timeslice`) work around it by
+selecting all orders in a time window around repeated visits of a SKU, so the visits that could be merged are all
+active.
 
 ### Acceptance is by makespan only
 `Solver.rrt_acceptance` compares makespans, whatever the active objective. In a `bin_fetches` / `total_flow_time` /

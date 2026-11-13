@@ -261,7 +261,9 @@ def build_model(
     return CppModelWrapper(cpp_model), build_handles(instance, horizon)
 
 
-CPP_OBJECTIVES = ("makespan", "bin_fetches", "total_flow_time", "idle_time", "max_picks")
+CPP_OBJECTIVES = (
+    "makespan", "bin_fetches", "total_flow_time", "idle_time", "max_picks", "sum_makespans"
+)
 
 
 class CppModelWrapper:

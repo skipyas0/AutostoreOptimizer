@@ -555,6 +555,180 @@ def strategy_history_success_ratio(handles, vlg, p=0.05) -> SelectionResult:
     return SelectionResult(seed_orders=seed_o, seed_skus=seed_k)
 
 
+# --------------------------------------------------------------------------- #
+# Bin-sharing strategies
+#
+# They pick timeslices where sharing could be created, so the subproblem holds the
+# orders around one bin visit instead of an active order next to a frozen visit
+# (see docs/KNOWN_ISSUES.md, "Subproblem LNS: shared bin visits").
+# --------------------------------------------------------------------------- #
+def _bounds(solution, var):
+    """(start, end) of a present interval in the solution, else None."""
+    if var is None or solution is None:
+        return None
+    if hasattr(solution, "BooleanValue"):
+        if not solution.BooleanValue(var.pres):
+            return None
+        return solution.Value(var.start), solution.Value(var.end)
+    vs = solution.get_var_solution(var)
+    if vs is None or not vs.is_present():
+        return None
+    return vs.get_start(), vs.get_end()
+
+
+def _bin_visits(handles, solution, skus=None):
+    """Present bin visits: list of (s, k, (fetch_start, fetch_end), [(pick_start, pick_end), ...])."""
+    P = handles.get("P", {})
+    demand = handles["orders_demanding_sku"]
+    wanted = None if skus is None else set(skus)
+    visits = []
+    for (s, k, e), f_var in handles["F"].items():
+        if wanted is not None and k not in wanted:
+            continue
+        fetch = _bounds(solution, f_var)
+        if fetch is None:
+            continue
+        picks = []
+        for o in demand[k]:
+            pick = _bounds(solution, P.get((o, s, k, e)))
+            if pick is not None:
+                picks.append(pick)
+        visits.append((s, k, fetch, picks))
+    return visits
+
+
+def _refetch_counts(handles, solution):
+    """Refetches per SKU: number of its bin visits minus one (over all stations)."""
+    fetches = defaultdict(int)
+    for (s, k, e), f_var in handles["F"].items():
+        if _bounds(solution, f_var) is not None:
+            fetches[k] += 1
+    return {k: n - 1 for k, n in fetches.items() if n > 1}
+
+
+def _draw_refetched_sku(handles, solution):
+    """One SKU drawn with probability proportional to its number of refetches (None if none)."""
+    refetches = _refetch_counts(handles, solution)
+    if not refetches:
+        return None
+    skus = sorted(refetches)
+    return random.choices(skus, weights=[refetches[k] for k in skus], k=1)[0]
+
+
+def _window_starts(lo, hi, width):
+    """Window starts t such that [t, t + width) overlaps the interval [lo, hi)."""
+    return lo - width + 1, max(hi, lo + 1) - 1
+
+
+def _add_range(diff, lo, hi):
+    """+1 on window starts lo..hi (inclusive), clipped to the diff array."""
+    lo, hi = max(lo, 0), min(hi, len(diff) - 2)
+    if lo <= hi:
+        diff[lo] += 1
+        diff[hi + 1] -= 1
+
+
+def _random_argmax(values):
+    """Index of a maximum of ``values``, ties broken at random."""
+    best = np.flatnonzero(values == values.max())
+    return int(random.choice(best))
+
+
+def strategy_refetched_sku_pick_slices(handles, solution, n_slices, width) -> SelectionResult:
+    """Orders in tiny timeslices around the picks of one refetched SKU.
+
+    The SKU is drawn with probability proportional to its refetches. Up to ``n_slices``
+    of its picks are drawn, and each gets a slice of ``width`` centred on the pick.
+    """
+    sku = _draw_refetched_sku(handles, solution)
+    if sku is None:
+        return SelectionResult()
+    picks = [pick for _, _, _, ps in _bin_visits(handles, solution, [sku]) for pick in ps]
+    order_intervals, _ = get_order_intervals(handles, solution)
+    width = max(1, width)
+    slices = []
+    for ps, pe in random.sample(picks, min(n_slices, len(picks))):
+        t_start = (ps + pe) // 2 - width // 2
+        slices.append(orders_in_timeslice(order_intervals, t_start, t_start + width))
+    return combine_strategies(*slices)
+
+
+def strategy_refetched_sku_fetch_density(handles, solution, width) -> SelectionResult:
+    """Orders in the window where one refetched SKU is fetched the most.
+
+    The SKU is drawn with probability proportional to its refetches. A fetch counts
+    for a window if the two overlap.
+    """
+    sku = _draw_refetched_sku(handles, solution)
+    if sku is None:
+        return SelectionResult()
+    order_intervals, makespan = get_order_intervals(handles, solution)
+    width = max(1, width)
+    if makespan <= width:
+        return orders_in_timeslice(order_intervals, 0, makespan)
+
+    diff = np.zeros(makespan - width + 2, dtype=np.int64)
+    for _, _, (fs, fe), _ in _bin_visits(handles, solution, [sku]):
+        _add_range(diff, *_window_starts(fs, fe, width))
+    counts = np.cumsum(diff)[:-1]
+    t_start = _random_argmax(counts)
+    return orders_in_timeslice(order_intervals, t_start, t_start + width)
+
+
+def fetch_pick_counts(visits, n_windows, width):
+    """Fetches and picks counted for each window start 0..n_windows-1.
+
+    A pick counts if both it and its visit's fetch overlap the window; a fetch counts
+    if it and at least one of its picks overlap the window.
+    """
+    fetch_diff = np.zeros(n_windows + 1, dtype=np.int64)
+    pick_diff = np.zeros(n_windows + 1, dtype=np.int64)
+    for _, _, (fs, fe), picks in visits:
+        f_lo, f_hi = _window_starts(fs, fe, width)
+        ranges = []
+        for ps, pe in picks:
+            p_lo, p_hi = _window_starts(ps, pe, width)
+            lo, hi = max(f_lo, p_lo), min(f_hi, p_hi)
+            if lo <= hi:
+                _add_range(pick_diff, lo, hi)
+                ranges.append((lo, hi))
+        # the fetch counts once on the union of its picks' ranges
+        ranges.sort()
+        cur_lo, cur_hi = None, None
+        for lo, hi in ranges:
+            if cur_hi is not None and lo <= cur_hi + 1:
+                cur_hi = max(cur_hi, hi)
+                continue
+            if cur_hi is not None:
+                _add_range(fetch_diff, cur_lo, cur_hi)
+            cur_lo, cur_hi = lo, hi
+        if cur_hi is not None:
+            _add_range(fetch_diff, cur_lo, cur_hi)
+    return np.cumsum(fetch_diff)[:-1], np.cumsum(pick_diff)[:-1]
+
+
+def strategy_fetch_pick_ratio_timeslice(handles, solution, width) -> SelectionResult:
+    """Orders in the window with the highest fetches / picks ratio (least bin sharing).
+
+    1.0 means every pick in the window has its own fetch. Only fetch-pick pairs of the
+    same visit that both overlap the window count (see ``fetch_pick_counts``).
+    Ties are broken at random.
+    """
+    order_intervals, makespan = get_order_intervals(handles, solution)
+    width = max(1, width)
+    if makespan <= width:
+        return orders_in_timeslice(order_intervals, 0, makespan)
+
+    fetches, picks = fetch_pick_counts(
+        _bin_visits(handles, solution), makespan - width + 1, width
+    )
+    if not picks.any():
+        return strategy_multi_random_timeslice(handles, solution, 1, width)
+    ratio = np.where(picks > 0, fetches / np.maximum(picks, 1), -1.0)
+    t_start = _random_argmax(ratio)
+    return orders_in_timeslice(order_intervals, t_start, t_start + width)
+
+
 def combine_strategies(*strategy_outputs: SelectionResult) -> SelectionResult:
     """Combines any number of selection results into a single selection."""
     combined_res = SelectionResult()
@@ -641,6 +815,15 @@ class StrategyManager:
             "pickface_balancing_station_timeslice": lambda sev: (
                 strategy_pickface_balancing_station_slices(h, sol(), width * sev)
             ),
+            "refetched_sku_pick_slices": lambda sev: strategy_refetched_sku_pick_slices(
+                h, sol(), n_slices=10, width=width * sev // 10
+            ),
+            "refetched_sku_fetch_density": lambda sev: strategy_refetched_sku_fetch_density(
+                h, sol(), width * sev
+            ),
+            "fetch_pick_ratio_timeslice": lambda sev: strategy_fetch_pick_ratio_timeslice(
+                h, sol(), width * sev
+            ),
         }
 
         self.presets = {
@@ -660,6 +843,11 @@ class StrategyManager:
                 "longest_orders",
                 "history_selection_frequency",
                 "history_success_ratio",
+            ],
+            "bin_sharing": [
+                "refetched_sku_pick_slices",
+                "refetched_sku_fetch_density",
+                "fetch_pick_ratio_timeslice",
             ],
             "seem_to_work_best": [
                 "random_orders",
