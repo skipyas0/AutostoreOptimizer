@@ -5,7 +5,7 @@ replaces `analyze_experiment1.py`, `analyze_lns_experiments.py` and
 `analyze_lns_scaling.py`.
 
 ```bash
-python -m evaluation compare precalculated_instances/temp_lns --out results/lns_config_comparison
+python -m evaluation compare precalculated_instances --out results/lns_config_comparison
 python -m evaluation compare <root> --configs LNS-2 LNS-6 --baselines CP "RDI-LB share"
 python -m evaluation compare <root> --pattern 'GEN*-10-*' --times 30 120 900 --png-tables
 python -m evaluation scaling results/lns_scaling

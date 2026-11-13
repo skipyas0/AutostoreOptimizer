@@ -38,6 +38,17 @@ def _spread(ys, min_gap):
     return out
 
 
+def _legend_below(fig, handles, labels, ncol, pad_pt=6):
+    """Figure legend centred just below the lowest axis decoration (tick labels, x label).
+    Call after the layout is final (subplots_adjust); works at any figure size."""
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    bottom = min(ax.get_tightbbox(renderer).y0 for ax in fig.axes if ax.get_visible())
+    y = fig.transFigure.inverted().transform((0, bottom))[1]
+    y -= pad_pt / 72 * fig.dpi / fig.bbox.height
+    return fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, y), ncol=ncol)
+
+
 def _time_axis(ax, t_min, time_limit, right=None):
     from matplotlib.ticker import FixedLocator, NullFormatter
     ticks = [t for t in (0.1, 1, 10, 60, 300, 900, 3600) if t_min <= t <= time_limit]
@@ -141,11 +152,10 @@ def convergence(runs, methods, look, sizes, time_limit, out, name, bands=False,
         handles.append(Line2D([], [], color=style.HEURISTIC_COLOR, lw=1.1, ls=(0, (4, 2)),
                               marker="*", ms=10, mfc=style.HEURISTIC_MARK, mec="white"))
         labels.append("Heuristic (star: mean runtime)")
-    fig.legend(handles, labels, loc="lower center", ncol=min(4, len(labels)),
-               bbox_to_anchor=(0.5, -0.12 if len(labels) <= 4 else -0.2))
     if title:
         fig.suptitle(title, y=1.02, fontsize=10)
     fig.subplots_adjust(wspace=0.1 + 0.06 * longest / panel_w * 3.6 if any_labels else 0.1)
+    _legend_below(fig, handles, labels, ncol=min(4, len(labels)))
     style.save(fig, out, name)
 
 
@@ -298,7 +308,7 @@ def lns_time_composition(iters, methods, look, sizes, out, name, title=None):
     axes[0].set_yticks(y, [look[m]["label"] for m in methods])
     axes[0].invert_yaxis()
     h, l = axes[0].get_legend_handles_labels()
-    fig.legend(h, l, loc="lower center", ncol=4, bbox_to_anchor=(0.5, -0.22))
+    _legend_below(fig, h, l, ncol=4)
     if title:
         fig.suptitle(title, y=1.04, fontsize=10)
     style.save(fig, out, name)
@@ -452,8 +462,7 @@ def work_vs_utilisation(sol, methods, look, sizes, ref, out, name, title=None):
     labels.append("Heuristic (labelled)")
     handles.append(Line2D([], [], marker="o", ls="none", ms=4, color=style.MUTED, alpha=0.4))
     labels.append("one instance (mean over runs)")
-    fig.legend(handles, labels, loc="lower center", ncol=min(4, len(labels)),
-               bbox_to_anchor=(0.5, -0.1 if len(labels) <= 4 else -0.2))
+    _legend_below(fig, handles, labels, ncol=min(4, len(labels)))
     if title:
         fig.suptitle(title, y=1.02, fontsize=10)
     style.save(fig, out, name)
@@ -503,8 +512,9 @@ def lns_fetches_over_time(iters, lns, look, sizes, start_fetches, refs, time_lim
                             annotation_clip=False)
     axes[0].annotate("0 = LNS start solution", (t_min, 0), xytext=(3, 3),
                      textcoords="offset points", fontsize=6.5, color=style.MUTED)
-    fig.legend(loc="lower center", ncol=3, bbox_to_anchor=(0.5, -0.2))
-    fig.subplots_adjust(wspace=0.35)
+    longest = max((len(m) for m in refs.method), default=0)  # labels right of each panel
+    fig.subplots_adjust(wspace=max(0.35, 0.03 * longest))
+    _legend_below(fig, *axes[0].get_legend_handles_labels(), ncol=3)
     if title:
         fig.suptitle(title, y=1.02, fontsize=10)
     style.save(fig, out, name)

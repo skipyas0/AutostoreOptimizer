@@ -63,15 +63,12 @@ class Comparison:
         d = load_root(root, pattern)
         self.instances, self.sizes = d.instances, d.size_order
         # Ids come from all configs, so LNS-k means the same config in every report.
-        self.cfg = config_table(d.experiments)
+        self.cfg = config_table(d.experiments, select=select)
         runs, self.iters = assign_lns_methods(d.runs, d.iters, self.cfg)
         # Best known solution from everything loaded, before filtering, so gaps are
         # comparable between reports on the same root.
         runs = metrics.add_reference(runs, self.instances)
         if select:
-            attrs = self.cfg.attrs
-            self.cfg = self.cfg[self.cfg.method.isin(select)].reset_index(drop=True)
-            self.cfg.attrs = attrs
             keep = runs.family.ne("lns") | runs.method.isin(select)
             runs = runs[keep]
             if len(self.iters):

@@ -131,7 +131,7 @@ def figure(df, out):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("root", nargs="?", default="precalculated_instances/temp_lns")
+    ap.add_argument("root", nargs="?", default="precalculated_instances")
     ap.add_argument("--runs", default="results/lns_config_comparison/data/runs.csv")
     ap.add_argument("--lns", default="LNS-6")
     ap.add_argument("--out", default="results/lns_config_comparison/rdi_vs_lns")

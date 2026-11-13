@@ -35,14 +35,20 @@ FORMATTERS = {
 }
 
 
-def config_table(experiments, prefix="LNS"):
+def config_table(experiments, prefix="LNS", select=None):
     """One row per distinct config: id, label, differing params, #instances, first date.
 
-    Ids are assigned in order of the first run of each config.
+    Ids are assigned in order of the first run of each config, over all configs, so an id
+    means the same config in every report on the same root. With `select` (a list of
+    ids) only those configs are kept, and labels name only the parameters in which the
+    selected configs differ.
     """
     g = experiments.groupby("config_key").agg(first=("date", "min"),
                                               n_instances=("instance", "nunique"))
     g = g.sort_values("first").reset_index()
+    g["method"] = [f"{prefix}-{i + 1}" for i in range(len(g))]
+    if select:
+        g = g[g.method.isin(select)].reset_index(drop=True)
     cfgs = [normalize_config(json.loads(k)) for k in g.config_key]
     keys = sorted({k for c in cfgs for k in c})
     differing = [k for k in keys if len({json.dumps(c.get(k)) for c in cfgs}) > 1]
@@ -58,7 +64,6 @@ def config_table(experiments, prefix="LNS"):
             if p and p not in parts:
                 parts.append(p)
         labels.append(" · ".join(parts) if parts else "default")
-    g["method"] = [f"{prefix}-{i + 1}" for i in range(len(g))]
     g["label"] = labels
     for k in differing:
         g[k] = [c.get(k) for c in cfgs]

@@ -35,3 +35,4 @@ tests/regression/.cache
 # Warehouse editor/simulator web app (separate git repo)
 warehouse-sim/
 reference_papers
+reports
