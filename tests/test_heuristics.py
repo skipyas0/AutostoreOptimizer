@@ -21,6 +21,7 @@ from heuristics import (  # noqa: E402
     Rule,
     resolve,
     run_ama,
+    run_gbs,
     run_heuristic,
     run_partitioned_rdi,
     run_rdi,
@@ -407,3 +408,63 @@ def test_rdi_load_balanced_never_commits_to_overloaded_station(monkeypatch):
     load = {s: 0.0 for s in four.S}
     run_rdi(four)  # plain RDI, same spy
     assert lb_spread <= max(load.values()) - min(load.values())
+
+
+# ---------------------------------------------------------------------------
+# GBS
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def four_stations():
+    return generate_data(num_stations=4, lanes_per_station=2, num_orders=40, num_skus=8000,
+                         seed=5, pick_touch_time=4, movecap=12)
+
+
+@pytest.mark.parametrize("interleave", [True, False])
+@pytest.mark.parametrize("partition", ["overlap", "lpt"])
+@pytest.mark.parametrize("pickcap", [1, 2])
+def test_gbs_variants_valid(interleave, partition, pickcap):
+    inst = generate_data(num_stations=4, lanes_per_station=3, num_orders=40, num_skus=8000,
+                         seed=5, pick_touch_time=4, movecap=12, pickcap=pickcap)
+    sol = run_gbs(inst, interleave=interleave, partition=partition)
+    assert sol.feasible and sol.validate(inst) == []
+    assert (sol.meta["interleave"], sol.meta["partition"]) == (interleave, partition)
+    # every visit serves all its orders within its presence, at most PickCap at a time
+    for evs in sol.bin_events.values():
+        for ev in evs:
+            assert len(ev.pick_intervals) == len(ev.orders_served)
+            assert all(ev.presence_start <= a < b <= ev.presence_end for a, b in ev.pick_intervals)
+
+
+def test_gbs_lpt_partition_is_balanced(four_stations):
+    from heuristics.gbs import partition_orders
+
+    inst = four_stations
+    work = {o: sum(inst.p[k] for k in inst.orders_req[o]) for o in inst.O}
+    part = partition_orders(inst, "lpt")
+    assert sorted(o for os_ in part.values() for o in os_) == sorted(inst.O)
+    load = [sum(work[o] for o in os_) for os_ in part.values()]
+    assert max(load) - min(load) <= max(work.values())  # LPT: spread below the largest job
+
+
+def test_gbs_interleave_reduces_station_drift(four_stations):
+    """Sequential GBS lets later stations drift (copies only free after their last return)."""
+    seq = run_gbs(four_stations, interleave=False)
+    inter = run_gbs(four_stations, interleave=True)
+    assert inter.validate(four_stations) == [] and seq.validate(four_stations) == []
+    assert inter.makespan <= seq.makespan
+
+
+def test_gbs_rejects_unknown_options(four_stations):
+    with pytest.raises(ValueError):
+        run_gbs(four_stations, rule="nope")
+    with pytest.raises(ValueError):
+        run_gbs(four_stations, partition="nope")
+
+
+def test_gbs_tight_horizon_is_infeasible_not_false_feasible(four_stations):
+    sol = run_gbs(four_stations, horizon=200)
+    assert not sol.feasible
+    assert set(sol.order_assignments) < set(four_stations.O)
+    assert all(v.startswith("Order") for v in sol.validate(four_stations, 200))  # only missing orders

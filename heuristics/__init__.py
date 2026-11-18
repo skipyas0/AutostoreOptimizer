@@ -17,6 +17,7 @@ import time
 from typing import Callable
 
 from heuristics.cfss import run_cfss
+from heuristics.gbs import GBS_PARTITIONS, GBS_RULES, run_gbs
 from heuristics.heuristic_utils import BinEvent, ExoState
 from heuristics.partitioned_rdi import PARTITION_METHODS, run_partitioned_rdi
 from heuristics.rdi import TIEBREAKERS, run_rdi
@@ -62,6 +63,16 @@ HEURISTICS: dict[str, tuple[Callable[..., HeuristicSolution], dict]] = {
     ),
     "cfss": (run_cfss, {}),
     "cfss_normalized": (run_cfss, {"normalize_similarity": True}),
+    # bin-centred: schedule bin visits serving every active order that needs the SKU
+    # (stations interleaved in time, original overlap partition)
+    "gbs_max_sharing": (run_gbs, {"rule": "max_sharing"}),
+    "gbs_critical_path": (run_gbs, {"rule": "critical_path"}),
+    "gbs_readiness_weighted": (run_gbs, {"rule": "readiness_weighted"}),
+    "gbs_adaptive": (run_gbs, {"rule": "adaptive"}),
+    # LPT partition on picking workload (near-perfect workload balance, a little less sharing)
+    "gbs_lpt": (run_gbs, {"rule": "max_sharing", "partition": "lpt"}),
+    # the original station-by-station construction (ablation)
+    "gbs_sequential": (run_gbs, {"rule": "max_sharing", "interleave": False}),
 }
 
 # Alternative spellings accepted by run_heuristic (e.g. LNS precalculation configs).
@@ -79,6 +90,7 @@ ALIASES = {
     "full_rdi": "rdi",
     "ama_sgc": "ama",
     "cfss_sgc": "cfss",
+    "gbs": "gbs_max_sharing",
 }
 # NB: "load_balanced_rdi" / "random_rdi" / "similarity_rdi" in LNS precalculation configs
 # mean the CP-based station decomposition (decomposition.py), not partitioned_rdi_*.
@@ -112,6 +124,8 @@ __all__ = [
     "ALL_RULES",
     "BinEvent",
     "ExoState",
+    "GBS_PARTITIONS",
+    "GBS_RULES",
     "HEURISTICS",
     "HeuristicSolution",
     "PARTITION_METHODS",
@@ -121,6 +135,7 @@ __all__ = [
     "resolve",
     "run_ama",
     "run_cfss",
+    "run_gbs",
     "run_heuristic",
     "run_partitioned_rdi",
     "run_rdi",

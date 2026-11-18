@@ -37,6 +37,7 @@ CLI: `python -m heuristics --list`, `python -m heuristics <name> [--orders 40 ..
 | `rdi.py` | RDI (regret insertion with the gap-filling planner) |
 | `partitioned_rdi.py` | Order→station partitioning, `distribute_movecap`, partitioned RDI |
 | `cfss.py` | Clustering plus interleaved SGC |
+| `gbs.py` | GBS: bin-centred construction (one visit serves every active order needing the SKU) |
 
 ## Registry
 
@@ -57,12 +58,15 @@ CLI: `python -m heuristics --list`, `python -m heuristics <name> [--orders 40 ..
 | `partitioned_rdi_{random,similarity,load_balanced}` | `run_partitioned_rdi(partition=...)` (seed 0) |
 | `partitioned_rdi_load_balanced_share` | as above with the `rdi_share` options |
 | `cfss` / `cfss_normalized` | `run_cfss(normalize_similarity=False / True)` |
+| `gbs_max_sharing` (alias `gbs`) / `gbs_critical_path` / `gbs_readiness_weighted` / `gbs_adaptive` | `run_gbs(rule=...)` (stations interleaved, overlap partition) |
+| `gbs_lpt` / `gbs_sequential` | `run_gbs(partition="lpt")` / `run_gbs(interleave=False)` (original construction) |
 
 Aliases such as `greedy`, `load_balanced_greedy` and `rdi_sgc` are accepted by `run_heuristic`
 and by `precalculate_instances_for_lns.py`.
 
 The registry replaces the old per-variant modules. For example, `heuristic_rdi_sgc_best_score.py`
-became `rdi_best_score` and `heuristic_cfss_sgc_normalized.py` became `cfss_normalized`. GBS was removed.
+became `rdi_best_score` and `heuristic_cfss_sgc_normalized.py` became `cfss_normalized`. GBS was removed in
+`ed5cadc` (invalid solutions) and reinstated in a corrected form (see GBS under Algorithms).
 
 ---
 
@@ -248,6 +252,47 @@ This is the heuristic-only counterpart of `decomposition.solve_station_decomposi
 Parameters: `horizon, alpha, beta (default 1.0), sim_threshold (0.1), max_cluster_orders (4), normalize_similarity`.
 Plans use the SGC planner, so MoveCap and PickCap hold. Clusters and pending orders are visited in a fixed order, so the
 result is deterministic.
+
+### GBS: Global Bin Scheduling (`run_gbs`)
+Bin-centred: instead of placing orders and borrowing bins, it schedules bin visits, each serving **every** active order
+at the station that needs the SKU.
+
+1. Partition the orders over the stations (`partition`):
+   - `"overlap"` (default, original): largest `sum_rt` first, to the station maximising rt-overlap with its SKUs minus its rt load.
+   - `"lpt"`: Longest Processing Time on picking workload. Largest `Σ p` first, to the station with the smallest `Σ p` so far.
+     Ties go to the station sharing the most SKUs with the order, then the first station.
+2. Seed every station's lanes with mutually overlapping orders.
+3. A *step* at a station schedules the best-scored *bin task* (one per SKU still needed by an active order) that fits the
+   horizon: fetch when the pickface frees up (copy, MoveCap), the served orders pick one after another (PickCap at a
+   time), return. A finished order frees its lane for the unscheduled order with the largest overlap with the active
+   orders' remaining SKUs.
+4. Which station steps next (`interleave`):
+   - `True` (default): the station whose pickface frees first (ties: first station), so visits are committed roughly in
+     time order over all stations.
+   - `False` (original, registry `gbs_sequential`): each station runs to completion before the next starts.
+
+Rules: `max_sharing` (n_served·(rt+rt_ret)), `critical_path` (largest remaining Σ(rt+p+rt_ret) of a served order),
+`readiness_weighted` (max_sharing − pickface idle gap), `adaptive` (best feasible of the three by `objective(alpha, beta)`).
+Parameters: `horizon, alpha, beta, rule, interleave, partition, exo` (`exo.lanes` is ignored, as in SGC).
+
+Fixed against the scrapped version: picks respect PickCap (previously all served orders picked at once during one
+`p[k]`), and `feasible` is honest (previously pre-filled `(0, 0)` picks made it always `True`).
+
+Why interleaving matters: a `BinCopyPool` copy is only free after its *last* return. Built station by station, a later
+station cannot use a copy in an earlier station's idle gaps, so station end times grow with the station index.
+
+On the 15 LNS benchmark instances (β = 1), relative to `lb_sgc_share` (runtime ≈ 2.5 s for all GBS variants):
+
+| | makespan | fetches | robot work | robot util. | workload imb. | makespan imb. |
+|---|---|---|---|---|---|---|
+| `lb_sgc_share` | 0 | 0 | 0 | 88% | 6.9% | 9.3% |
+| `gbs_sequential` | +49.8% | −9.3% | −5.3% | 57% | 14.9% | 71.5% |
+| `gbs_max_sharing` | −1.4% | −9.3% | −5.3% | 85% | 14.9% | 10.9% |
+| `gbs_readiness_weighted` | −0.1% | −9.2% | −5.2% | 84% | 14.9% | 12.7% |
+| `gbs_lpt` | +0.3% | −7.6% | −4.3% | 85% | 0.2% | 17.6% |
+
+LNS keeps the start's robot work almost unchanged (final makespan ≈ 1.03·W/MoveCap on these instances), so the robot-work
+saving is what a GBS warm start should carry over; this has not been validated with LNS runs yet.
 
 ---
 
