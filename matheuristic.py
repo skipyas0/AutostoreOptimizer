@@ -390,7 +390,7 @@ class Solver:
             if incumbent > self.current_result + 1e-6:
                 if solve_status != "Feasible" and self.cp_obj == "makespan":
                     # Only possible when the subproblem cannot represent the
-                    # incumbent (subproblem mode with --no-close-sharing)
+                    # incumbent (subproblem mode with --no-close-sharing --no-joinable-exo)
                     logger.warning(
                         f"Optimal makespan subproblem is worse than the incumbent "
                         f"({incumbent} > {self.current_result})"
@@ -551,7 +551,8 @@ class Solver:
         cfg = self.experiment_config
         backend = cfg["backend"]
         ctx = subproblem.extract_context(
-            self.current_solution, self.handles, self.instance, active_orders
+            self.current_solution, self.handles, self.instance, active_orders,
+            cfg.get("joinable_exo", True),
         )
         skip = subproblem.violates_bound(ctx, self.cp_obj, impr_bound)
         if not skip:
@@ -1185,8 +1186,17 @@ if __name__ == "__main__":
         default=True,
         dest="close_sharing",
         help="Subproblem mode: add every frozen order that shares a bin visit with an "
-        "active order to the neighbourhood, so the subproblem can always reproduce the "
-        "incumbent (see KNOWN_ISSUES.md, 'Subproblem LNS: shared bin visits')",
+        "active order to the neighbourhood, so shared visits are fully active "
+        "(see KNOWN_ISSUES.md, 'Subproblem LNS: frozen bin visits cannot move')",
+    )
+    parser.add_argument(
+        "--joinable-exo",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        dest="joinable_exo",
+        help="Subproblem mode: active orders can pick from frozen bin visits (fixed fetch, "
+        "presence and return; optional picks inside the presence window). "
+        "--no-joinable-exo restores the subproblems before this option existed",
     )
     parser.add_argument(
         "--improvement-ref",
@@ -1249,6 +1259,7 @@ if __name__ == "__main__":
             "validate_merges": args.validate_merges,
             "combine_strat_with_tail": args.combine_strat_with_tail,
             "close_sharing": args.close_sharing,
+            "joinable_exo": args.joinable_exo,
             "improvement_ref": args.improvement_ref,
         }
         solver = Solver(

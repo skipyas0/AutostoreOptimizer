@@ -10,13 +10,17 @@ stays fixed and enters the subproblem as constants:
   exo_blocks        frozen bin cycles (fetch..return)      -> per-SKU bin copy limit N[k]
   exo_moves         frozen fetches and returns             -> MoveCap
   ObjectiveOffsets  frozen part of every KPI               -> exact global objective values
+  exo_visits        frozen visits active orders may join   -> PX picks, frozen picks in PickCap
 
-PickCap needs no exo data: picks lie inside their bin's presence window and bins at a
-station never overlap, so new picks cannot overlap frozen ones.
+PickCap needs exo data only for the joinable visits: picks lie inside their bin's presence
+window and bins at a station never overlap, so only picks on the same frozen visit can
+overlap frozen ones.
 
-A bin visit is frozen if it serves at least one frozen order. Active orders that
-currently share such a visit lose access to it (see docs/KNOWN_ISSUES.md,
-"Subproblem LNS: shared bin visits").
+A bin visit (F, B, R of one (s, k, e)) is frozen if it serves at least one frozen order:
+its fetch, presence and return are fixed. Active orders can still pick from it
+(``exo_visits``): each gets an optional pick PX[o,s,k,e] inside the fixed presence window,
+as one more candidate of alternative(C[o,k,s], ...). The visit itself cannot move or
+stretch (see docs/KNOWN_ISSUES.md, "Subproblem LNS: frozen bin visits cannot move").
 
 The subproblem result is written back into a full-model solution dict
 (``CppSolveResult``), so strategies, logging and acceptance are unchanged.
@@ -92,6 +96,10 @@ class FrozenContext:
     free_visits: list  # (s, k, e) visits served only by active orders (re-planned)
     frozen_slots: dict  # (s, k) -> set of copy indices e held by frozen visits
     shared_picks: list  # (o, s, k, e): active order picking from a frozen visit
+    # Joinable frozen visits: (s, k, e, b_start, b_end, frozen_picks). Active orders
+    # get optional picks PX[o,s,k,e] inside the fixed presence window.
+    exo_visits: list = field(default_factory=list)
+    warm_px: dict = field(default_factory=dict)  # (o, s, k, e) -> incumbent pick on an exo visit
 
 
 # --------------------------------------------------------------------------- #
@@ -133,8 +141,26 @@ def close_under_sharing(solution, handles, active_orders) -> list:
     return sorted(active)
 
 
-def extract_context(solution, handles, instance, active_orders) -> FrozenContext:
-    """Split the incumbent into the active part (warm start) and the frozen part (exo data)."""
+def _pick_fits(window, frozen_picks, length, pickcap) -> bool:
+    """True if a pick of ``length`` fits in ``window`` next to the frozen picks (PickCap)."""
+    points = sorted({*window, *(t for iv in frozen_picks for t in iv)})
+    run = 0
+    for a, b in zip(points, points[1:]):
+        load = sum(1 for st, en in frozen_picks if st <= a and b <= en)
+        run = run + (b - a) if load < pickcap else 0
+        if run >= length:
+            return True
+    return False
+
+
+def extract_context(solution, handles, instance, active_orders,
+                    joinable_exo: bool = True) -> FrozenContext:
+    """Split the incumbent into the active part (warm start) and the frozen part (exo data).
+
+    ``joinable_exo``: frozen visits of SKUs the active orders need are also passed as
+    ``exo_visits``, so active orders can pick from them (False: behaviour before Nov 2026,
+    active picks on frozen visits are dropped from the warm start).
+    """
     vs = solution.var_sols
     active = set(active_orders)
     S, L = handles["S"], handles["L"]
@@ -171,6 +197,8 @@ def extract_context(solution, handles, instance, active_orders) -> FrozenContext
     free_visits, shared_picks = [], []
     warm_events = defaultdict(list)
     warm_picks = {}
+    exo_visits, warm_px = [], {}
+    sub_skus = {k for o in active for k in handles["orders_req"][o]}
 
     for (s, k, e), b_var in B.items():
         b = _present(vs, b_var)
@@ -194,7 +222,15 @@ def extract_context(solution, handles, instance, active_orders) -> FrozenContext
             for o in frozen_served:
                 offsets.station_pick_time[s] = offsets.station_pick_time.get(s, 0) + p[k]
                 offsets.station_pick_count[s] = offsets.station_pick_count.get(s, 0) + 1
-            shared_picks.extend((o, s, k, e) for o in picks if o in active)
+            shared = [o for o in picks if o in active]
+            shared_picks.extend((o, s, k, e) for o in shared)
+            if joinable_exo and k in sub_skus:
+                frozen_picks = sorted(picks[o] for o in frozen_served)
+                # Exact pruning: skip visits where no further pick can fit
+                if _pick_fits(b, frozen_picks, p[k], instance.pickcap):
+                    exo_visits.append((s, k, e, b[0], b[1], frozen_picks))
+                    for o in shared:
+                        warm_px[(o, s, k, e)] = picks[o]
         else:
             free_visits.append((s, k, e))
             served = sorted(picks)
@@ -209,7 +245,6 @@ def extract_context(solution, handles, instance, active_orders) -> FrozenContext
 
     # Reduced instance: active orders and the SKUs they need
     orders_req = {o: list(handles["orders_req"][o]) for o in sorted(active)}
-    sub_skus = {k for req in orders_req.values() for k in req}
     K_sub = sorted(sub_skus)
     sub = SubInstance(
         S=S, L=L, K=K_sub, orders_req=orders_req,
@@ -243,6 +278,8 @@ def extract_context(solution, handles, instance, active_orders) -> FrozenContext
         free_visits=free_visits,
         frozen_slots=frozen_slots,
         shared_picks=shared_picks,
+        exo_visits=exo_visits,
+        warm_px=warm_px,
     )
 
 
@@ -260,23 +297,41 @@ def build_submodel(ctx: FrozenContext, backend: str, horizon: int, objective: st
         objective_func=objective,
         exo_station_bins=ctx.exo_station_bins,
         obj_offsets=ctx.offsets,
+        exo_visits=ctx.exo_visits,
     )
-    if backend == "docplex":
-        import cp_model
+    import cp_model
 
+    if backend == "docplex":
         mdl, handles = cp_model.build_model(ctx.instance, **kwargs)
-        sp = cp_model.inject_warmstart(ctx.warm, ctx.warm.pick_events, mdl, handles,
-                                       remap_lanes=False)
-        mdl.set_starting_point(sp)
+        sp_model = mdl
     elif backend == "cpp":
         import cpp_cp_model
 
         mdl, handles = cpp_cp_model.build_model(ctx.instance, **kwargs)
-        cpp_cp_model.inject_warmstart(ctx.warm, ctx.warm.pick_events, mdl, handles,
-                                      remap_lanes=False)
+        sp_model = cpp_cp_model.MockCpoModel()
     else:
         raise ValueError(backend)
+    mdl.set_starting_point(warm_start(ctx, sp_model, handles))
     return mdl, handles
+
+
+def warm_start(ctx: FrozenContext, sp_model, handles):
+    """Complete starting point of the subproblem: the incumbent of the active orders."""
+    import cp_model
+
+    sp = cp_model.inject_warmstart(ctx.warm, ctx.warm.pick_events, sp_model, handles,
+                                   remap_lanes=False)
+    # Incumbent picks of active orders on joinable frozen visits (set after the sweep
+    # of inject_warmstart, which marked their consumptions absent)
+    for (o, s, k, e), var in handles["PX"].items():
+        iv = ctx.warm_px.get((o, s, k, e))
+        if iv is None:
+            sp.add_interval_var_solution(var, presence=False)
+        else:
+            sp.add_interval_var_solution(var, presence=True, start=iv[0], end=iv[1])
+            sp.add_interval_var_solution(handles["C"][(o, k, s)], presence=True,
+                                         start=iv[0], end=iv[1])
+    return sp
 
 
 def solve_submodel(mdl, handles, backend, objective, impr_bound, cfg, progress_callback=None,
@@ -368,8 +423,9 @@ def merge(solution, ctx: FrozenContext, sub_sol, sub_handles, handles) -> dict:
         put(I_os[(o, s)], _iv(st, en))
         put(I_os_lane[(o, s, ln)], _iv(st, en))
         for k in orders_req[o]:
-            ps, pe = hs.pick_events[(o, s, k)]
-            put(C[(o, k, s)], _iv(ps, pe))
+            # from C, not hs.pick_events: picks on exo visits (PX) are not in hs
+            c = sub_sol.get_var_solution(sub_handles["C"][(o, k, s)])
+            put(C[(o, k, s)], _iv(c.get_start(), c.get_end()))
 
     # 3. Bin visits: take copy indices not held by frozen visits
     for s, events in hs.bin_events.items():
@@ -389,6 +445,12 @@ def merge(solution, ctx: FrozenContext, sub_sol, sub_handles, handles) -> dict:
                 put(Block[(s, k, e)], _iv(be.fetch_start, be.return_end))
                 for o in be.orders_served:
                     put(P[(o, s, k, e)], _iv(*hs.pick_events[(o, s, k)]))
+
+    # 4. Picks on joinable frozen visits: e is the visit's copy index in the full model
+    for key, var in sub_handles["PX"].items():
+        px = sub_sol.get_var_solution(var)
+        if px is not None and px.is_present():
+            put(P[key], _iv(px.get_start(), px.get_end()))
     return new
 
 
@@ -427,12 +489,13 @@ def to_full_result(solution, ctx, sub_sol, sub_handles, handles, backend, object
 
 
 def solve_iteration(solution, handles, instance, active_orders, *, backend, horizon,
-                    objective, impr_bound, cfg, progress_callback=None, limits=None):
+                    objective, impr_bound, cfg, progress_callback=None, limits=None,
+                    joinable_exo=True):
     """One complete subproblem iteration: extract, build, solve, merge.
 
     Returns (CppSolveResult on the full model, progress records, FrozenContext).
     """
-    ctx = extract_context(solution, handles, instance, active_orders)
+    ctx = extract_context(solution, handles, instance, active_orders, joinable_exo)
     if violates_bound(ctx, objective, impr_bound):
         return infeasible_result(), [], ctx
     mdl, sub_handles = build_submodel(ctx, backend, horizon, objective)

@@ -204,9 +204,10 @@ def test_bound_shortcut(setup):
     assert not subproblem.violates_bound(ctx, "makespan", hs.makespan - 1)
 
 
+@pytest.mark.parametrize("close_sharing", [True, False], ids=["closure", "no_closure"])
 @pytest.mark.parametrize("cycling", [False, True], ids=["makespan", "cycling"])
 @pytest.mark.parametrize("backend", BACKENDS)
-def test_lns_end_to_end(tmp_path, backend, cycling):
+def test_lns_end_to_end(tmp_path, backend, cycling, close_sharing):
     from matheuristic import Solver
 
     inst = generate_data(num_stations=2, lanes_per_station=2, num_orders=16, num_skus=40,
@@ -232,7 +233,8 @@ def test_lns_end_to_end(tmp_path, backend, cycling):
         "default_percent": 0.2, "cp_objective": "makespan",
         "cp_objective_phase_duration": 0, "cp_objective_phase_schedule": "m",
         "render_video": False, "only_first_sol": False,
-        "lns_model": "subproblem", "validate_merges": True, "close_sharing": True,
+        "lns_model": "subproblem", "validate_merges": True, "close_sharing": close_sharing,
+        "joinable_exo": True,
         "improvement_ref": "current",
     }
     if cycling:
@@ -270,3 +272,258 @@ def test_cpp_submodel_matches_docplex(setup, tmp_path):
         diff = [ln for ln in diff if ln[:1] in "+-" and ln[:3] not in ("+++", "---")
                 and "shift_len" not in ln and "shift_cost" not in ln]
         assert not diff, "".join(diff[:60])
+
+
+# --------------------------------------------------------------------------- #
+# Joinable frozen visits (exo_visits): validation against the full CP model
+# --------------------------------------------------------------------------- #
+KPIS = ("makespan", "bin_fetches", "total_flow_time", "idle_time", "max_picks",
+        "sum_makespans")
+DECISION = ("I_os", "I_os_lane", "C", "P", "F", "R", "B", "Block")
+
+
+@pytest.fixture(scope="module", params=[(1, 1), (7, 2)], ids=["pickcap1", "pickcap2"])
+def shared_setup(request):
+    """Small instance with an RDI incumbent, in which about half the visits are shared."""
+    seed, pickcap = request.param
+    inst = generate_data(num_stations=2, lanes_per_station=2, num_orders=16, num_skus=12,
+                         seed=seed, movecap=4, pickcap=pickcap)
+    heur = run_heuristic("rdi", inst, horizon=H)
+    assert heur is not None and heur.feasible
+    _, handles, sol = prepare_model_subproblem({"horizon": H}, inst, heur)
+    return inst, handles, sol
+
+
+def _fix(mdl, var, value):
+    """Fix an interval variable of a docplex model to a var_sols entry."""
+    if value is not None and value.get("present"):
+        mdl.add(mdl.presence_of(var) == 1)
+        mdl.add(mdl.start_of(var) == value["start"])
+        mdl.add(mdl.end_of(var) == value["end"])
+    else:
+        mdl.add(mdl.presence_of(var) == 0)
+
+
+def _full_model_fixed(inst, sol, objective="makespan", active=None):
+    """Full docplex model with the incumbent ``sol`` fixed.
+
+    ``active=None``: every decision variable is fixed (a feasibility / KPI check).
+    Otherwise the reference for a subproblem: the frozen orders' windows, lanes,
+    consumptions and picks are fixed, and so are F, B, R, Block of every visit that
+    serves a frozen order. Everything else is free, including the active orders'
+    picks on those visits.
+    """
+    mdl, h = cp_model.build_model(inst, add_symmetry_breaking=False, horizon=H,
+                                  objective_func=objective)
+    vs = sol.var_sols
+
+    def present(var):
+        value = vs.get(var.get_name())
+        return value is not None and value.get("present")
+
+    if active is None:
+        for group in DECISION:
+            for var in h[group].values():
+                _fix(mdl, var, vs.get(var.get_name()))
+        return mdl, h
+
+    active = set(active)
+    for group in ("I_os", "I_os_lane", "C", "P"):
+        for key, var in h[group].items():
+            if key[0] not in active:
+                _fix(mdl, var, vs.get(var.get_name()))
+    spare = {}  # (s, k) -> free copy indices still allowed
+    for (s, k, e), b in h["B"].items():
+        demand = h["orders_demanding_sku"][k]
+        frozen = [o for o in demand if o not in active and present(h["P"][(o, s, k, e)])]
+        if present(b) and frozen:
+            for group in ("F", "B", "R", "Block"):
+                var = h[group][(s, k, e)]
+                _fix(mdl, var, vs.get(var.get_name()))
+            continue
+        # Copy indices are interchangeable (no symmetry breaking), and the active orders
+        # need at most one visit per order line: the surplus free copies are switched
+        # off, otherwise CP Optimizer rarely proves optimality of the full model.
+        left = spare.setdefault((s, k), len(demand & active))
+        if left > 0:
+            spare[(s, k)] = left - 1
+        else:
+            for group in ("F", "B", "R", "Block"):
+                mdl.add(mdl.presence_of(h[group][(s, k, e)]) == 0)
+    return mdl, h
+
+
+def _assert_feasible_in_full_model(inst, result):
+    """The merged solution satisfies the full CP model and its KPIs are the reported ones."""
+    mdl, _ = _full_model_fixed(inst, result)
+    res = mdl.solve(TimeLimit=30, Workers=1, LogVerbosity="Quiet")
+    assert res.is_solution(), "merged solution is infeasible in the full CP model"
+    full, reported = res.get_kpis(), result.get_kpis()
+    for name in KPIS:
+        assert full[name] == reported[name], (name, full[name], reported[name])
+
+
+def _small_neighbourhoods(handles, n, seed, max_size=4):
+    rng = random.Random(seed)
+    for _ in range(n):
+        yield rng.sample(handles["O"], rng.randint(1, max_size))
+
+
+def _joins(ctx, result, handles):
+    """Active orders' picks on frozen visits in ``result`` that are new (not in the incumbent)."""
+    vs = result.var_sols
+    found = []
+    for (s, k), slots in ctx.frozen_slots.items():
+        for e in slots:
+            for o in ctx.active_orders:
+                key = (o, s, k, e)
+                if key in handles["P"] and key not in ctx.warm_px \
+                        and vs[handles["P"][key].get_name()].get("present"):
+                    found.append(key)
+    return found
+
+
+def test_pick_fits():
+    fits = subproblem._pick_fits
+    assert fits((0, 10), [], 10, 1) and not fits((0, 10), [], 11, 1)
+    assert fits((0, 30), [(0, 10), (20, 30)], 10, 1)
+    assert not fits((0, 30), [(0, 10), (15, 30)], 10, 1)
+    # PickCap 2: one frozen pick leaves room everywhere, two overlapping ones do not
+    assert fits((0, 10), [(0, 10)], 10, 2)
+    assert not fits((0, 10), [(0, 10), (0, 10)], 10, 2)
+    assert not fits((0, 20), [(0, 12), (8, 20)], 10, 2)  # free parts 8 + 8, not contiguous
+
+
+def test_joinable_exo_off_is_the_old_subproblem(setup):
+    inst, handles, sol = setup
+    for active in _random_neighbourhoods(handles, 5, seed=6):
+        ctx = subproblem.extract_context(sol, handles, inst, active, joinable_exo=False)
+        assert not ctx.exo_visits and not ctx.warm_px
+        _, sub_handles = subproblem.build_submodel(ctx, "docplex", H, "makespan")
+        assert not sub_handles["PX"]
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_exo_visits_keep_the_incumbent(shared_setup, backend):
+    """Without the closure, the warm start is a feasible solution of the subproblem with
+    the incumbent's KPIs. The variables are fixed to the warm start, so a starting point
+    that CP Optimizer would silently repair fails here."""
+    inst, handles, sol = shared_setup
+    with_shared = 0
+    for active in _random_neighbourhoods(handles, 10, seed=0):
+        ctx = subproblem.extract_context(sol, handles, inst, active)
+        assert len(ctx.warm_px) == len(ctx.shared_picks)
+        with_shared += bool(ctx.shared_picks)
+        mdl, sub_handles = subproblem.build_submodel(ctx, backend, H, "makespan")
+        variables = [v for group in DECISION + ("PX",) for v in sub_handles[group].values()]
+        if backend == "docplex":
+            sp = subproblem.warm_start(ctx, mdl, sub_handles)
+            for var in variables:
+                vsol = sp.get_var_solution(var)
+                assert vsol is not None, var.get_name()  # complete starting point
+                value = {"present": vsol.is_present()}
+                if vsol.is_present():
+                    value.update(start=vsol.get_start(), end=vsol.get_end())
+                _fix(mdl, var, value)
+        else:
+            import cpp_cp_model
+
+            state = subproblem.warm_start(ctx, cpp_cp_model.MockCpoModel(),
+                                          sub_handles).state_dict
+            names = [v.get_name() for v in variables]
+            assert set(names) <= set(state)  # complete starting point
+            mdl.apply_delta_freezing(
+                names, [state[n]["present"] for n in names],
+                [state[n].get("start", 0) for n in names],
+                [state[n].get("end", 0) for n in names], [])
+        res, _ = subproblem.solve_submodel(mdl, sub_handles, backend, "makespan", -1, CFG)
+        assert res.is_solution(), active
+        for name in KPIS:
+            assert res.get_kpis()[name] == sol.get_kpis()[name], (name, active)
+    assert with_shared >= 3
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("objective", KPIS)
+def test_subproblem_optimum_equals_frozen_full_model(shared_setup, objective, backend):
+    """A subproblem with joinable frozen visits has the same optimum as the full model
+    in which the frozen orders and the visits serving them are fixed."""
+    inst, handles, sol = shared_setup
+    compared = with_exo = 0
+    cfg = {**CFG, "iter_time_limit": 10}
+    for active in _small_neighbourhoods(handles, 8, seed=21):
+        ctx = subproblem.extract_context(sol, handles, inst, active)
+        mdl, sub_handles = subproblem.build_submodel(ctx, backend, H, objective)
+        raw, _ = subproblem.solve_submodel(mdl, sub_handles, backend, objective, -1, cfg)
+        full_mdl, _ = _full_model_fixed(inst, sol, objective, active)
+        ref = full_mdl.solve(TimeLimit=10, Workers=1, LogVerbosity="Quiet")
+        assert raw.is_solution() and ref.is_solution(), active
+        sub_val, ref_val = raw.get_kpis()[objective], ref.get_kpis()[objective]
+        sub_opt = raw.get_solve_status() == "Optimal"
+        ref_opt = ref.get_solve_status() == "Optimal"
+        # A proven optimum of one model can never be beaten by the other
+        if sub_opt:
+            assert ref_val >= sub_val, (objective, active)
+        if ref_opt:
+            assert sub_val >= ref_val, (objective, active)
+        if not (sub_opt and ref_opt):
+            continue
+        merged = subproblem.to_full_result(sol, ctx, raw, sub_handles, handles, backend,
+                                           objective)
+        assert subproblem.check_merged(merged, handles, inst, H) == []
+        _assert_feasible_in_full_model(inst, merged)
+        compared += 1
+        with_exo += bool(ctx.exo_visits)
+    assert compared >= 3 and with_exo >= 2, (compared, with_exo)
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_active_orders_join_frozen_visits(shared_setup, backend):
+    """Minimising fetches, active orders move onto frozen visits; every merged solution
+    is feasible in the full CP model."""
+    inst, handles, sol = shared_setup
+    joined = solved = 0
+    for active in _random_neighbourhoods(handles, 12, seed=8):
+        bound = int(sol.get_kpis()["bin_fetches"]) - 1
+        result, _, ctx = subproblem.solve_iteration(
+            sol, handles, inst, active, backend=backend, horizon=H,
+            objective="bin_fetches", impr_bound=bound, cfg=CFG,
+        )
+        if not result.is_solution():
+            continue
+        assert subproblem.check_merged(result, handles, inst, H) == []
+        _assert_feasible_in_full_model(inst, result)
+        assert result.get_kpis()["bin_fetches"] <= bound
+        joined += bool(_joins(ctx, result, handles))
+        solved += 1
+        sol = result
+    assert solved >= 1 and joined >= 1, (solved, joined)
+
+
+@pytest.mark.skipif("cpp" not in BACKENDS, reason="C++ extension not built")
+@pytest.mark.parametrize("objective", ["makespan", "idle_time", "max_picks"])
+def test_cpp_submodel_matches_docplex_with_exo_visits(shared_setup, tmp_path, objective):
+    """Same as test_cpp_submodel_matches_docplex, on subproblems with joinable frozen visits."""
+    import cpp_cp_model
+
+    inst, handles, sol = shared_setup
+    with_exo = 0
+    for i, active in enumerate(_random_neighbourhoods(handles, 6, seed=2)):
+        ctx = subproblem.extract_context(sol, handles, inst, active)
+        with_exo += bool(ctx.exo_visits)
+        py_mdl, py_handles = subproblem.build_submodel(ctx, "docplex", H, objective)
+        cpp_mdl, cpp_handles = subproblem.build_submodel(ctx, "cpp", H, objective)
+        assert set(py_handles["PX"]) == set(cpp_handles["PX"])
+        assert bool(py_handles["PX"]) == bool(ctx.exo_visits)
+        py_path, cpp_path = tmp_path / f"py{i}.cpo", tmp_path / f"cpp{i}.cpo"
+        py_mdl.export_model(str(py_path))
+        cpp_cp_model.export_model(cpp_mdl, str(cpp_path))
+        _, diff = compare_cpo_files(str(py_path), str(cpp_path))
+        diff = [ln for ln in diff if ln[:1] in "+-" and ln[:3] not in ("+++", "---")
+                and "shift_len" not in ln and "shift_cost" not in ln]
+        if objective == "idle_time":
+            # The two APIs print the idle-time sum in different forms (also before
+            # exo_visits); its value is checked by the optimum-equality tests.
+            diff = [ln for ln in diff if not ln[1:].startswith("minimize(")]
+        assert not diff, "".join(diff[:60])
+    assert with_exo >= 3, with_exo
