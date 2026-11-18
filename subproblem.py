@@ -19,8 +19,8 @@ overlap frozen ones.
 A bin visit (F, B, R of one (s, k, e)) is frozen if it serves at least one frozen order:
 its fetch, presence and return are fixed. Active orders can still pick from it
 (``exo_visits``): each gets an optional pick PX[o,s,k,e] inside the fixed presence window,
-as one more candidate of alternative(C[o,k,s], ...). The visit itself cannot move or
-stretch (see docs/KNOWN_ISSUES.md, "Subproblem LNS: frozen bin visits cannot move").
+as one more candidate of alternative(C[o,k,s], ...). The visit's own variables stay
+frozen (see docs/KNOWN_ISSUES.md, "Subproblem LNS: joining frozen bin visits").
 
 The subproblem result is written back into a full-model solution dict
 (``CppSolveResult``), so strategies, logging and acceptance are unchanged.

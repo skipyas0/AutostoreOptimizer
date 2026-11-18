@@ -26,6 +26,7 @@ from freezing_utils import (
     generate_freeze_constraints,
     get_associated_indices,
     get_optimized_set,
+    subproblem_optimized_set,
 )
 from heuristics import HeuristicSolution, validate_solution
 from instance import Instance
@@ -219,6 +220,9 @@ class Solver:
             instance_path,
             instance_config,
         ) = load_instance(instance_config, instance_path)
+        if experiment_config.get("symmetry_breaking") is not None:
+            instance_config = {**instance_config,
+                               "symmetry_breaking": experiment_config["symmetry_breaking"]}
         self.instance_config = instance_config
         self.vlg = VisualLogger(
             instance_path, instance_config, experiment_config, self.instance
@@ -758,7 +762,9 @@ class Solver:
             self.vlg.log_strategy(strat_name, strat_idx)
 
             # create to_optimize set with graph traversal
-            if self.subproblem_mode:
+            full_sub_nbh = (not self.subproblem_mode and
+                            self.experiment_config.get("full_neighbourhood") == "subproblem")
+            if self.subproblem_mode or full_sub_nbh:
                 active_orders = get_associated_indices(
                     self.handles, self.current_solution, strategy_results
                 )[0]
@@ -768,9 +774,14 @@ class Solver:
                     active_orders = subproblem.close_under_sharing(
                         self.current_solution, self.handles, active_orders
                     )
-            to_optimize = get_optimized_set(
-                self.handles, self.current_solution, strategy_results
-            )
+            if full_sub_nbh:
+                to_optimize = subproblem_optimized_set(
+                    self.handles, self.current_solution, active_orders
+                )
+            else:
+                to_optimize = get_optimized_set(
+                    self.handles, self.current_solution, strategy_results
+                )
 
             # generate freeze constraints from the to_optimize set
             if self.subproblem_mode:
@@ -1187,7 +1198,7 @@ if __name__ == "__main__":
         dest="close_sharing",
         help="Subproblem mode: add every frozen order that shares a bin visit with an "
         "active order to the neighbourhood, so shared visits are fully active "
-        "(see KNOWN_ISSUES.md, 'Subproblem LNS: frozen bin visits cannot move')",
+        "(see KNOWN_ISSUES.md, 'Subproblem LNS: joining frozen bin visits')",
     )
     parser.add_argument(
         "--joinable-exo",
@@ -1197,6 +1208,24 @@ if __name__ == "__main__":
         help="Subproblem mode: active orders can pick from frozen bin visits (fixed fetch, "
         "presence and return; optional picks inside the presence window). "
         "--no-joinable-exo restores the subproblems before this option existed",
+    )
+    parser.add_argument(
+        "--full-neighbourhood",
+        type=str,
+        default="graph",
+        choices=["graph", "subproblem"],
+        dest="full_neighbourhood",
+        help="Full-model mode: which variables an iteration frees. 'graph': orders, SKUs "
+        "and every visit of those SKUs found by the graph traversal (visits serving frozen "
+        "orders included). 'subproblem': exactly the variables the subproblem LNS frees "
+        "(visits serving a frozen order stay frozen); use with --no-symmetry-breaking",
+    )
+    parser.add_argument(
+        "--symmetry-breaking",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        dest="symmetry_breaking",
+        help="Full-model mode: override the instance's symmetry_breaking setting",
     )
     parser.add_argument(
         "--improvement-ref",
@@ -1261,6 +1290,8 @@ if __name__ == "__main__":
             "close_sharing": args.close_sharing,
             "joinable_exo": args.joinable_exo,
             "improvement_ref": args.improvement_ref,
+            "full_neighbourhood": args.full_neighbourhood,
+            "symmetry_breaking": args.symmetry_breaking,
         }
         solver = Solver(
             experiment_config,

@@ -477,6 +477,61 @@ def test_subproblem_optimum_equals_frozen_full_model(shared_setup, objective, ba
     assert compared >= 3 and with_exo >= 2, (compared, with_exo)
 
 
+def _full_model_with_subproblem_freeze_set(inst, handles, sol, active, objective, backend):
+    """Full model (no symmetry breaking) frozen the way the full-model LNS freezes it,
+    with --full-neighbourhood subproblem."""
+    from freezing_utils import subproblem_optimized_set
+
+    free = {v.get_name() for v in subproblem_optimized_set(handles, sol, active)}
+    if backend == "docplex":
+        mdl, h = cp_model.build_model(inst, add_symmetry_breaking=False, horizon=H,
+                                      objective_func=objective)
+        for group in DECISION:
+            for var in h[group].values():
+                if var.get_name() not in free:
+                    _fix(mdl, var, sol.var_sols.get(var.get_name()))
+        return mdl, h
+    import cpp_cp_model
+
+    mdl, h = cpp_cp_model.build_model(inst, add_symmetry_breaking=False, horizon=H,
+                                      objective_func=objective)
+    names = [n for n in sol.var_sols if n not in free]  # as Solver.run with backend cpp
+    vs = [sol.var_sols[n] for n in names]
+    mdl.apply_delta_freezing(names, [1 if v.get("present") else 0 for v in vs],
+                             [v.get("start", 0) if v.get("present") else 0 for v in vs],
+                             [v.get("end", 0) if v.get("present") else 0 for v in vs], [])
+    return mdl, h
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("objective", ["makespan", "bin_fetches", "total_flow_time"])
+def test_full_neighbourhood_subproblem_matches_subproblem(shared_setup, objective, backend):
+    """--full-neighbourhood subproblem frees exactly the subproblem's variables: the frozen
+    full model and the subproblem (joinable exo visits) have the same optimum."""
+    inst, handles, sol = shared_setup
+    cfg = {**CFG, "iter_time_limit": 10}
+    compared = with_exo = 0
+    for active in _small_neighbourhoods(handles, 8, seed=21):
+        ctx = subproblem.extract_context(sol, handles, inst, active)
+        mdl, sub_handles = subproblem.build_submodel(ctx, backend, H, objective)
+        raw, _ = subproblem.solve_submodel(mdl, sub_handles, backend, objective, -1, cfg)
+        full_mdl, full_h = _full_model_with_subproblem_freeze_set(inst, handles, sol, active,
+                                                                  objective, backend)
+        ref, _ = subproblem.solve_submodel(full_mdl, full_h, backend, objective, -1, cfg)
+        assert raw.is_solution() and ref.is_solution(), active  # incumbent is feasible in both
+        sub_val, ref_val = raw.get_kpis()[objective], ref.get_kpis()[objective]
+        sub_opt = raw.get_solve_status() == "Optimal"
+        ref_opt = ref.get_solve_status() == "Optimal"
+        if sub_opt:
+            assert ref_val >= sub_val, (objective, active, ref_val, sub_val)
+        if ref_opt:
+            assert sub_val >= ref_val, (objective, active, sub_val, ref_val)
+        if sub_opt and ref_opt:
+            compared += 1
+            with_exo += bool(ctx.exo_visits)
+    assert compared >= 3 and with_exo >= 2, (compared, with_exo)
+
+
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_active_orders_join_frozen_visits(shared_setup, backend):
     """Minimising fetches, active orders move onto frozen visits; every merged solution

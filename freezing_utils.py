@@ -244,6 +244,33 @@ def get_optimized_set(handles, solution, strategy_results):
     return to_optimize
 
 
+def subproblem_optimized_set(handles, solution, active_orders):
+    """Variables the subproblem LNS leaves free, as variables of the full model.
+
+    For the active orders: all I_os, I_os_lane, C and P. For every SKU an active order
+    needs: F, B, R, Block of each copy slot (s, k, e) that is not a present visit serving
+    a frozen order. Everything else (frozen orders, visits serving them, SKUs no active
+    order needs) is frozen. With --joinable-exo the subproblem has exactly this
+    neighbourhood; requires the full model without symmetry breaking, which the
+    subproblem does not have either.
+    """
+    active = set(active_orders)
+    to_optimize = set()
+    for group in ("I_os", "I_os_lane", "C", "P"):
+        to_optimize.update(v for key, v in handles[group].items() if key[0] in active)
+    skus = {k for o in active for k in handles["orders_req"][o]}
+    for (s, k, e) in handles["B"]:
+        if k not in skus:
+            continue
+        if is_bin_present_in_solution(handles, solution, s, k, e) and any(
+            o not in active and is_pick_present_in_solution(handles, solution, o, s, k, e)
+            for o in handles["orders_demanding_sku"][k]
+        ):
+            continue
+        to_optimize.update(handles[g][(s, k, e)] for g in ("F", "B", "R", "Block"))
+    return to_optimize
+
+
 def create_partial_starting_point(mdl, solution, to_optimize):
     """
     Creates a warm start (starting point) containing ONLY the variables
