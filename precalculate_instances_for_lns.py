@@ -12,6 +12,7 @@ os.environ.setdefault("MPLCONFIGDIR", "/tmp/mpl_config")
 
 from cp_model import extract_and_print_solution
 import cpp_cp_model
+import result_store
 from datagen import generate_data
 from heuristics import HEURISTICS, resolve, run_heuristic, validate_solution, validate_warmstart
 from schedule_visualizer import plot_schedule, write_html
@@ -169,13 +170,12 @@ def precalculate_config(config):
         if sol_cp:
             sol = sol_cp.get_solution()
             if sol is not None:
-                with open(f"{path}/cp_solution_{seed}.pkl", "wb") as f:
-                    pickle.dump(sol, f)
+                result_store.dump(sol, f"{path}/cp_solution_{seed}.npz")
             else:
                 print("CP sol is None")
 
-            with open(f"{path}/cp_intermediate_records_{seed}.pkl", "wb") as f:
-                pickle.dump(history_listener.records, f)
+            result_store.dump(history_listener.records,
+                              f"{path}/cp_intermediate_records_{seed}.npz")
 
             print(f"CP Solve Status: {sol_cp.get_solve_status()}")
             with open(f"{path}/cp_sol_{seed}.txt", "w+") as f, redirect_stdout(f):

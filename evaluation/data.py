@@ -9,7 +9,7 @@ metrics and plots never need to know where a number came from:
     t, v     anytime trajectory: times [s] and best makespan found by then
              (np arrays, t ascending, v non-increasing)
     final    best makespan at the end of the run
-    solution path of the final solution pickle (may not exist; see solutions.py)
+    solution path of the final solution file (.npz, or legacy .pkl; None if missing)
 
 To add a method, write a loader that returns rows in this format and append them.
 
@@ -29,6 +29,8 @@ from datetime import datetime
 
 import numpy as np
 import pandas as pd
+
+import result_store
 
 EXP_DATE_FMT = "%d-%m-%Y_%H-%M-%S"
 
@@ -184,7 +186,7 @@ def load_cp(d, meta, start_value=np.nan):
         rows.append(dict(method="CP", family="cp", instance=meta["instance"], run=k,
                          t=t, v=v, final=v[-1] if len(v) else np.nan,
                          extraction=extraction, first_sol_time=first_t, warm_start=warm,
-                         solution=os.path.join(d, f"cp_solution_{k}.pkl")))
+                         solution=result_store.find(os.path.join(d, f"cp_solution_{k}"))))
     return rows
 
 
@@ -325,7 +327,7 @@ def load_lns(d, meta, start_value):
             runs.append(dict(config_key=key, family="lns", instance=meta["instance"],
                              run=int(rid), t=t, v=v, final=v[-1], end_time=end,
                              setup_time=setup, n_iters=len(rdf),
-                             solution=os.path.join(e, f"run{int(rid)}-solution.pkl")))
+                             solution=result_store.find(os.path.join(e, f"run{int(rid)}-solution"))))
             prev = np.minimum.accumulate(np.concatenate([[start_value], rdf.best.values[:-1]]))
             phase = _phase_objective_columns(rdf, start_value)
             it = rdf.drop(columns=[c for c in ITER_DROP if c in rdf.columns])

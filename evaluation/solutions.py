@@ -6,8 +6,9 @@ Every method's final schedule is reduced to two lists:
 
 Sources (the `solution` column of the runs table, see data.py):
     heuristics  heuristic_<name>_solution.pkl   HeuristicSolution
-    CP          cp_solution_<k>.pkl             CppSolveResult (var_sols by name)
-    LNS         <exp>/run<k>-solution.pkl       dict {var name: {present, start, end}}
+    CP          cp_solution_<k>.npz             CppSolveResult (var_sols by name)
+    LNS         <exp>/run<k>-solution.npz       dict {var name: {present, start, end}}
+    (.npz = result_store compact pickle; legacy .pkl files are read as well)
 
 Metrics of one solution (C = makespan, S = stations, W = robot work):
     fetches            number of bin visits
@@ -32,6 +33,8 @@ import warnings
 
 import numpy as np
 import pandas as pd
+
+import result_store
 
 METRICS = {  # column -> (label, unit)
     "fetch_pick_ratio": ("Fetch / pick ratio", ""),
@@ -72,9 +75,8 @@ def _from_heuristic(sol):
 
 
 def read_solution(path):
-    """(visits, picks) of a solution pickle of any supported kind."""
-    with open(path, "rb") as f:
-        obj = pickle.load(f)
+    """(visits, picks) of a solution file (.npz / .pkl) of any supported kind."""
+    obj = result_store.load(path)
     if hasattr(obj, "bin_events"):
         return _from_heuristic(obj)
     if hasattr(obj, "var_sols"):

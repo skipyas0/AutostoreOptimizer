@@ -13,6 +13,7 @@ from loguru import logger
 from matplotlib import ticker
 from matplotlib.colors import BoundaryNorm, ListedColormap
 
+import result_store
 from cp_model_utils import build_solve_dict
 from schedule_visualizer import plot_schedule, write_html
 
@@ -133,7 +134,9 @@ class LoguruStream:
 
 
 class LazyBarcodeList(list):
-    """List proxy that stores barcode file paths on disk and loads numpy arrays lazily on access."""
+    """List proxy that stores barcode file paths on disk and loads numpy arrays lazily on access.
+
+    Do not pickle it: pickling iterates the list and would embed every array."""
 
     def __init__(self, elements=None):
         super().__init__(elements or [])
@@ -144,7 +147,7 @@ class LazyBarcodeList(list):
         val = super().__getitem__(idx)
         if isinstance(val, (str, os.PathLike)) and str(val).endswith((".npy", ".npz")):
             if os.path.exists(val):
-                return np.load(val)
+                return result_store.load_barcode(val)
         return val
 
     def __iter__(self):
@@ -399,21 +402,17 @@ class VisualLogger:
                     }
                 else:
                     sol_dict[var_sol.get_name()] = val
-            with open(f"{self.path}/run{self.current_run}-solution.pkl", "wb") as f:
-                pickle.dump(sol_dict, f)
+            result_store.dump(sol_dict, f"{self.path}/run{self.current_run}-solution.npz")
 
         # Attempt CP lookup — load all seeds and compute mean final best
-        import glob
-
-        cp_pattern = os.path.join(self.instance_folder, "cp_intermediate_records_*.pkl")
-        cp_files = sorted(glob.glob(cp_pattern))
+        cp_files = result_store.find_all(
+            os.path.join(self.instance_folder, "cp_intermediate_records_*"))
         cp_final_bests = []
         for fpath in cp_files:
             try:
-                with open(fpath, "rb") as f:
-                    records = pickle.load(f)
-                    cp_final_bests.append(records[-1]["best"])
-            except (FileNotFoundError, IndexError, pickle.UnpicklingError):
+                records = result_store.load(fpath)
+                cp_final_bests.append(records[-1]["best"])
+            except (OSError, IndexError, KeyError, ValueError, pickle.UnpicklingError):
                 continue
 
         if cp_final_bests:
@@ -532,8 +531,8 @@ class VisualLogger:
 
         # 4. Save intermediate barcode to disk and free memory
         if self.current_barcode is not None:
-            barcode_path = f"{self.path}/barcode_run_{self.current_run}.npy"
-            np.save(barcode_path, self.current_barcode)
+            barcode_path = f"{self.path}/barcode_run_{self.current_run}.npz"
+            result_store.save_barcode(barcode_path, self.current_barcode)
             self.barcodes.append(barcode_path)
             self.current_barcode = None
 
@@ -831,12 +830,10 @@ class VisualLogger:
         self.current_run_deltas.append(delta)
 
     def get_cp_performance(self, mth_mean_ticks):
-        """Load all cp_intermediate_records_{seed}.pkl files and compute
+        """Load all cp_intermediate_records_{seed} files and compute
         mean ± std CP trajectory (time-aligned) and mean ± std 1-hour best."""
-        import glob
-
-        pattern = os.path.join(self.instance_folder, "cp_intermediate_records_*.pkl")
-        cp_files = sorted(glob.glob(pattern))
+        cp_files = result_store.find_all(
+            os.path.join(self.instance_folder, "cp_intermediate_records_*"))
 
         if not cp_files:
             logger.warning("No CP records found. Skipping CP performance mapping.")
@@ -846,9 +843,8 @@ class VisualLogger:
         all_records = []
         for fpath in cp_files:
             try:
-                with open(fpath, "rb") as f:
-                    all_records.append(pickle.load(f))
-            except (FileNotFoundError, pickle.UnpicklingError, IndexError) as e:
+                all_records.append(result_store.load(fpath))
+            except (OSError, KeyError, ValueError, pickle.UnpicklingError, IndexError) as e:
                 logger.warning(f"Could not load {fpath}: {e}")
                 continue
 
@@ -890,7 +886,8 @@ class VisualLogger:
         with open(f"{self.path}/experiment_config.json", "w+") as f:
             json.dump(self.experiment_config, f, indent=4)
 
-        # Save initial solution and solution deltas as JSON
+        # Save initial solution and solution deltas (same structure as the former
+        # solutions.json; read back with result_store.load / reconstruct_solutions)
         if len(self.all_run_deltas) == 1:
             solutions_payload = {
                 "run_id": 1,
@@ -915,22 +912,13 @@ class VisualLogger:
                 for r_idx in range(len(self.all_run_deltas))
             ]
 
-        with open(f"{self.path}/solutions.json", "w+") as f:
-            json.dump(solutions_payload, f, indent=4)
+        result_store.dump(solutions_payload, f"{self.path}/solutions.npz")
 
         self.df.to_pickle(f"{self.path}/experiment_dataframe.pkl")
 
-        with open(f"{self.path}/barcodes.pkl", "wb") as f:
-            pickle.dump(self.barcodes, f)
-
-        barcode_manifest = [
-            (
-                item
-                if isinstance(item, str)
-                else f"{self.path}/barcode_run_{r + 1}.npy"
-            )
-            for r, item in enumerate(self.barcodes)
-        ]
+        # Barcodes live in barcode_run_<k>.npz; the manifest just lists them
+        # (list.__iter__ bypasses LazyBarcodeList loading, yielding the stored paths)
+        barcode_manifest = list(list.__iter__(self.barcodes))
         with open(f"{self.path}/barcodes_manifest.json", "w+") as f:
             json.dump(barcode_manifest, f, indent=4)
 
@@ -2401,16 +2389,14 @@ def reconstruct_solutions(initial_solution_or_data, deltas=None):
         1. A dict representing the initial solution (if deltas is passed).
         2. A dict with 'initial_solution' and 'deltas' keys.
         3. A list of run dicts, each with 'initial_solution' and 'deltas'.
-        4. A string path to a solutions.json file.
+        4. A path to a solutions.npz (or legacy solutions.json) file.
     - deltas: Optional list of delta dicts (if initial_solution is passed as first arg).
 
     Returns:
     - A list of solution dicts (one per iteration), or a list of such lists if multiple runs are provided.
     """
-    if isinstance(initial_solution_or_data, str):
-        with open(initial_solution_or_data, "r") as f:
-            data = json.load(f)
-        return reconstruct_solutions(data)
+    if isinstance(initial_solution_or_data, (str, os.PathLike)):
+        return reconstruct_solutions(result_store.load(initial_solution_or_data))
 
     if deltas is not None:
         current = copy.deepcopy(initial_solution_or_data)

@@ -92,8 +92,9 @@ Strategy metrics per iteration (phase = the objective the CP optimised, `cp_obj`
 ### Solution structure
 
 Computed from the final solution of every run (`solutions.py`): heuristics
-`heuristic_<name>_solution.pkl`, CP `cp_solution_<k>.pkl`, LNS
-`experiments/<date>/run<k>-solution.pkl`. A solution whose makespan differs from the
+`heuristic_<name>_solution.pkl`, CP `cp_solution_<k>.npz`, LNS
+`experiments/<date>/run<k>-solution.npz` (`result_store` format; legacy `.pkl` files
+are read too). A solution whose makespan differs from the
 logged final value triggers a warning. Results are cached in `data/solution_metrics.csv`
 by file path, mtime and size, so reruns only read new or changed files.
 

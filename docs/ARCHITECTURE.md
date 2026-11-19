@@ -69,9 +69,20 @@ precalculated_instances/GEN<gen_seed>-<S>-<L>-<SKUs>-<orders>-<movecap>[-<heuris
   instance_summary.txt
   heuristic_solution.pkl      pickled heuristics.HeuristicSolution (warm start)
   heuristic_summary.txt, heuristic_solution.html
-  cp_solution_<seed>.pkl, cp_sol_<seed>.txt, cplog_<seed>.txt, cp_intermediate_records_<seed>.pkl
-  experiments/                LNS runs (matheuristic.py)
+  cp_solution_<seed>.npz, cp_sol_<seed>.txt, cplog_<seed>.txt, cp_intermediate_records_<seed>.npz
+  experiments/<date>/         LNS runs (matheuristic.py)
+    experiment_config.json, experiment_dataframe.pkl, run_<k>.log, summary.txt, *.svg
+    run<k>-solution.npz       final solution {var name: {present, start, end}}
+    solutions.npz             per run: initial solution + per-iteration deltas
+    barcode_run_<k>.npz       iterations x variables unfrozen-by-strategy matrix
 ```
+
+Large result data goes through `result_store.py` (compressed `.npz`, ~1-2 % of the
+former `.pkl` / `.json` / `.npy` size): `result_store.load(path)` for solutions,
+deltas and CP results, `result_store.load_barcode(path)` for barcodes;
+`result_store.find(stem)` resolves a path with or without extension, and both
+loaders still read the legacy formats. Old folders are converted (losslessly,
+verified) by `scripts/compact_results.py`.
 
 `matheuristic.load_instance(folder)` loads `(instance, heur_sol, folder, config)`.
 
@@ -111,6 +122,7 @@ See [HEURISTICS.md](HEURISTICS.md).
 | `freezing_utils.py` | Freezing policies: which variables of the incumbent are fixed, plus partial starting points |
 | `subproblem.py` | Subproblem mode (`--lns-model subproblem`). Instead of freezing variables of the full model, each iteration builds a reduced model with only the active orders. Frozen orders enter as fixed intervals (`exo_lanes`, `exo_station_bins`, `exo_blocks`, `exo_moves`) and objective constants (`ObjectiveOffsets`), and the result is merged back into the full solution. The full model is never built, so extraction cost scales with the neighbourhood, not the instance. Works with both backends. `--close-sharing` (default) adds frozen orders that share a bin visit with an active order, so the subproblem can always reproduce the incumbent. `--validate-merges` checks every merged solution. Open issue: active orders cannot join frozen visits (KNOWN_ISSUES.md) |
 | `matheuristic_plots.py` | `VisualLogger`: per-iteration logging, solution-delta "barcodes", KPI and convergence plots |
+| `result_store.py` | Compact storage of large result data (barcodes, solution dicts, delta trajectories, CP results) | `dump`, `load`, `save_barcode`, `load_barcode`, `find` |
 | `precalculate_instances_for_lns.py` | Builds precalculated instance folders. It generates the instance, runs the warm-start heuristic (`--heuristic`, any registry name or `load_balanced_rdi` / `random_rdi` / `similarity_rdi` for the CP-based decomposition) and runs monolithic CP baselines per `--cp-seeds` |
 | `evaluation/` | Experiment evaluation suite (replaces `analyze_experiment1.py`, `analyze_lns_experiments.py`, `analyze_lns_scaling.py`). `python -m evaluation compare <root>` compares every LNS configuration found under a folder of instance folders (grouped by `experiment_config.json`) with CP and all heuristics: tables (CSV/MD/LaTeX), figures, full and reduced (best LNS + baselines) variants. `python -m evaluation scaling` for `benchmark_lns_scaling.py` output. See `evaluation/README.md` |
 
@@ -125,7 +137,7 @@ See [HEURISTICS.md](HEURISTICS.md).
 | `trainset_generator.py` | AMA data-mining dataset: instance features plus the objective of all 192 SGC dispatching-rule pairs (`heuristics.sgc.ALL_RULES`) |
 | `ama_sgc_dataset_analysis.ipynb` | Analysis of that dataset (see KNOWN_ISSUES: produced with an older planner) |
 | `rl_order_assignment.py` | RL order→station assignment: a GNN PPO agent and a permutation-invariant `StationOrderScorer` trained with self-critical REINFORCE. Reward = partitioned RDI makespan (`evaluate_assignment_reward`) |
-| `benchmark_models.py` | Standardised benchmark of heuristics and RL checkpoints on the RL training distribution. Every method is `Instance -> HeuristicSolution`, and RL-environment metrics come from `solution_metrics`. `--methods`, `--skip-rl` |
+| `heuristics/benchmark.py` | Benchmark of heuristics and RL checkpoints (`python -m heuristics benchmark`), see docs/HEURISTICS.md § Benchmarking. RL-environment metrics come from `solution_metrics`; torch is imported only with `--checkpoints` |
 
 ### Visualisation and misc
 | Module | Purpose |
@@ -142,7 +154,7 @@ See [HEURISTICS.md](HEURISTICS.md).
 constants ◄── instance ◄── datagen
 jaccard_similarity ◄── instance, heuristics.cfss, heuristics.partitioned_rdi
 heuristics ◄── cp_model_utils, matheuristic, decomposition, precalculate_instances_for_lns,
-               benchmark_models, rl_order_assignment, trainset_generator
+               rl_order_assignment, trainset_generator
 cp_model ◄── cpp_cp_model, matheuristic, decomposition, subproblem (lazy), heuristics.solution (lazy)
 subproblem ◄── matheuristic
 cp_model_utils ◄── cpp_cp_model, matheuristic, matheuristic_plots, neighborhood_selection
@@ -151,7 +163,8 @@ neighborhood_selection ◄── matheuristic, heuristics.partitioned_rdi (lazy)
 ```
 
 `heuristics` itself imports only `instance` (plus `jaccard_similarity`, `cp_model`
-and `neighborhood_selection` lazily where they are needed).
+and `neighborhood_selection` lazily where they are needed). `heuristics.benchmark`
+additionally imports `datagen`, and `rl_order_assignment`/torch lazily for `--checkpoints`.
 
 ---
 
@@ -171,8 +184,8 @@ python matheuristic.py GEN42-4-4-5000-200-20 --backend cpp --runs 5
 # ... solving reduced subproblems instead of the frozen full model (much faster on large instances)
 python matheuristic.py GEN42-4-4-5000-200-20 --backend cpp --runs 5 --lns-model subproblem
 
-# benchmark heuristics (+ RL checkpoints found as rl_agent_weights*.pth)
-python benchmark_models.py --num-instances 10 --methods all --skip-rl
+# benchmark heuristics (add --checkpoints to include RL checkpoints rl_agent_weights*.pth)
+python -m heuristics benchmark -n 10 --methods all --skip '*rdi*'
 
 # verify the heuristics still match the reference commit exactly
 python tests/regression/equivalence.py              # vs. HEAD; --ref <commit> for another baseline

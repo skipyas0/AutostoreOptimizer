@@ -358,8 +358,9 @@ def test_share_reward_score():
 
 
 def test_rdi_lazy_cache_keeps_movecap_with_extensions():
-    bm = pytest.importorskip("benchmark_models")
-    big = bm.generate_benchmark_instance(0, "small")
+    from heuristics.benchmark import generate_instance
+
+    big, _ = generate_instance("rl-small", 0)
     # used to produce "MoveCap violation: 5 > 4": a cached plan's extended shared-bin return was
     # not considered when deciding which cached plans to re-plan
     sol = run_rdi(big, extend_share_window=True, share_reward=2.0, legacy_share_bonus=0.0)

@@ -39,6 +39,7 @@ docplex config --upgrade <PATH_TO_CPLEX_STUDIO>
 ```text
 .
 ├── heuristics/                       # constructive heuristics: run_heuristic(name, inst) -> HeuristicSolution
+│                                     #   + benchmark: python -m heuristics benchmark
 ├── instance.py, datagen.py           # problem instance (+ cached attributes) and synthetic generator
 ├── cp_model.py                       # docplex CP Optimizer model (+ warm-start injection)
 ├── cp_lns_core.cpp, cpp_cp_model.py  # C++ CP model + Python wrapper (build: python setup.py mac|ubuntu)
@@ -47,7 +48,6 @@ docplex config --upgrade <PATH_TO_CPLEX_STUDIO>
 ├── decomposition.py                  # CP-based spatial / temporal / 2D / RL decompositions
 ├── rl_order_assignment.py            # RL order->station assignment
 ├── trainset_generator.py             # AMA dispatching-rule dataset
-├── benchmark_models.py               # heuristic / RL benchmark
 ├── evaluation/                       # experiment evaluation suite: python -m evaluation
 ├── schedule_visualizer.py            # Plotly Gantt charts
 ├── docs/                             # documentation
@@ -88,7 +88,7 @@ print(sol.makespan, sol.validate(inst, 10000))
 python precalculate_instances_for_lns.py --stations 4 --lanes 4 --orders 200 --skus 5000 --movecaps 20 \
        --gen-seeds 42 --cp-seeds 42 --heuristic lb_sgc
 python matheuristic.py GEN42-4-4-5000-200-20 --backend cpp
-python benchmark_models.py --num-instances 10 --methods all --skip-rl
+python -m heuristics benchmark --methods all --skip '*rdi*' --preset medium -n 10
 ```
 
 ### Evaluating experiments

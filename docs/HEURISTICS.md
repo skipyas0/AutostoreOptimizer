@@ -30,7 +30,8 @@ CLI: `python -m heuristics --list`, `python -m heuristics <name> [--orders 40 ..
 | File | Content |
 |---|---|
 | `__init__.py` | Public API, the `HEURISTICS` registry (name → `(function, default params)`), `ALIASES`, `run_heuristic` (adds `meta["name"]` and `meta["runtime"]`) |
-| `__main__.py` | Single CLI for all heuristics |
+| `__main__.py` | Single CLI for all heuristics (`python -m heuristics benchmark ...` dispatches to `benchmark.py`) |
+| `benchmark.py` | Benchmark of many heuristics (and RL checkpoints) over generated or pregenerated instances |
 | `heuristic_utils.py` | Shared machinery for the SGC family (below) |
 | `solution.py` | `HeuristicSolution`, `validate_solution`, `validate_warmstart`, `build_viz_handles` |
 | `sgc.py` | SGC planner and loop, dispatching `Rule`s, `ALL_RULES`, AMA |
@@ -296,6 +297,59 @@ saving is what a GBS warm start should carry over; this has not been validated w
 
 ---
 
+## Benchmarking
+
+`python -m heuristics benchmark` runs a selection of registry heuristics on a set of instances and
+prints two summary tables (`--output-json` keeps the per-instance details):
+
+- **Quality**: makespan C, its mean gap to the best method on each instance, normalized makespan (RL
+  reward), robot work W (fetch + return robot-seconds), its gap to the best, number of fetches,
+  W relative to one fetch per order line (the sharing gain), validator violations, time.
+- **Utilisation, balance and picker gaps**: robot utilisation W / (MoveCap · C); picker utilisation
+  (time with at least one pick running / C, mean over stations); station-finish spread
+  (C − min C_s) / C and its coefficient of variation; picking-workload imbalance; picks per bin
+  presence; and *holeyness* of the picker schedule. That is idle time inside each station's
+  [first pick, last pick] span, the share of it in pauses longer than `--gap-threshold`
+  (default 60 s), the number of such pauses per station, and the longest pause.
+
+The schedule metrics (`schedule_metrics`) cover feasible stations only. `solution_metrics` keeps the
+penalised RL-environment view and is what the equivalence harness fingerprints.
+
+**Selecting methods.** Methods are named by registry key, RL checkpoints by `rl:<stem>`.
+`--methods` / `-m` and `--skip` / `-x` take any number of tokens (also comma-separated): `default`
+(the 14-method comparison set, `DEFAULT_METHODS`), `all` (whole registry), an exact name or alias,
+or a shell glob. Selection = union of `--methods` minus every match of `--skip`, in registry order.
+A `--methods` token matching nothing is an error; `--list` prints the selection and exits.
+
+```bash
+python -m heuristics benchmark --methods all --skip '*rdi*'        # quote globs
+python -m heuristics benchmark -m '*sgc*' -x '*singles*' 'gbs_*'
+python -m heuristics benchmark -m 'gbs_*' lb_sgc_share precalculated_instances/
+python -m heuristics benchmark --checkpoints rl_agent_weights_mlp_1200.pth -m default 'rl:*' --preset rl-small
+```
+
+**Instances.** Positional paths run on pregenerated instances (precalculated folders, `instance.pkl`
+files, or a directory of folders; horizon from `config.json`). Otherwise `-n` instances are
+generated from `--preset` with seeds `--seed-base + i`:
+
+| Preset | Distribution |
+|---|---|
+| `tiny` | 2-3 stations, 10-20 orders/station |
+| `small` (default) | 2-4 stations, 20-40 orders/station |
+| `medium` | 4-8 stations, 30-50 orders/station |
+| `large` | 8-15 stations, 40-60 orders/station, 2.5-5 robots/station |
+| `lns` | cycles the precalculated LNS shapes 5/10/15 stations × 300/400/600 orders, MoveCap 40; `--seed-base 1` reproduces `GEN1-*` exactly |
+| `rl-small`/`rl-medium`/`rl-large` | the old `benchmark_models.py` generator (RL training distribution: 400 orders and MoveCap 40 for any station count) |
+
+Orders and MoveCap scale with the number of stations (`orders = stations × orders_per_station`,
+`MoveCap = round(stations × robots_per_station)`, 3-6 robots/station by default), so instances of
+one preset have comparable per-station load. Any preset parameter can be overridden with a fixed
+value, a range or a choice list: `--stations 10 --orders-per-station 30-50 --movecap 40 --skus 5000,20000`.
+`--save-instances DIR` writes the generated instances as precalculated-style folders, which can then be
+passed back as positional paths.
+
+---
+
 ## Adding a heuristic
 
 1. Create `heuristics/my_heuristic.py` with
@@ -313,7 +367,7 @@ saving is what a GBS warm start should carry over; this has not been validated w
    If you need a new per-instance precomputation, add it as a `cached_property` on `Instance` and list it in `Instance._CACHED`.
 2. Register it in `heuristics/__init__.py`: add `"my_heuristic": (run_my_heuristic, {defaults})` to `HEURISTICS`, and export it.
 3. It is then available in `python -m heuristics`, `run_heuristic`, `precalculate_instances_for_lns.py --heuristic`
-   and `benchmark_models.py --methods my_heuristic`.
+   and `python -m heuristics benchmark --methods my_heuristic`.
 4. Add a case to `tests/test_heuristics.py`. The registry smoke test parametrises over `HEURISTICS` automatically.
 
 ---

@@ -166,18 +166,25 @@ def new_run(heur, inst, params):
 
 
 def new_bench(inst, method, seed):
-    import benchmark_models as bm
-
     name = {
-        "random": "1. Random-partitioned RDI",
-        "similarity": "2. Similarity-partitioned RDI",
-        "load_balanced": "3. Load-balanced RDI",
-        "full_rdi": "4. Full RDI (No Decomposition)",
-        "greedy": "5. Standard Full Greedy (SGC)",
-        "lb_greedy": "6. Load-balanced Greedy (SGC)",
+        "random": "partitioned_rdi_random",
+        "similarity": "partitioned_rdi_similarity",
+        "load_balanced": "partitioned_rdi_load_balanced",
+        "full_rdi": "rdi",
+        "greedy": "sgc",
+        "lb_greedy": "lb_sgc",
     }[method]
     random.seed(seed)
-    return bm.run_method(bm.DEFAULT_METHODS[name], inst)
+    try:
+        from heuristics import benchmark as bm
+    except ImportError:  # reference commits before heuristics/benchmark.py
+        import benchmark_models as bm
+
+        labels = {lab.split(". ", 1)[0]: lab for lab in bm.DEFAULT_METHODS}
+        legacy = {"partitioned_rdi_random": "1", "partitioned_rdi_similarity": "2",
+                  "partitioned_rdi_load_balanced": "3", "rdi": "4", "sgc": "5", "lb_sgc": "6"}
+        return bm.run_method(bm.DEFAULT_METHODS[labels[legacy[name]]], inst)
+    return bm.run_method(bm.heuristic_method(name), inst)
 
 
 def new_validate(sol, inst, hz):

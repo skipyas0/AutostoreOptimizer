@@ -6,6 +6,7 @@ precalculated instances.
     python -m heuristics cfss --instance precalculated_instances/GEN1-1-1-100-10-2/instance.pkl --save
     python -m heuristics rdi precalculated_instances/* --save
     python -m heuristics --list
+    python -m heuristics benchmark --methods all --skip '*rdi*'   # see heuristics/benchmark.py
 
 Batch mode (positional instance paths, each a precalculated folder or its instance.pkl)
 takes horizon/alpha/beta from each folder's config.json; --param and the generation /
@@ -21,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import pickle
+import sys
 from pathlib import Path
 
 from heuristics import HEURISTICS, resolve, run_heuristic
@@ -174,6 +176,12 @@ def _run_batch(args, ap: argparse.ArgumentParser) -> None:
 
 
 def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "benchmark":
+        from heuristics.benchmark import main as benchmark_main
+
+        benchmark_main(sys.argv[2:])
+        return
+
     ap = argparse.ArgumentParser(description="Run a heuristic from the heuristics registry.")
     ap.add_argument("name", nargs="?", help="registry name or alias (see --list)")
     ap.add_argument(

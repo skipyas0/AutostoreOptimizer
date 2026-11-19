@@ -185,8 +185,8 @@ class TestMatheuristicPlotsColorPalettes(unittest.TestCase):
 
         vlg.log_run_end()
 
-        # Intermediate barcode must be saved on disk as .npy
-        expected_npy = os.path.join(vlg.path, "barcode_run_1.npy")
+        # Intermediate barcode must be saved on disk (compact .npz)
+        expected_npy = os.path.join(vlg.path, "barcode_run_1.npz")
         self.assertTrue(os.path.exists(expected_npy))
 
         # In-memory current_barcode must be released
@@ -208,7 +208,7 @@ class TestMatheuristicPlotsColorPalettes(unittest.TestCase):
             vlg.log_iteration_end(Status.Optimal_Improve, best=90 - i, cur=90)
         vlg.log_run_end()
 
-        expected_npy_2 = os.path.join(vlg.path, "barcode_run_2.npy")
+        expected_npy_2 = os.path.join(vlg.path, "barcode_run_2.npz")
         self.assertTrue(os.path.exists(expected_npy_2))
         self.assertEqual(len(vlg.barcodes), 2)
         self.assertEqual(vlg.barcodes[1].shape, (3, num_vars))
