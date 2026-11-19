@@ -9,7 +9,7 @@ Joint **order and bin scheduling** in robotic compact storage / retrieval system
 - ML-augmented order assignment.
 
 This file maps the top-level code. Heuristic internals are in
-[HEURISTICS.md](HEURISTICS.md). Known bugs and quirks are in [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
+[HEURISTICS.md](HEURISTICS.md). Known bugs and quirks are in [KNOWN_ISSUES.md](KNOWN_ISSUES.md). Parked ideas are in [FUTURE_IDEAS.md](FUTURE_IDEAS.md).
 
 ---
 

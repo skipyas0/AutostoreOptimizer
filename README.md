@@ -31,8 +31,9 @@ docplex config --upgrade <PATH_TO_CPLEX_STUDIO>
 ## Documentation
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): problem summary, pipeline, map of every top-level module, workflows
-- [docs/HEURISTICS.md](docs/HEURISTICS.md): the `heuristics/` package (SGC, AMA, RDI, partitioned RDI, CFSS), API, how to add a heuristic, equivalence harness
+- [docs/HEURISTICS.md](docs/HEURISTICS.md): the `heuristics/` package (SGC, AMA, RDI, partitioned RDI, CFSS, GBS), API, how to add a heuristic, equivalence harness
 - [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md): known bugs and quirks
+- [docs/FUTURE_IDEAS.md](docs/FUTURE_IDEAS.md): parked ideas with the evidence so far (e.g. GBS work stealing)
 
 ## Repository Structure
 
