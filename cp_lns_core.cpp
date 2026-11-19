@@ -11,6 +11,7 @@
 #include <fstream>
 #include <mutex>
 #include <optional>
+#include <tuple>
 #include <thread>
 #include <condition_variable>
 #include <chrono>
@@ -276,7 +277,10 @@ public:
                int flow_offset,
                const std::map<int, std::pair<int, int>>& station_window,
                const std::map<int, int>& station_pick_time,
-               const std::map<int, int>& station_pick_count) {
+               const std::map<int, int>& station_pick_count,
+               // Joinable frozen visits: (s, k, e, b_start, b_end, frozen picks). Active
+               // orders get optional picks PX[o,s,k,e] inside the fixed presence window.
+               const std::vector<std::tuple<int, int, int, int, int, std::vector<std::pair<int, int>>>>& exo_visits) {
         
         model = IloModel(env);
         cp = IloCP(model);
@@ -409,6 +413,28 @@ public:
             }
         }
         
+        // Picks of active orders on joinable frozen visits. Fetch, presence and return
+        // of the visit are constants, so F -> P -> R reduces to the window bounds.
+        std::map<std::pair<int, int>, std::vector<int>> exo_slots;  // (s, k) -> copy indices e
+        for (const auto& visit : exo_visits) {
+            int s = std::get<0>(visit), k = std::get<1>(visit), e = std::get<2>(visit);
+            int b_start = std::get<3>(visit), b_end = std::get<4>(visit);
+            exo_slots[{s, k}].push_back(e);
+            for (int o : O) {
+                const auto& reqs = orders_req.at(o);
+                if (std::find(reqs.begin(), reqs.end(), k) == reqs.end()) continue;
+                std::string name_PX = make_key_o_s_k_e("PX", o, s, k, e);
+                IloIntervalVar iv(env, p.at(k));
+                iv.setOptional();
+                iv.setStartMin(b_start);
+                iv.setStartMax(b_end - p.at(k));
+                iv.setEndMin(b_start + p.at(k));
+                iv.setEndMax(b_end);
+                iv.setName(name_PX.c_str());
+                vars[name_PX] = iv;
+            }
+        }
+
         if (horizon == 0) {
             horizon = 0;
             for (int k : active_K) {
@@ -458,6 +484,22 @@ public:
                                 }
                             }
                         }
+                    }
+                }
+                // Joinable frozen visits: active picks share the bin with the frozen picks
+                for (const auto& visit : exo_visits) {
+                    if (std::get<0>(visit) != s) continue;
+                    int k = std::get<1>(visit), e = std::get<2>(visit);
+                    for (int o : O) {
+                        std::string name_PX = make_key_o_s_k_e("PX", o, s, k, e);
+                        if (vars.find(name_PX) != vars.end()) {
+                            station_picks += IloPulse(vars[name_PX], 1);
+                            has_picks = true;
+                        }
+                    }
+                    for (const auto& st_en : std::get<5>(visit)) {
+                        station_picks += IloPulse(env, st_en.first, st_en.second, 1);
+                        has_picks = true;
                     }
                 }
                 if (has_picks) {
@@ -544,6 +586,12 @@ public:
                         IloIntervalVarArray candidates(env, Uk);
                         for (int e = 0; e < Uk; ++e) {
                             candidates[e] = vars[make_key_o_s_k_e("P", o, s, k, e)];
+                        }
+                        auto slots_it = exo_slots.find({s, k});
+                        if (slots_it != exo_slots.end()) {
+                            for (int e : slots_it->second) {
+                                candidates.add(vars[make_key_o_s_k_e("PX", o, s, k, e)]);
+                            }
                         }
                         model.add(IloAlternative(env, iv_C, candidates));
                     }
@@ -722,6 +770,16 @@ public:
                                 }
                             }
                         }
+                    }
+                }
+            }
+            for (const auto& visit : exo_visits) {
+                if (std::get<0>(visit) != s) continue;
+                for (int o : O) {
+                    std::string px_key = make_key_o_s_k_e("PX", o, s, std::get<1>(visit), std::get<2>(visit));
+                    if (vars.find(px_key) != vars.end()) {
+                        pick_sum += IloSizeOf(vars[px_key]);
+                        pick_count += IloPresenceOf(env, vars[px_key]);
                     }
                 }
             }
@@ -1072,7 +1130,8 @@ PYBIND11_MODULE(cp_lns_core, m) {
     py::class_<CpLnsModel>(m, "CpLnsModel", py::dynamic_attr())
         .def(py::init<std::vector<int>, std::vector<int>, std::vector<int>, std::map<int, std::vector<int>>, std::map<int, int>, std::map<int, int>, std::map<int, int>, std::optional<int>, std::optional<int>, std::map<int, int>, std::vector<int>, std::map<int, int>, int, bool, std::map<std::pair<int, int>, std::vector<std::pair<int, int>>>, std::map<int, std::vector<std::pair<int, int>>>, std::vector<std::pair<int, int>>, int, std::string,
                       std::map<int, std::vector<std::pair<int, int>>>, int, int, int,
-                      std::map<int, std::pair<int, int>>, std::map<int, int>, std::map<int, int>>())
+                      std::map<int, std::pair<int, int>>, std::map<int, int>, std::map<int, int>,
+                      std::vector<std::tuple<int, int, int, int, int, std::vector<std::pair<int, int>>>>>())
         .def("apply_warm_start", &CpLnsModel::apply_warm_start)
         .def("apply_delta_freezing", &CpLnsModel::apply_delta_freezing)
         .def("solve", &CpLnsModel::solve,

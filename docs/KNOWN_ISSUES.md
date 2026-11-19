@@ -6,32 +6,67 @@ records its effect, measured with `tests/regression/equivalence.py --ref <previo
 
 ## Open
 
-### Subproblem LNS: shared bin visits (mitigated by `--close-sharing`, default on)
-In subproblem mode (`--lns-model subproblem`, `subproblem.py`) a bin visit is frozen as soon as it serves at least one
-frozen order. Its fetch, presence and return become fixed intervals in the subproblem. Two consequences:
-- **Active orders cannot join a frozen visit.** In the full-model LNS an active order can still pick from a visit
-  that also serves frozen orders (the visit may move as long as it covers the frozen picks). In a subproblem it
-  needs a new visit, so sharing with frozen orders is never created, and the subproblem never removes a fetch by
-  merging into one.
-- **The incumbent may not be representable.** If an active order currently picks from a frozen visit, its old pick
-  is dropped from the warm start, and the subproblem must give it a new visit. The starting point is then worse than
-  the incumbent in every KPI (one extra fetch per dropped pick, often more flow time, sometimes more makespan).
+### Subproblem LNS: joining frozen bin visits (fixed Nov 2026, `--joinable-exo`, default on)
+Terms: a *bin visit* is the triple `F[s,k,e]`, `B[s,k,e]`, `R[s,k,e]` (fetch, presence, return); a *pick*
+`P[o,s,k,e]` assigns the consumption `C[o,k,s]` of order o to that visit (`alternative(C, {P[o,s,k,e]}ₑ)`).
 
-How often (measured Nov 2026): 43% of the strategies' neighbourhoods on the 600-order benchmark instance
-(`GEN4-15-3-28750-600-40`) contain such a pick, and most neighbourhoods on instances with ≤ 1000 SKUs. Without a fix,
-every such iteration starts behind the incumbent; with `--improvement-constr` the `bin_fetches` / `idle_time` /
-`total_flow_time` phases then almost never find a solution, and accepted solutions slowly lose bin sharing.
+In subproblem mode (`--lns-model subproblem`, `subproblem.py`) a visit is frozen as soon as it serves at least one
+frozen order: its F, B and R become fixed intervals (`exo_moves`, `exo_station_bins`, `exo_blocks`).
 
-**Mitigation:** `--close-sharing` (default) adds every frozen order that shares a visit with an active order to the
-neighbourhood (`subproblem.close_under_sharing`, fixed point). The warm start then reproduces the incumbent exactly
-(all five KPIs, checked in `tests/test_subproblem.py`). It grows neighbourhoods by about 2.5% on the benchmark
-instance and costs about 0.03 s per iteration. The logged unfrozen set (`num_optimized`, barcodes) stays the
-strategy's selection. `--no-close-sharing` restores the behaviour of the subproblem experiments before Nov 2026.
-The first consequence (no new sharing with frozen orders) remains; a fix would pass frozen visits that serve active
-orders as joinable "exo visits" with fixed fetch/return but open picks. The `bin_sharing` strategies
-(`refetched_sku_pick_slices`, `refetched_sku_fetch_density`, `fetch_pick_ratio_timeslice`) work around it by
-selecting all orders in a time window around repeated visits of a SKU, so the visits that could be merged are all
-active.
+**Fixed (`--joinable-exo`):** frozen visits of SKUs that an active order needs are also passed as `exo_visits`. Each
+active order o gets an optional pick `PX[o,s,k,e]` (size `p[k]`) with its domain inside the fixed presence window,
+as one more candidate of `alternative(C[o,k,s], …)`. `PX` and the frozen picks of the visit enter the station's
+PickCap cumulative, and `PX` enters the pick sums of `idle_time` / `max_picks`. Visits where no further pick fits
+(PickCap) are not passed. Consequences:
+- The incumbent is always representable: an active order's pick on a frozen visit is warm-started on `PX`. Before,
+  that pick was dropped from the warm start and CP had to open a new visit (+1 fetch); on the 600-order benchmark
+  instance (`GEN4-15-3-28750-600-40`), 12 of 12 random 100-order neighbourhoods then had no solution within 5 s.
+  Now all 12 reproduce the incumbent's KPIs exactly.
+- Active orders can join a frozen visit, where its fixed presence window has room.
+
+Validated in `tests/test_subproblem.py`: the subproblem optimum equals the optimum of the full docplex model with
+the frozen orders and their visits fixed (all six KPIs, both backends); every merged solution is feasible in the
+full model with the reported KPIs; the warm start is feasible when all variables are fixed to it.
+`--no-joinable-exo` builds exactly the subproblems from before the option existed (identical `.cpo`).
+
+**Neighbourhood definitions (`--neighbourhood`, both LNS models).** Frozen variables are fixed in every mode; the
+rules differ in which variables a neighbourhood frees for the same strategy output.
+- `graph` (default since Nov 2026, both models; `freezing_utils.get_optimized_set`): I_os, lanes and C of the
+  selected orders; F, B, R, Block of *every* present visit of the selected SKUs, including visits that serve frozen
+  orders (those orders' picks stay fixed, so the free visit must still cover them), plus one absent copy slot per
+  (s, k); a pick P[o,s,k,e] is free iff o is selected and (s, k, e) is free. The subproblem reproduces it exactly
+  (`subproblem.extract_context_graph`): frozen orders with a pick on a free visit enter the subproblem *pinned*
+  (every variable fixed), active orders' picks on frozen visits are fixed (`PX` fixed to the incumbent), and copy
+  slots beyond the freed ones are fixed absent. Validated in `test_graph_subproblem_matches_full_model` (same
+  optimum as the frozen full model for all six KPIs, both backends; every variable the full-model LNS freezes is
+  unchanged after the merge).
+- `subproblem` (the subproblem rule before Nov 2026): F, B, R, Block of a visit that serves a frozen order are
+  frozen too; active orders can only join it where its fixed presence window has room (`--joinable-exo`), and
+  `--close-sharing` adds frozen orders sharing a visit. In the full model it is `subproblem_optimized_set`.
+
+Benchmark (Nov 2026, 10 instances x 4 runs x 150 iterations, `mmb`, full model, no symmetry breaking): `graph`
+reduced bin fetches by 2.6 percentage points more than `subproblem` (10/10 instances); with the same neighbourhood the
+full model and the subproblem were equivalent (+0.04 pp, within +-1 pp, p < 1e-6).
+The `bin_sharing` strategies (`refetched_sku_pick_slices`, `refetched_sku_fetch_density`,
+`fetch_pick_ratio_timeslice`) work around this by selecting all orders in a time window around repeated visits of
+a SKU, so the visits that could be merged are all active.
+
+`--close-sharing` (default on, independent of `--joinable-exo`) still adds every frozen order that shares a visit
+with an active order to the neighbourhood (`subproblem.close_under_sharing`, fixed point; about +2.5% orders and
+0.03 s per iteration on the benchmark instance). It is no longer needed for a valid warm start, but it makes those
+shared visits fully movable. `--no-close-sharing --no-joinable-exo` restores the subproblem experiments before
+Nov 2026, in which neighbourhoods with shared picks (43% of the strategies' neighbourhoods on the benchmark
+instance) started behind the incumbent.
+
+### Full-model LNS: symmetry breaking restricts the neighbourhood (off by default since Nov 2026)
+`symmetry_breaking` (instance config, true for the benchmark instances) adds, per (s, k), the copy-slot chain
+`presence(B[s,k,e+1]) ⇒ presence(B[s,k,e])` and `endBeforeStart(B[s,k,e], B[s,k,e+1])`. In a full model with frozen
+visits, the free slots must keep that order around the frozen ones, so some solutions of the neighbourhood are cut
+off. On the small test instances (16 orders, matched subproblem neighbourhood, 16 neighbourhoods proven optimal
+both ways) the bin-fetch optimum was worse with symmetry breaking in 4 of 16 (e.g. 32 instead of 30); the makespan
+optimum was never affected. The subproblem has no symmetry breaking. **Since Nov 2026 every LNS run builds its model without
+symmetry breaking** (`--symmetry-breaking` turns it back on). In the benchmark above, dropping it raised the full
+model's fetch reduction by 2.0 percentage points (10/10 instances) and improved makespan as well.
 
 ### Acceptance is by makespan only
 `Solver.rrt_acceptance` compares makespans, whatever the active objective. In a `bin_fetches` / `total_flow_time` /

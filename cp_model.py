@@ -18,6 +18,7 @@ def build_model(
     objective_func: str = "makespan",
     exo_station_bins: dict = None,  # station -> list of (start, end) bin presences
     obj_offsets=None,  # subproblem.ObjectiveOffsets: frozen part of every KPI
+    exo_visits: list = None,  # joinable frozen visits: (s, k, e, b_start, b_end, frozen_picks)
 ):
     """
     Intervals per (s,k,e):
@@ -39,6 +40,7 @@ def build_model(
     exo_blocks = exo_blocks or defaultdict(list)
     exo_moves = exo_moves or []
     exo_station_bins = exo_station_bins or {}
+    exo_visits = exo_visits or []
 
     mdl = CpoModel()
     O = sorted(orders_req.keys())
@@ -153,6 +155,22 @@ def build_model(
                 )
                 mdl.add(mdl.span(Block[(s, k, e)], [F[(s, k, e)], R[(s, k, e)]]))
 
+    # Picks of active orders on joinable frozen visits (LNS subproblems). The visit's
+    # fetch, presence and return are constants, so F -> P -> R reduces to the pick
+    # lying inside the fixed presence window [b_start, b_end].
+    PX = {}
+    exo_slots = defaultdict(list)  # (s, k) -> full-model copy indices e of joinable visits
+    for s, k, e, b_start, b_end, _ in exo_visits:
+        exo_slots[(s, k)].append(e)
+        for o in sorted(orders_demanding_sku[k]):
+            PX[(o, s, k, e)] = mdl.interval_var(
+                size=p[k],
+                optional=True,
+                start=(b_start, b_end - p[k]),
+                end=(b_start + p[k], b_end),
+                name=f"PX[{o},{s},{k},{e}]",
+            )
+
     if horizon == 0:
         horizon = sum((rt[k] + p[k] + rt_return.get(k, rt[k])) * U[k] for k in active_K)
         print(f"New horizon {horizon}")
@@ -219,6 +237,7 @@ def build_model(
                     mdl.add(mdl.presence_of(C[(o, k, s)]) == 0)
                 else:
                     candidates = [P[(o, s, k, e)] for e in range(Uk)]
+                    candidates += [PX[(o, s, k, e)] for e in exo_slots.get((s, k), [])]
                     mdl.add(mdl.alternative(C[(o, k, s)], candidates))
 
     # --- capacities (disjunctive only) ---
@@ -265,6 +284,15 @@ def build_model(
                     # Verify P exists (as created in the active_K/O loops above)
                     if (o, s, k, e) in P:
                         station_pulses.append(mdl.pulse(P[(o, s, k, e)], 1))
+
+        # Joinable frozen visits: active picks share the bin with the frozen picks
+        for xs, k, e, _, _, frozen_picks in exo_visits:
+            if xs != s:
+                continue
+            for o in sorted(orders_demanding_sku[k]):
+                station_pulses.append(mdl.pulse(PX[(o, s, k, e)], 1))
+            for st, en in frozen_picks:
+                station_pulses.append(mdl.pulse((st, en), 1))
 
         if station_pulses:
             station_picks = sum(station_pulses)  # Or mdl.sum()
@@ -436,6 +464,10 @@ def build_model(
             for k in orders_req[o]
             for e in range(U[k])
         )
+        for (o, xs, k, e), iv in PX.items():
+            if xs == s:
+                sum_pick_durations = sum_pick_durations + mdl.size_of(iv)
+                pick_count = pick_count + mdl.presence_of(iv)
         if obj_offsets is not None and obj_offsets.station_pick_count.get(s, 0):
             sum_pick_durations = sum_pick_durations + obj_offsets.station_pick_time[s]
             pick_count = pick_count + obj_offsets.station_pick_count[s]
@@ -476,6 +508,7 @@ def build_model(
         "I_os": I_os,
         "C": C,
         "P": P,
+        "PX": PX,
         "F": F,
         "R": R,
         "B": B,

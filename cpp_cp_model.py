@@ -168,6 +168,7 @@ def build_handles(instance, horizon: int) -> dict:
         "I_os": I_os,
         "C": C,
         "P": P,
+        "PX": {},
         "F": F,
         "R": R,
         "B": B,
@@ -202,6 +203,7 @@ def build_model(
     objective_func: str = "makespan",
     exo_station_bins: dict = None,  # station -> list of (start, end) bin presences
     obj_offsets=None,  # subproblem.ObjectiveOffsets: frozen part of every KPI
+    exo_visits: list = None,  # joinable frozen visits: (s, k, e, b_start, b_end, frozen_picks)
 ):
     if objective_func not in CPP_OBJECTIVES:
         # the C++ model would silently fall back to makespan
@@ -216,6 +218,10 @@ def build_model(
     exo_blocks = exo_blocks or defaultdict(list)
     exo_moves = exo_moves or []
     exo_station_bins = exo_station_bins or {}
+    exo_visits = [
+        (s, k, e, int(b_start), int(b_end), [(int(st), int(en)) for st, en in frozen])
+        for s, k, e, b_start, b_end, frozen in (exo_visits or [])
+    ]
 
     if obj_offsets is None:
         makespan_lb, fetches_off, flow_off = 0, 0, 0
@@ -256,9 +262,16 @@ def build_model(
         station_window,
         station_pick_time,
         station_pick_count,
+        exo_visits,
     )
 
-    return CppModelWrapper(cpp_model), build_handles(instance, horizon)
+    handles = build_handles(instance, horizon)
+    for s, k, e, *_ in exo_visits:
+        for o in sorted(orders_demanding_sku[k]):
+            var = MockIntervalVar(f"PX[{o},{s},{k},{e}]")
+            handles["PX"][(o, s, k, e)] = var
+            handles["all_intervals_flat"][var.get_name()] = var
+    return CppModelWrapper(cpp_model), handles
 
 
 CPP_OBJECTIVES = (
