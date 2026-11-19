@@ -204,6 +204,26 @@ def test_bound_shortcut(setup):
     assert not subproblem.violates_bound(ctx, "makespan", hs.makespan - 1)
 
 
+def _assert_delta_log_replays(solver):
+    """Initial solution + logged deltas of the last run = the run's final incumbent
+    (KNOWN_ISSUES: "Solution delta log misses variable changes")."""
+    from freezing_utils import LNS_VAR_GROUPS
+
+    def norm(v):
+        if not v or not v.get("present"):
+            return (False, None, None)
+        return (True, int(v["start"]), int(v["end"]))
+
+    state = {k: norm(v) for k, v in solver.vlg.all_run_initial_solutions[-1].items()}
+    for delta in solver.vlg.all_run_deltas[-1]:
+        state.update({k: norm(v) for k, v in delta.items()})
+    real = solver.current_solution.var_sols
+    for group in LNS_VAR_GROUPS:
+        for var in solver.handles[group].values():
+            name = var.get_name()
+            assert state.get(name, norm(None)) == norm(real.get(name)), name
+
+
 @pytest.mark.parametrize("neighbourhood,close_sharing",
                          [("graph", True), ("subproblem", True), ("subproblem", False)],
                          ids=["graph", "closure", "no_closure"])
@@ -246,6 +266,7 @@ def test_lns_end_to_end(tmp_path, backend, cycling, neighbourhood, close_sharing
     assert solver.best_result <= heur.makespan
     final = HeuristicSolution.from_cp(solver.best_solution, solver.handles)
     assert final.validate(inst, horizon=H) == []
+    _assert_delta_log_replays(solver)
     if cycling:
         # every run starts at the beginning of the objective cycle
         seqs = [list(g.cp_obj) for _, g in solver.vlg.df.groupby("run_id")]

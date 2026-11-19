@@ -937,9 +937,12 @@ class Solver:
             strategy_manager.current_solution = self.current_solution
 
             # log iteration end in VisualLogger
-            self.vlg.log_solution_delta(
-                prev_solution, self.current_solution, to_optimize
-            )
+            # The subproblem merge may write variables outside to_optimize (orders
+            # added by --close-sharing, relabelled copy indices): diff over those too.
+            logged = to_optimize
+            if self.subproblem_mode and sol.get("written_vars"):
+                logged = set(to_optimize) | sol.get("written_vars")
+            self.vlg.log_solution_delta(prev_solution, self.current_solution, logged)
             self.vlg.log_iteration()
 
         # End of LNS loop: Validate the best solution found

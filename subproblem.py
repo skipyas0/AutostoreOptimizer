@@ -612,8 +612,12 @@ def _timings(sol, backend):
 # --------------------------------------------------------------------------- #
 # Writing the result back into the full solution
 # --------------------------------------------------------------------------- #
-def merge(solution, ctx: FrozenContext, sub_sol, sub_handles, handles) -> dict:
-    """Full-model var_sols with the active orders replaced by the subproblem result."""
+def merge(solution, ctx: FrozenContext, sub_sol, sub_handles, handles, written=None) -> dict:
+    """Full-model var_sols with the active orders replaced by the subproblem result.
+
+    ``written``: optional set that receives the name of every variable the merge sets
+    (a superset of the changed ones; the solution delta log diffs over it).
+    """
     hs = HeuristicSolution.from_cp(sub_sol, sub_handles)
     new = dict(solution.var_sols)
     S, L, U = handles["S"], handles["L"], handles["U"]
@@ -623,6 +627,8 @@ def merge(solution, ctx: FrozenContext, sub_sol, sub_handles, handles) -> dict:
 
     def put(var, value):
         new[var.get_name()] = value
+        if written is not None:
+            written.add(var.get_name())
 
     # 1. Clear the old schedule of the active orders and of their own bin visits
     for o in ctx.active_orders:
@@ -714,7 +720,9 @@ def to_full_result(solution, ctx, sub_sol, sub_handles, handles, backend, object
         "objective": None,
     }
     if status in ("Optimal", "Feasible"):
-        result["var_solutions"] = merge(solution, ctx, sub_sol, sub_handles, handles)
+        written = set()
+        result["var_solutions"] = merge(solution, ctx, sub_sol, sub_handles, handles, written)
+        result["written_vars"] = written  # for the solution delta log
         kpis = dict(sub_sol.get_kpis() or {})
         result["kpis"] = {k: kpis[k] for k in
                           ("makespan", "bin_fetches", "total_flow_time", "idle_time", "max_picks",
