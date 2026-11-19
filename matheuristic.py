@@ -1145,6 +1145,15 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--replay-html",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        dest="replay_html",
+        help="Write an interactive LNS replay (lns_replay.html) into the experiment folder; "
+        "can also be generated later with `python lns_replay.py <exp_dir>`",
+    )
+
+    parser.add_argument(
         "--time-limit",
         type=float,
         default=None,
@@ -1307,6 +1316,7 @@ if __name__ == "__main__":
             "cp_objective_phase_duration": args.cp_objective_phase_duration,
             "cp_objective_phase_schedule": args.cp_objective_phase_schedule,
             "render_video": args.render_video,
+            "replay_html": args.replay_html,
             "only_first_sol": args.only_first_sol,
             "lns_model": args.lns_model,
             "validate_merges": args.validate_merges,

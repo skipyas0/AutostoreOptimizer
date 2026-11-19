@@ -165,63 +165,27 @@ class LNSOptimizationScene(Scene):
                     span_vars[idx].append(ev["k_var"])
             
             if not spans: return {}, 0
-            
-            from docplex.cp.model import CpoModel
-            mdl = CpoModel()
-            
-            intervals = [(idx, spans[idx][0], spans[idx][1], span_vars[idx]) for idx in spans]
-            N = len(intervals)
-            
-            num_lanes = mdl.integer_var(0, N, "num_lanes")
-            lane_vars = {idx: mdl.integer_var(0, N - 1, f"lane_{idx[0]}_{idx[1]}") for idx, s, e, vars_ in intervals}
-            
-            for idx, s, e, vars_ in intervals:
-                mdl.add(lane_vars[idx] < num_lanes)
-                if idx in previous_assignment and all(v in frozen_vars for v in vars_):
-                    mdl.add(lane_vars[idx] == previous_assignment[idx])
-                    
-            for i, (idx1, s1, e1, _) in enumerate(intervals):
-                for j, (idx2, s2, e2, _) in enumerate(intervals):
-                    if i < j:
-                        if not (e1 <= s2 or e2 <= s1):
-                            mdl.add(lane_vars[idx1] != lane_vars[idx2])
-                            
-            changes = []
-            for idx, s, e, _ in intervals:
-                if idx in previous_assignment:
-                    changes.append(lane_vars[idx] != previous_assignment[idx])
-                    
-            if changes: mdl.minimize(num_lanes * 1000 + mdl.sum(changes))
-            else: mdl.minimize(num_lanes)
-                
-            sol = mdl.solve(TimeLimit=5, LogVerbosity="Quiet")
-            
+
+            # Interval-graph colouring: a greedy sweep by start time is optimal; the
+            # previous lane is preferred when free so bars don't jump between frames.
             assignment = {}
-            if sol:
-                for idx, s, e, _ in intervals:
-                    assignment[idx] = sol.get_value(lane_vars[idx])
-                return assignment, sol.get_value(num_lanes)
-            else:
-                # Fallback to greedy
-                unplaced = list(spans.items())
-                unplaced.sort(key=lambda x: x[1][0])
-                lanes_content = {}
-                for idx, span in unplaced:
-                    if idx in previous_assignment and all(v in frozen_vars for v in span_vars[idx]):
-                        lane_idx = previous_assignment[idx]
-                        assignment[idx] = lane_idx
-                        if lane_idx not in lanes_content: lanes_content[lane_idx] = []
-                        lanes_content[lane_idx].append(span)
-                        continue
-                    lane_idx = 0
-                    while True:
-                        if not any(not (span[1] <= s[0] or s[1] <= span[0]) for s in lanes_content.get(lane_idx, [])):
-                            assignment[idx] = lane_idx
-                            if lane_idx not in lanes_content: lanes_content[lane_idx] = []
-                            lanes_content[lane_idx].append(span)
-                            break
-                        lane_idx += 1
-                return assignment, max(assignment.values()) + 1 if assignment else 0
+            lane_end = []
+            for idx, (s, e) in sorted(spans.items(), key=lambda kv: (kv[1][0], kv[1][1])):
+                lane = None
+                p = previous_assignment.get(idx)
+                if p is not None:
+                    while len(lane_end) <= p:
+                        lane_end.append(float("-inf"))
+                    if lane_end[p] <= s:
+                        lane = p
+                if lane is None:
+                    lane = next((l for l, le in enumerate(lane_end) if le <= s), None)
+                    if lane is None:
+                        lane = len(lane_end)
+                        lane_end.append(float("-inf"))
+                lane_end[lane] = e
+                assignment[idx] = lane
+            return assignment, len(lane_end)
 
         current_state = {}
         for k, v in self.initial_solution.items():

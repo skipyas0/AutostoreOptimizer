@@ -40,7 +40,7 @@ CONFIG_DEFAULTS = {
     "combine_strat_with_tail": "all",
 }
 # Keys that do not change the algorithm.
-CONFIG_IGNORE = {"runs", "render_video"}
+CONFIG_IGNORE = {"runs", "render_video", "replay_html"}
 
 HEURISTIC_NAMES = {
     "load_balanced_greedy": "LB-SGC",

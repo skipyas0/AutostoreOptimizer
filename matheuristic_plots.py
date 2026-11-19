@@ -940,6 +940,17 @@ class VisualLogger:
         self.plot_status_time_distributions()
         self.plot_kpis_interplay()
         self.plot_discovered_solutions_distribution()
+
+        if self.experiment_config.get("replay_html", False):
+            try:
+                import lns_replay
+
+                out, _ = lns_replay.export_experiment(
+                    self.path, strategy_names=self.strategy_map
+                )
+                logger.info(f"Wrote interactive LNS replay to {out}")
+            except Exception as e:  # never lose an experiment over a visualisation
+                logger.error(f"Failed to write LNS replay: {e}")
         logger.info(f"Experiment saved successfully to {self.path}")
 
     def get_solution_history_df(self, solution_history):

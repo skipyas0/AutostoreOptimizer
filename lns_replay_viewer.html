@@ -1,0 +1,1160 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LNS Replay</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --ink: #111827; --muted: #6b7280; --line: #e5e7eb;
+    --accent: #2563eb; --danger: #dc2626;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink);
+    font: 13px/1.35 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  body { display: flex; flex-direction: column; }
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding: 8px 12px;
+    background: var(--panel); border-bottom: 1px solid var(--line); }
+  header .title { font-weight: 600; margin-right: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 260px; }
+  header .grp { display: flex; align-items: center; gap: 4px; }
+  header .sep { width: 1px; height: 22px; background: var(--line); margin: 0 2px; }
+  button, select, input[type=number] { font: inherit; color: inherit; background: #fff; border: 1px solid #d1d5db;
+    border-radius: 6px; padding: 3px 8px; height: 28px; }
+  button { cursor: pointer; }
+  button:hover { background: #f3f4f6; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover { background: #1d4ed8; }
+  button.rec { color: var(--danger); border-color: #fecaca; }
+  button.icon { width: 30px; padding: 0; }
+  #slider { width: 220px; accent-color: var(--accent); }
+  #frameLbl { font-variant-numeric: tabular-nums; min-width: 78px; text-align: right; }
+  details.menu { position: relative; }
+  details.menu summary { list-style: none; cursor: pointer; border: 1px solid #d1d5db; border-radius: 6px; padding: 3px 8px; height: 28px; display: flex; align-items: center; background: #fff; }
+  details.menu summary::-webkit-details-marker { display: none; }
+  details.menu .pop { position: absolute; z-index: 20; top: 32px; right: 0; background: #fff; border: 1px solid var(--line);
+    border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,.12); padding: 10px 12px; width: 260px; display: grid; gap: 8px; }
+  .pop label { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  main { position: relative; flex: 1; min-height: 0; }
+  canvas#stage { position: absolute; inset: 0; width: 100%; height: 100%; display: block; cursor: crosshair; }
+  #tip { position: fixed; pointer-events: none; z-index: 30; background: rgba(17,24,39,.94); color: #fff; padding: 6px 8px;
+    border-radius: 6px; font-size: 12px; line-height: 1.4; white-space: pre; display: none; font-variant-numeric: tabular-nums; }
+  #drop { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; text-align: center; color: var(--muted); }
+  #drop.show { display: flex; }
+  #drop .box { border: 2px dashed #cbd5e1; border-radius: 12px; padding: 32px 40px; background: #fff; max-width: 560px; }
+  code { background: #f3f4f6; padding: 1px 5px; border-radius: 4px; }
+  dialog { border: 1px solid var(--line); border-radius: 10px; padding: 18px 20px; width: min(420px, calc(100vw - 32px)); }
+  dialog::backdrop { background: rgba(0,0,0,.25); }
+  dialog h3 { margin: 0 0 12px; font-size: 15px; }
+  dialog .row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 8px 0; }
+  dialog .row input[type=number] { width: 90px; }
+  dialog .note { color: var(--muted); font-size: 12px; margin: 10px 0; }
+  dialog .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+  progress { width: 100%; height: 8px; }
+  .kbd { font-size: 11px; color: var(--muted); }
+  @media (max-width: 720px) { #slider { width: 120px; } header .title { max-width: 100%; flex-basis: 100%; } }
+</style>
+</head>
+<body>
+<header>
+  <div class="title" id="title">LNS Replay</div>
+  <div class="grp"><select id="runSel" title="Run"></select></div>
+  <div class="sep"></div>
+  <div class="grp">
+    <button class="icon" id="bFirst" title="First frame (Home)">⏮</button>
+    <button class="icon" id="bPrev" title="Previous (←)">◀</button>
+    <button class="primary" id="bPlay" title="Play / pause (Space)" style="min-width:64px">Play</button>
+    <button class="icon" id="bNext" title="Next (→)">▶</button>
+    <button id="bNextImp" title="Next improvement (Shift+→)">next ★</button>
+  </div>
+  <div class="grp">
+    <input type="range" id="slider" min="0" max="0" value="0">
+    <span id="frameLbl">0 / 0</span>
+  </div>
+  <div class="grp">
+    <select id="speed" title="Playback speed (iterations / second)">
+      <option value="0.5">0.5 it/s</option><option value="1">1 it/s</option><option value="2" selected>2 it/s</option>
+      <option value="4">4 it/s</option><option value="8">8 it/s</option><option value="16">16 it/s</option><option value="40">40 it/s</option>
+    </select>
+  </div>
+  <div class="sep"></div>
+  <div class="grp">
+    <select id="stationSel" title="Station filter"></select>
+    <select id="robotSel" title="Robot view">
+      <option value="lanes">Robots: lanes</option><option value="load">Robots: load</option><option value="hide">Robots: hidden</option>
+    </select>
+  </div>
+  <details class="menu" id="viewMenu">
+    <summary>View ▾</summary>
+    <div class="pop">
+      <label>Fade frozen variables <input type="checkbox" id="optHighlight" checked></label>
+      <label>Ghost of previous position <input type="checkbox" id="optGhost" checked></label>
+      <label>Animate transitions <input type="checkbox" id="optTween" checked></label>
+      <label>Skip iterations without change <input type="checkbox" id="optSkip"></label>
+      <label>KPI x-axis <select id="optKpiX"><option value="iter">iteration</option><option value="time">wall time</option></select></label>
+      <div class="kbd">Wheel: zoom time · drag: pan · double-click: reset<br>Space play · ←/→ step · Shift+→ next improvement</div>
+    </div>
+  </details>
+  <div class="sep"></div>
+  <div class="grp">
+    <button id="bPng" title="Save current frame as PNG">PNG</button>
+    <button class="rec" id="bRec" title="Render a video of the replay">● Record video</button>
+  </div>
+</header>
+<main>
+  <canvas id="stage"></canvas>
+  <div id="drop"><div class="box">
+    <p><b>No trace embedded.</b></p>
+    <p>Drop a trace <code>.json</code> here (from <code>python lns_replay.py &lt;exp_dir&gt; --json trace.json</code>),<br>
+    or generate a ready-to-open page with <code>python lns_replay.py &lt;exp_dir&gt;</code>.</p>
+    <p><input type="file" id="fileIn" accept=".json,application/json"></p>
+  </div></div>
+</main>
+<div id="tip"></div>
+
+<dialog id="recDlg">
+  <h3>Render video</h3>
+  <div id="recForm">
+    <div class="row"><span>From frame</span><input type="number" id="recFrom" min="0" value="0"></div>
+    <div class="row"><span>To frame</span><input type="number" id="recTo" min="0" value="0"></div>
+    <div class="row"><span>Seconds per iteration</span><input type="number" id="recSpi" min="0.05" step="0.05" value="0.5"></div>
+    <div class="row"><span>Resolution</span>
+      <select id="recRes"><option value="1280x720">1280 × 720</option><option value="1920x1080" selected>1920 × 1080</option><option value="2560x1440">2560 × 1440</option></select></div>
+    <div class="row"><span>Frame rate</span><select id="recFps"><option>30</option><option selected>60</option></select></div>
+    <div class="row"><span>Skip iterations without change</span><input type="checkbox" id="recSkip" checked></div>
+    <div class="note" id="recEst"></div>
+    <div class="note">Uses the current view (zoom, station filter, robot view, options). Recording runs in real time; keep this tab visible.</div>
+  </div>
+  <div id="recProg" style="display:none">
+    <progress id="recBar" max="1" value="0"></progress>
+    <div class="note" id="recStatus"></div>
+  </div>
+  <div class="actions">
+    <button id="recCancel">Cancel</button>
+    <button class="primary" id="recStart">Start</button>
+  </div>
+</dialog>
+
+<script id="trace-data" type="application/json">/*__LNS_TRACE__*/null</script>
+<script>
+"use strict";
+// ---------------------------------------------------------------- constants
+const TYPE = { LANE: 0, C: 1, P: 2, B: 3, F: 4, R: 5 };
+const TYPE_NAME = ["I_os_lane", "C", "P", "B", "F", "R"];
+const TYPE_LABEL = ["Order", "Consumption", "Pick", "Bin at station", "Fetch", "Return"];
+const TYPE_COLOR = ["#6C5CE7", "#FF0015", "#E63946", "#6C757D", "#FF8C00", "#1D4ED8"];
+const STATUS_COLOR = { best: "#16a34a", improve: "#0891b2", same: "#94a3b8", worse: "#f59e0b", fail: "#d1d5db" };
+const STATUS_LABEL = { best: "new best", improve: "improved", same: "no change in obj.", worse: "accepted worse", fail: "infeasible / unknown" };
+const INK = "#111827", MUTED = "#6b7280", GRID = "#eef0f3", PANEL = "#ffffff", BG = "#f6f7f9";
+const KEY_EVERY = 32;
+const DRAW_ORDER = [TYPE.LANE, TYPE.B, TYPE.P, TYPE.C, TYPE.F, TYPE.R];
+const FONT = 'ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
+const MONO = 'ui-monospace, SFMono-Regular, Menlo, monospace';
+
+function statusClass(s) {
+  if (s === 3 || s === 6) return "best";
+  if (s === 4 || s === 7) return "improve";
+  if (s === 8) return "worse";
+  if (s === 2 || s === 5) return "same";
+  return "fail";
+}
+const fmtInt = (x) => x == null ? "–" : Math.round(x).toLocaleString("en-US");
+function fmtShort(x) {
+  if (x == null) return "–";
+  const a = Math.abs(x);
+  if (a >= 1e6) return (x / 1e6).toFixed(a >= 1e7 ? 0 : 1) + "M";
+  if (a >= 1e4) return (x / 1e3).toFixed(a >= 1e5 ? 0 : 1) + "k";
+  return Math.round(x).toLocaleString("en-US");
+}
+function niceTicks(lo, hi, n) {
+  if (!(hi > lo)) { hi = lo + 1; }
+  const raw = (hi - lo) / Math.max(1, n);
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const step = [1, 2, 2.5, 5, 10].map(m => m * mag).find(s => s >= raw) || 10 * mag;
+  const out = [];
+  for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-9; v += step) out.push(+v.toFixed(10));
+  return out;
+}
+const lerp = (a, b, t) => a + (b - a) * t;
+const ease = (t) => t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+
+// ---------------------------------------------------------------- data
+let TRACE = null, RUN = null;
+
+function prepRun(raw) {
+  const v = raw.vars, nV = v.t.length, nF = raw.nIters + 1;
+  const R = {
+    raw, nV, nF, nIters: raw.nIters,
+    t: Int8Array.from(v.t), s: Int16Array.from(v.s), o: Int32Array.from(v.o),
+    k: Int32Array.from(v.k), e: Int16Array.from(v.e), l: Int8Array.from(v.l),
+    deltas: raw.deltas.map(a => Int32Array.from(a)),
+    freed: raw.freed.map(a => Int32Array.from(a)),
+  };
+  // stations / lanes
+  const st = new Set(); let L = 1;
+  for (let i = 0; i < nV; i++) { st.add(R.s[i]); if (R.t[i] === TYPE.LANE) L = Math.max(L, R.l[i] + 1); }
+  R.stations = [...st].filter(x => x >= 0).sort((a, b) => a - b);
+  R.L = L;
+  // C -> candidate order-lane variables
+  const laneVars = new Map();
+  for (let i = 0; i < nV; i++) if (R.t[i] === TYPE.LANE) {
+    const key = R.o[i] * 4096 + R.s[i];
+    if (!laneVars.has(key)) laneVars.set(key, []);
+    laneVars.get(key).push(i);
+  }
+  R.cLane = new Array(nV);
+  for (let i = 0; i < nV; i++) if (R.t[i] === TYPE.C) R.cLane[i] = laneVars.get(R.o[i] * 4096 + R.s[i]) || [];
+  // robot moves
+  const rv = [];
+  for (let i = 0; i < nV; i++) if (R.t[i] === TYPE.F || R.t[i] === TYPE.R) rv.push(i);
+  R.robotVars = Int32Array.from(rv);
+  R.byType = DRAW_ORDER.map(() => []);
+  for (let i = 0; i < nV; i++) R.byType[DRAW_ORDER.indexOf(R.t[i])].push(i);
+  R.robotPos = new Int32Array(nV).fill(-1);
+  rv.forEach((vi, j) => R.robotPos[vi] = j);
+  const nR = rv.length;
+  R.robotLane = new Int16Array(nF * nR);
+  // replay once: keyframes + stable robot lanes + per-frame counts
+  const S = new Int32Array(nV), E = new Int32Array(nV);
+  for (let i = 0; i < nV; i++) { S[i] = raw.init[2 * i]; E[i] = raw.init[2 * i + 1]; }
+  R.keyS = []; R.keyE = [];
+  const prev = new Int16Array(nR).fill(-1), cur = new Int16Array(nR);
+  let maxLanes = 1;
+  R.changed = new Int32Array(nF); R.freedCount = new Int32Array(nF);
+  for (let f = 0; f < nF; f++) {
+    if (f > 0) {
+      const d = R.deltas[f - 1];
+      for (let j = 0; j < d.length; j += 3) { S[d[j]] = d[j + 1]; E[d[j]] = d[j + 2]; }
+      R.changed[f] = d.length / 3;
+      const fr = R.freed[f - 1]; let c = 0;
+      for (let j = 1; j < fr.length; j += 2) c += fr[j];
+      R.freedCount[f] = c;
+    }
+    if (f % KEY_EVERY === 0) { R.keyS.push(S.slice()); R.keyE.push(E.slice()); }
+    const n = packRobots(R, S, E, prev, cur);
+    maxLanes = Math.max(maxLanes, n);
+    R.robotLane.set(cur, f * nR);
+    prev.set(cur);
+  }
+  R.maxLanes = maxLanes;
+  R.cache = new Map();
+  R.freedCache = new Map();
+  R.histCache = new Map();
+  // KPI series per frame (frame 0 = replayed initial state)
+  const k = raw.kpi, rp = raw.replay;
+  const series = (cur, best, rep) => {
+    const c = [rep[0]], b = [rep[0]];
+    for (let i = 0; i < raw.nIters; i++) {
+      c.push(cur && cur[i] != null ? cur[i] : rep[i + 1]);
+      b.push(best && best[i] != null ? best[i] : null);
+    }
+    return { cur: c, best: b, rep };
+  };
+  R.kpi = {
+    makespan: series(k.makespan, k.best_makespan, rp.makespan),
+    fetches: series(k.fetches, k.best_fetches, rp.fetches),
+    flow: series(k.flow, k.best_flow, rp.flow),
+  };
+  R.cpRef = raw.cpRef ? [null, ...raw.cpRef] : null;
+  R.timeAt = [0, ...raw.timeCum];
+  R.mismatch = raw.mismatch || {};
+  R.mismatchSet = {};
+  for (const key in R.mismatch) R.mismatchSet[key] = new Set(R.mismatch[key]);
+  R.horizon = 1;
+  for (let i = 0; i < nV; i++) R.horizon = Math.max(R.horizon, raw.init[2 * i + 1]);
+  for (const d of R.deltas) for (let j = 0; j < d.length; j += 3) R.horizon = Math.max(R.horizon, d[j + 2]);
+  return R;
+}
+
+function packRobots(R, S, E, prev, out) {
+  const rv = R.robotVars, items = [];
+  for (let j = 0; j < rv.length; j++) { if (S[rv[j]] >= 0) items.push(j); else out[j] = -1; }
+  items.sort((a, b) => (S[rv[a]] - S[rv[b]]) || (E[rv[a]] - E[rv[b]]));
+  const laneEnd = [];
+  for (const j of items) {
+    const s = S[rv[j]], p = prev[j];
+    let lane = -1;
+    if (p >= 0) {
+      while (laneEnd.length <= p) laneEnd.push(-Infinity);
+      if (laneEnd[p] <= s) lane = p;
+    }
+    if (lane < 0) {
+      for (let l = 0; l < laneEnd.length; l++) if (laneEnd[l] <= s) { lane = l; break; }
+      if (lane < 0) { lane = laneEnd.length; laneEnd.push(-Infinity); }
+    }
+    laneEnd[lane] = E[rv[j]];
+    out[j] = lane;
+  }
+  return laneEnd.length;
+}
+
+function getState(f) {
+  const R = RUN;
+  if (R.cache.has(f)) return R.cache.get(f);
+  const kf = Math.floor(f / KEY_EVERY);
+  const S = R.keyS[kf].slice(), E = R.keyE[kf].slice();
+  for (let g = kf * KEY_EVERY; g < f; g++) {
+    const d = R.deltas[g];
+    for (let j = 0; j < d.length; j += 3) { S[d[j]] = d[j + 1]; E[d[j]] = d[j + 2]; }
+  }
+  const st = { S, E };
+  R.cache.set(f, st);
+  if (R.cache.size > 6) R.cache.delete(R.cache.keys().next().value);
+  return st;
+}
+
+// 0 = frozen, 1 = freed, 2 = changed; null at frame 0 (nothing frozen yet)
+function getMask(f) {
+  const R = RUN;
+  if (f <= 0) return null;
+  if (R.freedCache.has(f)) return R.freedCache.get(f);
+  const m = new Uint8Array(R.nV), fr = R.freed[f - 1], d = R.deltas[f - 1];
+  for (let j = 0; j < fr.length; j += 2) m.fill(1, fr[j], fr[j] + fr[j + 1]);
+  for (let j = 0; j < d.length; j += 3) m[d[j]] = 2;
+  R.freedCache.set(f, m);
+  if (R.freedCache.size > 6) R.freedCache.delete(R.freedCache.keys().next().value);
+  return m;
+}
+
+function varHistory(vi) {
+  const R = RUN;
+  if (R.histCache.has(vi)) return R.histCache.get(vi);
+  let freed = 0, moved = 0;
+  for (let it = 0; it < R.nIters; it++) {
+    const fr = R.freed[it];
+    let lo = 0, hi = fr.length / 2 - 1, hit = false;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1, a = fr[2 * mid], n = fr[2 * mid + 1];
+      if (vi < a) hi = mid - 1; else if (vi >= a + n) lo = mid + 1; else { hit = true; break; }
+    }
+    if (hit) freed++;
+    const d = R.deltas[it];
+    for (let j = 0; j < d.length; j += 3) if (d[j] === vi) { moved++; break; }
+  }
+  const h = { freed, moved };
+  R.histCache.set(vi, h);
+  return h;
+}
+
+function varName(vi) {
+  const R = RUN, t = R.t[vi];
+  switch (t) {
+    case TYPE.LANE: return `I_os_lane[${R.o[vi]},${R.s[vi]},${R.l[vi]}]`;
+    case TYPE.C: return `C[${R.o[vi]},${R.k[vi]},${R.s[vi]}]`;
+    case TYPE.P: return `P[${R.o[vi]},${R.s[vi]},${R.k[vi]},${R.e[vi]}]`;
+    default: return `${TYPE_NAME[t]}[${R.s[vi]},${R.k[vi]},${R.e[vi]}]`;
+  }
+}
+
+// ---------------------------------------------------------------- view state
+const view = {
+  f: 0, fromF: 0, t: 1, playing: false,
+  x0: 0, x1: 1, station: "all", robots: "lanes",
+  highlight: true, ghost: true, tween: true, skip: false, kpiX: "iter",
+  hover: null, kpiHover: null,
+};
+
+// ---------------------------------------------------------------- layout
+function computeLayout(W, H) {
+  const pad = 12, hudH = 58;
+  const side = W >= 980;
+  let g, k;
+  if (side) {
+    const kw = clamp(W * 0.27, 290, 470);
+    g = { x: pad, y: hudH, w: W - kw - pad * 3, h: H - hudH - pad };
+    k = { x: W - kw - pad, y: hudH, w: kw, h: H - hudH - pad };
+  } else {
+    const kh = clamp(H * 0.38, 250, 420);
+    g = { x: pad, y: hudH, w: W - 2 * pad, h: H - hudH - kh - pad * 2 };
+    k = { x: pad, y: H - kh - pad, w: W - 2 * pad, h: kh };
+  }
+  const labelW = 70, axisH = 20, legendH = 24;
+  const plot = { x: g.x + labelW, y: g.y + 8, w: g.w - labelW - 10, h: g.h - axisH - legendH - 12 };
+  return { W, H, hudH, g, k, plot, axisH, legendH, side, rows: buildRows(plot) };
+}
+
+function buildRows(plot) {
+  const R = RUN, rows = [];
+  const stations = view.station === "all" ? R.stations : [ +view.station ];
+  const groups = [];
+  let w = 0;
+  stations.forEach((s, gi) => {
+    if (gi > 0) w += 0.6;
+    const start = w;
+    for (let l = 0; l < R.L; l++) { rows.push({ kind: "lane", s, l, label: `L${l}`, w0: w, wt: 1 }); w += 1; }
+    rows.push({ kind: "pick", s, label: "Pick", w0: w, wt: 1 }); w += 1;
+    rows.push({ kind: "bin", s, label: "Bin", w0: w, wt: 1 }); w += 1;
+    groups.push({ label: `S${s}`, w0: start, w1: w });
+  });
+  let robotRows = 0;
+  if (view.robots !== "hide") {
+    const stationW = w;
+    w += 0.8;
+    const start = w;
+    // robot block: ~35% of the plot for all stations, capped relative to a single station
+    const total = Math.max(stationW * 0.55, Math.min(R.maxLanes * 0.3, stationW * 1.4));
+    if (view.robots === "lanes") {
+      robotRows = R.maxLanes;
+      const wt = total / R.maxLanes;
+      for (let l = 0; l < R.maxLanes; l++) { rows.push({ kind: "robot", l, label: l % 5 === 0 ? `${l}` : "", w0: w, wt }); w += wt; }
+    } else {
+      rows.push({ kind: "load", label: "", w0: w, wt: total * 0.8 }); w += total * 0.8;
+    }
+    groups.push({ label: "Robots", w0: start, w1: w });
+  }
+  const scale = plot.h / Math.max(1, w);
+  for (const r of rows) { r.y = plot.y + r.w0 * scale; r.h = r.wt * scale; }
+  for (const gr of groups) { gr.y0 = plot.y + gr.w0 * scale; gr.y1 = plot.y + gr.w1 * scale; }
+  const stationBase = new Map(), robotBase = rows.findIndex(r => r.kind === "robot");
+  rows.forEach((r, i) => { if (r.kind === "lane" && r.l === 0) stationBase.set(r.s, i); });
+  return { rows, groups, stationBase, robotBase, loadRow: rows.find(r => r.kind === "load") || null, robotRows };
+}
+
+// row index of variable vi in a given state/frame; -1 = not drawn
+function rowOf(vi, st, f, L) {
+  const R = RUN, t = R.t[vi], base = L.rows.stationBase.get(R.s[vi]);
+  if (t === TYPE.F || t === TYPE.R) {
+    if (L.rows.robotBase < 0) return -1;
+    const lane = R.robotLane[f * R.robotVars.length + R.robotPos[vi]];
+    return lane < 0 ? -1 : L.rows.robotBase + lane;
+  }
+  if (base === undefined) return -1;
+  if (t === TYPE.LANE) return base + R.l[vi];
+  if (t === TYPE.P) return base + R.L;
+  if (t === TYPE.B) return base + R.L + 1;
+  if (t === TYPE.C) {
+    for (const lv of R.cLane[vi]) if (st.S[lv] >= 0) return base + R.l[lv];
+    return base;
+  }
+  return -1;
+}
+
+// ---------------------------------------------------------------- rendering
+let hitRows = null; // per row: arrays of [x0, x1, vi]
+let LAYOUT = null;
+
+function render(ctx, W, H, opts = {}) {
+  const R = RUN;
+  const L = computeLayout(W, H);
+  if (!opts.offscreen) { LAYOUT = L; hitRows = L.rows.rows.map(() => []); }
+  ctx.fillStyle = BG; ctx.fillRect(0, 0, W, H);
+  const f = view.f, fromF = view.fromF, t = view.tween ? ease(view.t) : 1;
+  drawHud(ctx, L, f);
+  drawGantt(ctx, L, f, fromF, t, opts);
+  drawKpis(ctx, L, f, fromF, t);
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+
+function drawHud(ctx, L, f) {
+  const R = RUN, it = f - 1;
+  ctx.textBaseline = "middle";
+  const y1 = 20, y2 = 43;
+  ctx.fillStyle = INK; ctx.font = `600 17px ${FONT}`; ctx.textAlign = "left";
+  const iterTxt = f === 0 ? `Initial solution` : `Iteration ${f} / ${R.nIters}`;
+  ctx.fillText(iterTxt, 14, y1);
+  let x = 14 + ctx.measureText(iterTxt).width + 14;
+  ctx.font = `13px ${FONT}`; ctx.fillStyle = MUTED;
+  const tTxt = `t = ${R.timeAt[f].toFixed(1)} s   ·   run ${R.raw.runId}`;
+  ctx.fillText(tTxt, x, y1 + 1);
+  ctx.textAlign = "right";
+  ctx.fillText(`${TRACE.instance}  ·  ${TRACE.experiment}`, L.W - 14, y1 + 1);
+  ctx.textAlign = "left";
+  // chips
+  x = 14;
+  const chip = (label, value, color) => {
+    ctx.font = `12px ${FONT}`;
+    const lw = ctx.measureText(label).width;
+    ctx.font = `600 12px ${FONT}`;
+    const vw = ctx.measureText(value).width;
+    const w = lw + vw + (color ? 30 : 18);
+    if (x + w > L.W - 10) return;
+    ctx.fillStyle = PANEL; roundRect(ctx, x, y2 - 11, w, 22, 11); ctx.fill();
+    ctx.strokeStyle = "#e5e7eb"; ctx.lineWidth = 1; ctx.stroke();
+    let cx = x + 9;
+    if (color) { ctx.fillStyle = color; ctx.beginPath(); ctx.arc(cx + 4, y2, 4, 0, 7); ctx.fill(); cx += 12; }
+    ctx.fillStyle = MUTED; ctx.font = `12px ${FONT}`; ctx.fillText(label, cx, y2);
+    ctx.fillStyle = INK; ctx.font = `600 12px ${FONT}`; ctx.fillText(value, cx + lw + 4, y2);
+    x += w + 8;
+  };
+  if (f === 0) {
+    chip("Strategy", "–"); chip("Status", "–");
+  } else {
+    const sname = TRACE.strategyNames[R.raw.strategies[it]] || `strategy ${R.raw.strategies[it]}`;
+    const s = R.raw.statuses[it], sc = statusClass(s);
+    chip("Strategy", sname.replace(/_/g, " "));
+    chip("Status", (TRACE.statusNames[s] || "?").replace(/_/g, " "), STATUS_COLOR[sc]);
+    if (R.raw.cpObj[it]) chip("Objective", R.raw.cpObj[it].replace(/_/g, " "));
+    chip("Freed", `${fmtInt(R.freedCount[f])} (${(100 * R.freedCount[f] / R.nV).toFixed(1)}%)`);
+    chip("Changed", fmtInt(R.changed[f]));
+    if (R.raw.iterTime[it] != null) chip("Iter time", `${R.raw.iterTime[it].toFixed(2)} s`);
+  }
+}
+
+function drawGantt(ctx, L, f, fromF, t, opts) {
+  const R = RUN, P = L.plot, g = L.g;
+  ctx.fillStyle = PANEL; roundRect(ctx, g.x, g.y, g.w, g.h, 8); ctx.fill();
+  ctx.strokeStyle = "#e5e7eb"; ctx.lineWidth = 1; ctx.stroke();
+  const x0 = view.x0, x1 = view.x1, sx = P.w / (x1 - x0);
+  const X = (tm) => P.x + (tm - x0) * sx;
+  const rows = L.rows.rows;
+  // row bands + labels
+  ctx.save();
+  for (const gr of L.rows.groups) {
+    ctx.fillStyle = "#f9fafb"; ctx.fillRect(P.x, gr.y0, P.w, gr.y1 - gr.y0);
+    ctx.fillStyle = INK; ctx.font = `600 ${clamp((gr.y1 - gr.y0) * 0.28, 9, 13)}px ${FONT}`;
+    ctx.textAlign = "left"; ctx.textBaseline = "middle";
+    ctx.fillText(gr.label, g.x + 8, (gr.y0 + gr.y1) / 2);
+  }
+  ctx.font = `${clamp(rows.length ? rows[0].h * 0.6 : 9, 7, 10)}px ${FONT}`; ctx.fillStyle = MUTED; ctx.textAlign = "right";
+  for (const r of rows) {
+    if (r.label && r.h >= 6) ctx.fillText(r.label, P.x - 6, r.y + r.h / 2);
+    if (r.kind !== "robot") { ctx.strokeStyle = GRID; ctx.beginPath(); ctx.moveTo(P.x, r.y + r.h + 0.5); ctx.lineTo(P.x + P.w, r.y + r.h + 0.5); ctx.stroke(); }
+  }
+  // time grid
+  const ticks = niceTicks(x0, x1, Math.max(3, Math.floor(P.w / 90)));
+  ctx.strokeStyle = GRID; ctx.fillStyle = MUTED; ctx.textAlign = "center"; ctx.textBaseline = "top"; ctx.font = `10px ${FONT}`;
+  for (const tk of ticks) {
+    const x = Math.round(X(tk)) + 0.5;
+    if (x < P.x - 1 || x > P.x + P.w + 1) continue;
+    ctx.beginPath(); ctx.moveTo(x, P.y); ctx.lineTo(x, P.y + P.h); ctx.stroke();
+    ctx.fillText(fmtInt(tk), x, P.y + P.h + 5);
+  }
+  ctx.restore();
+
+  // clip to plot
+  ctx.save();
+  ctx.beginPath(); ctx.rect(P.x, P.y - 2, P.w, P.h + 4); ctx.clip();
+  const B = getState(f), A = fromF !== f ? getState(fromF) : B;
+  const mask = view.highlight ? getMask(f) : null;
+  const ghostSrc = view.ghost && f > 0 ? getState(f - 1) : null;
+  const ghostF = f - 1;
+  const order = DRAW_ORDER, byType = R.byType;
+  const robotsAsLoad = view.robots !== "lanes";
+  const onlyStation = view.station === "all" ? -1 : +view.station;
+  const outlines = [], ghosts = [];
+
+  const geom = (vi, st, ff) => {
+    if (st.S[vi] < 0) return null;
+    const ri = rowOf(vi, st, ff, L);
+    if (ri < 0) return null;
+    return [st.S[vi], st.E[vi], ri];
+  };
+  const rect = (tp, s, e, ri) => {
+    const r = rows[ri] || rows[Math.round(ri)];
+    if (!r) return null;
+    const y0 = rows[Math.floor(ri)], y1 = rows[Math.ceil(ri)] || y0;
+    const fy = ri - Math.floor(ri);
+    const ry = lerp(y0.y, y1.y, fy), rh = lerp(y0.h, y1.h, fy);
+    let y, h;
+    if (tp === TYPE.C) { h = Math.max(1, rh * 0.22); y = ry + rh * 0.72; }
+    else if (tp === TYPE.LANE) { h = rh * 0.74; y = ry + rh * 0.13; }
+    else { h = Math.max(1, rh * (tp >= TYPE.F ? 0.8 : 0.7)); y = ry + (rh - h) / 2; }
+    let xa = X(s), xb = X(e);
+    if (xb - xa < 1) xb = xa + 1;
+    return [xa, y, xb - xa, h];
+  };
+
+  for (let oi = 0; oi < order.length; oi++) {
+    const tp = order[oi];
+    if ((tp === TYPE.F || tp === TYPE.R) && robotsAsLoad) continue;
+    const list = byType[oi];
+    for (let pass = 0; pass < 2; pass++) { // pass 0: faded (frozen), pass 1: active
+      ctx.fillStyle = TYPE_COLOR[tp];
+      ctx.globalAlpha = pass === 0 ? 0.2 : (tp === TYPE.LANE ? 0.85 : 1);
+      const isRobot = tp === TYPE.F || tp === TYPE.R;
+      for (const vi of list) {
+        let m = mask ? mask[vi] : 1;
+        if (isRobot && onlyStation >= 0 && R.s[vi] !== onlyStation) m = 0; // other stations' moves: dimmed
+        if ((m === 0) !== (pass === 0)) continue;
+        const gb = geom(vi, B, f);
+        const ga = A === B ? gb : geom(vi, A, fromF);
+        if (!gb && !ga) continue;
+        let s, e, ri, alpha = 1;
+        if (gb && ga) { s = lerp(ga[0], gb[0], t); e = lerp(ga[1], gb[1], t); ri = lerp(ga[2], gb[2], t); }
+        else if (gb) { [s, e, ri] = gb; alpha = t; }
+        else { [s, e, ri] = ga; alpha = 1 - t; }
+        if (e < x0 || s > x1) continue;
+        const rc = rect(tp, s, e, ri);
+        if (!rc) continue;
+        if (alpha < 1) { const ga0 = ctx.globalAlpha; ctx.globalAlpha = ga0 * alpha; ctx.fillRect(rc[0], rc[1], rc[2], rc[3]); ctx.globalAlpha = ga0; }
+        else ctx.fillRect(rc[0], rc[1], rc[2], rc[3]);
+        if (m === 2 && mask) outlines.push(rc);
+        if (hitRows && gb && Number.isInteger(ri)) hitRows[ri].push([rc[0], rc[0] + rc[2], vi, rc[1], rc[1] + rc[3]]);
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+  // ghosts: previous positions of changed variables
+  if (ghostSrc) {
+    const d = R.deltas[f - 1];
+    ctx.setLineDash([3, 2]); ctx.strokeStyle = "rgba(17,24,39,0.55)"; ctx.lineWidth = 1;
+    for (let j = 0; j < d.length; j += 3) {
+      const vi = d[j], tp = R.t[vi];
+      if ((tp === TYPE.F || tp === TYPE.R) && robotsAsLoad) continue;
+      const ga = geom(vi, ghostSrc, ghostF);
+      if (!ga) continue;
+      const gb = geom(vi, B, f);
+      if (gb && gb[0] === ga[0] && gb[1] === ga[1] && gb[2] === ga[2]) continue;
+      const rc = rect(tp, ga[0], ga[1], ga[2]);
+      if (!rc) continue;
+      ctx.globalAlpha = view.tween ? t : 1;
+      ctx.strokeRect(rc[0] + 0.5, rc[1] + 0.5, Math.max(1, rc[2] - 1), Math.max(1, rc[3] - 1));
+    }
+    ctx.setLineDash([]); ctx.globalAlpha = 1;
+  }
+  // outlines for changed variables
+  ctx.strokeStyle = INK; ctx.lineWidth = 1;
+  for (const rc of outlines) ctx.strokeRect(rc[0] + 0.5, rc[1] + 0.5, Math.max(1, rc[2] - 1), Math.max(1, rc[3] - 1));
+
+  // robot load curve
+  if (L.rows.loadRow) drawLoad(ctx, L.rows.loadRow, P, X, A, B, t);
+
+  // makespan marker
+  const msA = R.kpi.makespan.rep[fromF], msB = R.kpi.makespan.rep[f];
+  if (msB != null) {
+    const ms = lerp(msA ?? msB, msB, t), x = Math.round(X(ms)) + 0.5;
+    ctx.strokeStyle = INK; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.moveTo(x, P.y); ctx.lineTo(x, P.y + P.h); ctx.stroke(); ctx.setLineDash([]);
+    ctx.font = `600 11px ${FONT}`; ctx.textBaseline = "top";
+    const txt = `C = ${fmtInt(ms)}`, tw = ctx.measureText(txt).width;
+    const lx = x + 4 + tw > P.x + P.w ? x - tw - 4 : x + 4;
+    ctx.fillStyle = "rgba(255,255,255,0.85)"; ctx.fillRect(lx - 2, P.y + 1, tw + 4, 15);
+    ctx.fillStyle = INK; ctx.textAlign = "left"; ctx.fillText(txt, lx, P.y + 3);
+  }
+  ctx.restore();
+
+  // legend
+  ctx.save();
+  let lx = g.x + 12; const ly = g.y + g.h - L.legendH / 2 - 4;
+  ctx.font = `11px ${FONT}`; ctx.textBaseline = "middle"; ctx.textAlign = "left";
+  for (let tp = 0; tp < 6; tp++) {
+    ctx.fillStyle = TYPE_COLOR[tp]; ctx.fillRect(lx, ly - 5, 14, tp === TYPE.C ? 3 : 10);
+    ctx.fillStyle = INK; ctx.fillText(TYPE_LABEL[tp], lx + 18, ly);
+    lx += 24 + ctx.measureText(TYPE_LABEL[tp]).width;
+  }
+  lx += 10;
+  const key = (draw, label) => {
+    if (lx + 120 > g.x + g.w) return;
+    draw(lx, ly); ctx.fillStyle = MUTED; ctx.fillText(label, lx + 18, ly); lx += 26 + ctx.measureText(label).width;
+  };
+  key((x, y) => { ctx.globalAlpha = 0.2; ctx.fillStyle = TYPE_COLOR[2]; ctx.fillRect(x, y - 5, 14, 10); ctx.globalAlpha = 1; }, "frozen");
+  key((x, y) => { ctx.fillStyle = TYPE_COLOR[2]; ctx.fillRect(x, y - 5, 14, 10); }, "freed");
+  key((x, y) => { ctx.fillStyle = TYPE_COLOR[2]; ctx.fillRect(x, y - 5, 14, 10); ctx.strokeStyle = INK; ctx.strokeRect(x + 0.5, y - 4.5, 13, 9); }, "changed");
+  key((x, y) => { ctx.setLineDash([3, 2]); ctx.strokeStyle = "rgba(17,24,39,.6)"; ctx.strokeRect(x + 0.5, y - 4.5, 13, 9); ctx.setLineDash([]); }, "previous position");
+  ctx.restore();
+}
+
+function drawLoad(ctx, row, P, X, A, B, t) {
+  const R = RUN, mc = TRACE.instanceMeta && TRACE.instanceMeta.movecap;
+  const curve = (st) => {
+    const ev = [];
+    for (const vi of R.robotVars) if (st.S[vi] >= 0) { ev.push([st.S[vi], 1]); ev.push([st.E[vi], -1]); }
+    ev.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+    const pts = []; let c = 0, peak = 0;
+    for (const [tm, dlt] of ev) { c += dlt; pts.push([tm, c]); peak = Math.max(peak, c); }
+    return { pts, peak };
+  };
+  const cb = curve(B), ca = A === B ? null : curve(A);
+  const ymax = Math.max(mc || 0, cb.peak, ca ? ca.peak : 0) * 1.08 || 1;
+  const Y = (v) => row.y + row.h - (v / ymax) * (row.h - 4);
+  const path = (pts) => {
+    ctx.beginPath(); ctx.moveTo(P.x, Y(0)); let last = 0;
+    for (const [tm, c] of pts) { const x = X(tm); ctx.lineTo(x, Y(last)); ctx.lineTo(x, Y(c)); last = c; }
+    ctx.lineTo(P.x + P.w, Y(last));
+  };
+  if (ca && t < 1) { path(ca.pts); ctx.strokeStyle = "rgba(17,24,39,.35)"; ctx.setLineDash([3, 2]); ctx.stroke(); ctx.setLineDash([]); }
+  path(cb.pts); ctx.lineTo(P.x + P.w, Y(0)); ctx.closePath();
+  ctx.fillStyle = "rgba(255,140,0,0.25)"; ctx.fill();
+  path(cb.pts); ctx.strokeStyle = TYPE_COLOR[TYPE.F]; ctx.lineWidth = 1.2; ctx.stroke();
+  if (mc) {
+    ctx.strokeStyle = "#dc2626"; ctx.setLineDash([6, 3]); ctx.beginPath(); ctx.moveTo(P.x, Y(mc)); ctx.lineTo(P.x + P.w, Y(mc)); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = "#dc2626"; ctx.font = `10px ${FONT}`; ctx.textAlign = "left"; ctx.textBaseline = "bottom";
+    ctx.fillText(`movecap ${mc}`, P.x + 4, Y(mc) - 1);
+  }
+  ctx.fillStyle = MUTED; ctx.font = `10px ${FONT}`; ctx.textAlign = "right"; ctx.textBaseline = "middle";
+  ctx.fillText(`${cb.peak}`, P.x - 6, Y(cb.peak)); ctx.fillText("0", P.x - 6, Y(0) - 4);
+}
+
+function kpiCharts(L) {
+  const k = L.k, R = RUN;
+  const specs = [
+    { key: "makespan", title: "Makespan", color: TYPE_COLOR[TYPE.P], wt: 1 },
+    { key: "fetches", title: "Bin fetches", color: "#d97706", wt: 1 },
+    { key: "flow", title: "Total flow time", color: TYPE_COLOR[TYPE.LANE], wt: 1 },
+    { key: "nbh", title: "Neighbourhood: freed / changed vars", color: "#334155", wt: 0.8 },
+  ];
+  const gap = 10, tot = specs.reduce((a, s) => a + s.wt, 0);
+  let y = k.y;
+  const avail = k.h - gap * (specs.length - 1);
+  return specs.map(s => {
+    const h = avail * s.wt / tot;
+    const box = { x: k.x, y, w: k.w, h };
+    y += h + gap;
+    const plot = { x: box.x + 46, y: box.y + 26, w: box.w - 58, h: box.h - 36 };
+    return { ...s, box, plot };
+  });
+}
+
+function kpiX(f) { return view.kpiX === "time" ? RUN.timeAt[f] : f; }
+
+function drawKpis(ctx, L, f, fromF, t) {
+  const R = RUN, charts = kpiCharts(L);
+  L.kpiCharts = charts;
+  const xmax = view.kpiX === "time" ? R.timeAt[R.nF - 1] || 1 : R.nF - 1 || 1;
+  const fc = lerp(fromF, f, t);
+  for (const c of charts) {
+    const b = c.box, P = c.plot;
+    ctx.fillStyle = PANEL; roundRect(ctx, b.x, b.y, b.w, b.h, 8); ctx.fill();
+    ctx.strokeStyle = "#e5e7eb"; ctx.lineWidth = 1; ctx.stroke();
+    const X = (x) => P.x + (x / xmax) * P.w;
+    let vals = [], lo = Infinity, hi = -Infinity;
+    if (c.key === "nbh") {
+      lo = 0; hi = 1;
+      for (let i = 1; i < R.nF; i++) hi = Math.max(hi, R.freedCount[i]);
+    } else {
+      const s = R.kpi[c.key];
+      for (const arr of [s.cur, s.best, c.key === "makespan" && R.cpRef ? R.cpRef : []])
+        for (const v of arr) if (v != null) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
+      if (!isFinite(lo)) { lo = 0; hi = 1; }
+      const padv = (hi - lo) * 0.08 || 1; lo -= padv; hi += padv;
+    }
+    const Y = (v) => P.y + P.h - ((v - lo) / (hi - lo)) * P.h;
+    // grid
+    ctx.font = `10px ${FONT}`; ctx.fillStyle = MUTED; ctx.textAlign = "right"; ctx.textBaseline = "middle";
+    for (const tk of niceTicks(lo, hi, 3)) {
+      const y = Math.round(Y(tk)) + 0.5;
+      ctx.strokeStyle = GRID; ctx.beginPath(); ctx.moveTo(P.x, y); ctx.lineTo(P.x + P.w, y); ctx.stroke();
+      ctx.fillText(fmtShort(tk), P.x - 5, y);
+    }
+    ctx.strokeStyle = "#d1d5db"; ctx.beginPath(); ctx.moveTo(P.x, P.y + P.h + 0.5); ctx.lineTo(P.x + P.w, P.y + P.h + 0.5); ctx.stroke();
+    // x labels
+    ctx.textAlign = "center"; ctx.textBaseline = "top";
+    for (const tk of niceTicks(0, xmax, 4)) ctx.fillText(view.kpiX === "time" ? `${fmtShort(tk)}s` : fmtShort(tk), X(tk), P.y + P.h + 2);
+
+    if (c.key === "nbh") {
+      const bw = Math.max(1, P.w / R.nF * 0.8);
+      for (let i = 1; i < R.nF; i++) {
+        const x = X(kpiX(i));
+        ctx.fillStyle = "#e2e8f0"; ctx.fillRect(x - bw / 2, Y(R.freedCount[i]), bw, Y(0) - Y(R.freedCount[i]));
+        ctx.fillStyle = "#334155";
+        ctx.fillRect(x - bw / 2, Y(R.changed[i]), bw, Y(0) - Y(R.changed[i]));
+      }
+    } else {
+      const s = R.kpi[c.key];
+      // CP reference
+      if (c.key === "makespan" && R.cpRef) {
+        ctx.strokeStyle = "#166534"; ctx.setLineDash([5, 3]); ctx.lineWidth = 1.3; ctx.beginPath(); let on = false;
+        for (let i = 0; i < R.nF; i++) { const v = R.cpRef[i]; if (v == null) { on = false; continue; } const x = X(kpiX(i)), y = Y(v); on ? ctx.lineTo(x, y) : ctx.moveTo(x, y); on = true; }
+        ctx.stroke(); ctx.setLineDash([]);
+      }
+      // best (step)
+      ctx.strokeStyle = STATUS_COLOR.best; ctx.lineWidth = 1.2; ctx.beginPath(); let on = false, lastY = null;
+      for (let i = 0; i < R.nF; i++) {
+        const v = i === 0 ? s.cur[0] : s.best[i]; if (v == null) continue;
+        const x = X(kpiX(i)), y = Y(v);
+        if (!on) { ctx.moveTo(x, y); on = true; } else { ctx.lineTo(x, lastY); ctx.lineTo(x, y); }
+        lastY = y;
+      }
+      ctx.stroke();
+      // current
+      ctx.strokeStyle = c.color; ctx.lineWidth = 1.4; ctx.globalAlpha = 0.85; ctx.beginPath(); on = false;
+      for (let i = 0; i < R.nF; i++) { const v = s.cur[i]; if (v == null) continue; const x = X(kpiX(i)), y = Y(v); on ? ctx.lineTo(x, y) : ctx.moveTo(x, y); on = true; }
+      ctx.stroke(); ctx.globalAlpha = 1;
+      // status dots for improvements
+      const rr = R.nF > 400 ? 1.6 : 2.4;
+      for (let i = 1; i < R.nF; i++) {
+        const sc = statusClass(R.raw.statuses[i - 1]); if (sc !== "best" && sc !== "improve" && sc !== "worse") continue;
+        const v = s.cur[i]; if (v == null) continue;
+        ctx.fillStyle = STATUS_COLOR[sc]; ctx.beginPath(); ctx.arc(X(kpiX(i)), Y(v), rr, 0, 7); ctx.fill();
+      }
+      // replay mismatches
+      const mm = R.mismatch[c.key] || [];
+      if (mm.length) {
+        ctx.fillStyle = "#dc2626";
+        for (const fr of mm) { const x = X(kpiX(fr)); ctx.fillRect(x - 0.75, P.y + P.h - 5, 1.5, 5); }
+      }
+    }
+    // cursor
+    const cx = X(view.kpiX === "time" ? lerp(R.timeAt[fromF], R.timeAt[f], t) : fc);
+    ctx.strokeStyle = "rgba(17,24,39,.55)"; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(cx + 0.5, P.y); ctx.lineTo(cx + 0.5, P.y + P.h); ctx.stroke();
+    // title
+    ctx.textAlign = "left"; ctx.textBaseline = "middle";
+    ctx.fillStyle = c.color; ctx.fillRect(b.x + 12, b.y + 9, 8, 8);
+    ctx.fillStyle = INK; ctx.font = `600 12px ${FONT}`;
+    ctx.fillText(c.title, b.x + 26, b.y + 13);
+    let tx = b.x + 26 + ctx.measureText(c.title).width + 10;
+    ctx.font = `12px ${MONO}`;
+    let valTxt;
+    if (c.key === "nbh") valTxt = f > 0 ? `${fmtInt(R.freedCount[f])} / ${fmtInt(R.changed[f])}` : "";
+    else {
+      const s = R.kpi[c.key], best = f === 0 ? s.cur[0] : s.best[f];
+      valTxt = `${fmtInt(s.cur[f])}` + (best != null ? `  best ${fmtInt(best)}` : "");
+      if (R.mismatchSet[c.key] && R.mismatchSet[c.key].has(f)) valTxt += `  replay ${fmtInt(s.rep[f])}`;
+    }
+    ctx.fillStyle = MUTED; ctx.textAlign = "right";
+    ctx.fillText(valTxt, b.x + b.w - 12, b.y + 13);
+    if (c.key === "makespan") drawKpiLegend(ctx, c, R);
+    if ((R.mismatch[c.key] || []).length && c.key !== "nbh") {
+      ctx.font = `10px ${FONT}`; ctx.fillStyle = "#dc2626"; ctx.textAlign = "left"; ctx.textBaseline = "bottom";
+      ctx.fillText(`▮ replay ≠ logged (${R.mismatch[c.key].length})`, P.x + 4, P.y + P.h - 6);
+    }
+  }
+}
+
+function drawKpiLegend(ctx, c, R) {
+  const P = c.plot; let x = P.x + P.w; const y = P.y + 6;
+  ctx.font = `10px ${FONT}`; ctx.textBaseline = "middle"; ctx.textAlign = "right";
+  const items = [["new best", STATUS_COLOR.best, "dot"], ["improved", STATUS_COLOR.improve, "dot"], ["accepted worse", STATUS_COLOR.worse, "dot"], ["best", STATUS_COLOR.best, "line"]];
+  if (R.cpRef) items.push(["CP (mean)", "#166534", "dash"]);
+  for (let i = items.length - 1; i >= 0; i--) {
+    const [lab, col, kind] = items[i];
+    ctx.fillStyle = MUTED; ctx.fillText(lab, x, y); x -= ctx.measureText(lab).width + 4;
+    ctx.fillStyle = col; ctx.strokeStyle = col;
+    if (kind === "dot") { ctx.beginPath(); ctx.arc(x - 3, y, 2.6, 0, 7); ctx.fill(); x -= 14; }
+    else { if (kind === "dash") ctx.setLineDash([3, 2]); ctx.lineWidth = 1.3; ctx.beginPath(); ctx.moveTo(x - 12, y); ctx.lineTo(x, y); ctx.stroke(); ctx.setLineDash([]); x -= 20; }
+  }
+}
+
+// ---------------------------------------------------------------- screen canvas
+const stage = document.getElementById("stage"), sctx = stage.getContext("2d");
+let cssW = 0, cssH = 0, dirty = true;
+function resize() {
+  const r = stage.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+  cssW = r.width; cssH = r.height;
+  stage.width = Math.round(cssW * dpr); stage.height = Math.round(cssH * dpr);
+  sctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  dirty = true;
+}
+window.addEventListener("resize", resize);
+
+// ---------------------------------------------------------------- playback
+let lastTs = 0, acc = 0;
+function nextFrame(f, dir = 1) {
+  let g = f + dir;
+  if (view.skip) while (g > 0 && g < RUN.nF - 1 && RUN.changed[g] === 0) g += dir;
+  return clamp(g, 0, RUN.nF - 1);
+}
+function goto(f, animate) {
+  f = clamp(f, 0, RUN.nF - 1);
+  if (f === view.f) return;
+  const from = view.f;
+  let fromF = f;
+  if (animate && view.tween) {
+    // forward: state(f-1) == state(from) when nothing changed in between
+    if (f > from && RUN.changed.subarray(from + 1, f).every(x => x === 0)) fromF = f - 1;
+    else if (f === from - 1) fromF = from;
+  }
+  view.fromF = fromF; view.f = f; view.t = fromF === f ? 1 : 0;
+  syncControls(); dirty = true;
+}
+function tick(ts) {
+  const dt = lastTs ? ts - lastTs : 0; lastTs = ts;
+  if (RUN && !recording) {
+    if (view.t < 1) { view.t = Math.min(1, view.t + dt / tweenMs()); dirty = true; }
+    if (view.playing) {
+      acc += dt;
+      const per = 1000 / speed();
+      if (acc >= per) {
+        acc = 0;
+        if (view.f >= RUN.nF - 1) { view.playing = false; syncControls(); }
+        else goto(nextFrame(view.f), true);
+      }
+    }
+    if (dirty) { render(sctx, cssW, cssH); dirty = false; }
+  }
+  requestAnimationFrame(tick);
+}
+const speed = () => +document.getElementById("speed").value;
+const tweenMs = () => Math.min(380, 600 / speed());
+
+// ---------------------------------------------------------------- controls
+const $ = (id) => document.getElementById(id);
+function syncControls() {
+  $("slider").value = view.f;
+  $("frameLbl").textContent = `${view.f} / ${RUN.nIters}`;
+  $("bPlay").textContent = view.playing ? "Pause" : "Play";
+  if (!view.playing) writeHash();
+}
+// shareable state in the URL: #run=2&f=57&station=3&robots=load&x=200-900
+function writeHash() {
+  const p = new URLSearchParams();
+  p.set("run", RUN.raw.runId); p.set("f", view.f);
+  if (view.station !== "all") p.set("station", view.station);
+  if (view.robots !== "lanes") p.set("robots", view.robots);
+  if (view.x0 > 1 || view.x1 < fullSpan() - 1) p.set("x", `${Math.round(view.x0)}-${Math.round(view.x1)}`);
+  try { history.replaceState(null, "", "#" + p.toString()); } catch (_) { /* file:// in some browsers */ }
+}
+function readHash(hash) {
+  const p = new URLSearchParams(hash.slice(1));
+  if (p.has("run")) { const i = TRACE.runs.findIndex(r => String(r.runId) === p.get("run")); if (i > 0) { $("runSel").value = i; selectRun(i); } }
+  if (p.has("station") && RUN.stations.includes(+p.get("station"))) { view.station = p.get("station"); $("stationSel").value = view.station; }
+  if (p.has("robots")) { view.robots = p.get("robots"); $("robotSel").value = view.robots; }
+  if (p.has("x")) { const [a, b] = p.get("x").split("-").map(Number); if (b > a) { view.x0 = a; view.x1 = b; } }
+  if (p.has("f")) { view.f = view.fromF = clamp(+p.get("f") | 0, 0, RUN.nF - 1); view.t = 1; }
+  syncControls(); dirty = true;
+}
+function nextImprovement(f) {
+  for (let g = f + 1; g < RUN.nF; g++) { const sc = statusClass(RUN.raw.statuses[g - 1]); if (sc === "best" || sc === "improve") return g; }
+  return RUN.nF - 1;
+}
+$("bPlay").onclick = () => { if (view.f >= RUN.nF - 1) goto(0, false); view.playing = !view.playing; acc = 1e9; syncControls(); };
+$("bPrev").onclick = () => { view.playing = false; goto(nextFrame(view.f, -1), true); };
+$("bNext").onclick = () => { view.playing = false; goto(nextFrame(view.f, 1), true); };
+$("bFirst").onclick = () => { view.playing = false; goto(0, false); };
+$("bNextImp").onclick = () => { view.playing = false; goto(nextImprovement(view.f), true); };
+$("slider").oninput = (e) => { view.playing = false; goto(+e.target.value, false); };
+$("stationSel").onchange = (e) => { view.station = e.target.value; dirty = true; };
+$("robotSel").onchange = (e) => { view.robots = e.target.value; dirty = true; };
+$("optHighlight").onchange = (e) => { view.highlight = e.target.checked; dirty = true; };
+$("optGhost").onchange = (e) => { view.ghost = e.target.checked; dirty = true; };
+$("optTween").onchange = (e) => { view.tween = e.target.checked; dirty = true; };
+$("optSkip").onchange = (e) => { view.skip = e.target.checked; };
+$("optKpiX").onchange = (e) => { view.kpiX = e.target.value; dirty = true; };
+$("runSel").onchange = (e) => selectRun(+e.target.value);
+// keep keyboard shortcuts working after using a control (Space must not re-click a focused button)
+document.querySelectorAll("header button, header select").forEach(el =>
+  el.addEventListener(el.tagName === "SELECT" ? "change" : "click", () => el.blur()));
+document.addEventListener("click", (e) => { const m = $("viewMenu"); if (m.open && !m.contains(e.target)) m.open = false; });
+document.addEventListener("keydown", (e) => {
+  if (!RUN || recording || e.target.tagName === "INPUT" && e.target.type !== "range" && e.target.type !== "checkbox" || e.target.tagName === "SELECT") return;
+  if (e.key === " ") { e.preventDefault(); $("bPlay").click(); }
+  else if (e.key === "ArrowRight" && e.shiftKey) { e.preventDefault(); $("bNextImp").click(); }
+  else if (e.key === "ArrowRight") { e.preventDefault(); $("bNext").click(); }
+  else if (e.key === "ArrowLeft") { e.preventDefault(); $("bPrev").click(); }
+  else if (e.key === "Home") { $("bFirst").click(); }
+  else if (e.key === "End") { view.playing = false; goto(RUN.nF - 1, false); }
+});
+
+// mouse: zoom / pan / hover / KPI click
+let drag = null;
+const inRect = (x, y, r) => x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
+stage.addEventListener("wheel", (e) => {
+  if (!LAYOUT || !inRect(e.offsetX, e.offsetY, LAYOUT.g)) return;
+  e.preventDefault();
+  const P = LAYOUT.plot, span = view.x1 - view.x0;
+  if (Math.abs(e.deltaX) > Math.abs(e.deltaY) || e.shiftKey) {
+    const dx = (e.shiftKey ? e.deltaY : e.deltaX) / P.w * span;
+    panTo(view.x0 + dx);
+  } else {
+    const fx = clamp((e.offsetX - P.x) / P.w, 0, 1), at = view.x0 + fx * span;
+    const ns = clamp(span * Math.exp(e.deltaY * 0.0022), 20, fullSpan() * 1.02);
+    view.x0 = at - fx * ns; view.x1 = view.x0 + ns; panTo(view.x0);
+  }
+  dirty = true;
+}, { passive: false });
+const fullSpan = () => RUN.horizon * 1.02;
+function panTo(x0) {
+  const span = view.x1 - view.x0, lo = -span * 0.05, hi = fullSpan() - span * 0.95;
+  view.x0 = clamp(x0, lo, Math.max(lo, hi)); view.x1 = view.x0 + span; dirty = true;
+}
+function resetZoom() { view.x0 = 0; view.x1 = fullSpan(); dirty = true; }
+stage.addEventListener("mousedown", (e) => {
+  if (!LAYOUT) return;
+  if (inRect(e.offsetX, e.offsetY, LAYOUT.plot)) drag = { x: e.offsetX, x0: view.x0, moved: false };
+  else { const f = kpiFrameAt(e.offsetX, e.offsetY); if (f != null) { view.playing = false; goto(f, false); } }
+});
+window.addEventListener("mouseup", () => { drag = null; stage.style.cursor = "crosshair"; });
+stage.addEventListener("dblclick", (e) => { if (LAYOUT && inRect(e.offsetX, e.offsetY, LAYOUT.g)) resetZoom(); });
+stage.addEventListener("mousemove", (e) => {
+  if (!LAYOUT || recording) return;
+  if (drag) {
+    const dx = e.offsetX - drag.x;
+    if (Math.abs(dx) > 2) { drag.moved = true; stage.style.cursor = "grabbing"; }
+    panTo(drag.x0 - dx / LAYOUT.plot.w * (view.x1 - view.x0)); hideTip(); return;
+  }
+  const tip = hitVar(e.offsetX, e.offsetY) || hitKpi(e.offsetX, e.offsetY);
+  if (tip) showTip(e.clientX, e.clientY, tip); else hideTip();
+});
+stage.addEventListener("mouseleave", hideTip);
+
+function hitVar(x, y) {
+  if (!hitRows || !inRect(x, y, LAYOUT.plot)) return null;
+  const rows = LAYOUT.rows.rows;
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i]; if (y < r.y || y > r.y + r.h) continue;
+    let best = null;
+    for (const h of hitRows[i]) if (x >= h[0] - 1 && x <= h[1] + 1 && y >= h[3] - 1 && y <= h[4] + 1) best = h;
+    if (!best) for (const h of hitRows[i]) if (x >= h[0] - 1 && x <= h[1] + 1) best = h;
+    if (!best) return null;
+    const vi = best[2], R = RUN, st = getState(view.f), m = getMask(view.f), hist = varHistory(vi);
+    const state = m ? ["frozen", "freed", "changed"][m[vi]] : "initial";
+    let txt = `${varName(vi)}   (${TYPE_LABEL[R.t[vi]]})\n[${st.S[vi]}, ${st.E[vi]})  dur ${st.E[vi] - st.S[vi]}\nthis iteration: ${state}`;
+    if (m && m[vi] === 2 && view.f > 0) { const p = getState(view.f - 1); txt += p.S[vi] >= 0 ? `  (was [${p.S[vi]}, ${p.E[vi]}))` : "  (new)"; }
+    txt += `\nfreed in ${hist.freed} / ${R.nIters} iterations, changed in ${hist.moved}`;
+    return txt;
+  }
+  return null;
+}
+function kpiFrameAt(x, y) {
+  if (!LAYOUT || !LAYOUT.kpiCharts) return null;
+  for (const c of LAYOUT.kpiCharts) if (inRect(x, y, c.box)) {
+    const P = c.plot, fx = clamp((x - P.x) / P.w, 0, 1), R = RUN;
+    if (view.kpiX === "iter") return Math.round(fx * (R.nF - 1));
+    const tm = fx * R.timeAt[R.nF - 1];
+    let best = 0; for (let i = 0; i < R.nF; i++) if (Math.abs(R.timeAt[i] - tm) < Math.abs(R.timeAt[best] - tm)) best = i;
+    return best;
+  }
+  return null;
+}
+function hitKpi(x, y) {
+  const f = kpiFrameAt(x, y); if (f == null) return null;
+  const R = RUN, k = R.kpi;
+  if (f === 0) return `frame 0 · initial solution\nmakespan ${fmtInt(k.makespan.cur[0])} · fetches ${fmtInt(k.fetches.cur[0])} · flow ${fmtInt(k.flow.cur[0])}`;
+  const it = f - 1, sname = TRACE.strategyNames[R.raw.strategies[it]] || R.raw.strategies[it];
+  let txt = `iteration ${f}  (t = ${R.timeAt[f].toFixed(1)} s)\n${sname} → ${(TRACE.statusNames[R.raw.statuses[it]] || "?").replace(/_/g, " ")}\n`;
+  txt += `makespan ${fmtInt(k.makespan.cur[f])} · fetches ${fmtInt(k.fetches.cur[f])} · flow ${fmtInt(k.flow.cur[f])}\nfreed ${fmtInt(R.freedCount[f])} · changed ${fmtInt(R.changed[f])}`;
+  const mm = ["makespan", "fetches", "flow"].filter(key => R.mismatchSet[key] && R.mismatchSet[key].has(f));
+  if (mm.length) txt += `\n⚠ replay ≠ logged: ${mm.map(key => `${key} ${fmtInt(k[key].rep[f])} vs ${fmtInt(k[key].cur[f])}`).join(", ")}`;
+  return txt + "\nclick to jump";
+}
+const tipEl = $("tip");
+function showTip(cx, cy, txt) {
+  tipEl.textContent = txt; tipEl.style.display = "block";
+  const r = tipEl.getBoundingClientRect();
+  tipEl.style.left = (cx + 14 + r.width > innerWidth ? cx - r.width - 10 : cx + 14) + "px";
+  tipEl.style.top = (cy + 14 + r.height > innerHeight ? cy - r.height - 10 : cy + 14) + "px";
+}
+function hideTip() { tipEl.style.display = "none"; }
+
+// ---------------------------------------------------------------- PNG + video
+const VW = 1600, VH = 900; // virtual drawing size for exports
+function offscreen(w, h) {
+  const c = document.createElement("canvas"); c.width = w; c.height = h;
+  const ctx = c.getContext("2d"); ctx.setTransform(w / VW, 0, 0, h / VH, 0, 0);
+  return { c, ctx };
+}
+function download(blob, name) {
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = name;
+  document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+}
+const baseName = () => `lns_${TRACE.instance}_${TRACE.experiment}_run${RUN.raw.runId}`;
+$("bPng").onclick = () => {
+  const { c, ctx } = offscreen(VW * 2, VH * 2);
+  const t = view.t; view.t = 1; render(ctx, VW, VH, { offscreen: true }); view.t = t;
+  c.toBlob(b => download(b, `${baseName()}_f${view.f}.png`), "image/png");
+};
+
+let recording = null;
+function pickMime() {
+  if (typeof MediaRecorder === "undefined") return null;
+  for (const m of ["video/mp4;codecs=avc1.640028", "video/mp4;codecs=avc1", "video/mp4", "video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm"])
+    if (MediaRecorder.isTypeSupported(m)) return m;
+  return null;
+}
+function recFrames() {
+  const from = clamp(+$("recFrom").value | 0, 0, RUN.nF - 1), to = clamp(+$("recTo").value | 0, from, RUN.nF - 1);
+  const seq = [from];
+  for (let g = from + 1; g <= to; g++) if (!$("recSkip").checked || RUN.changed[g] > 0 || g === to) seq.push(g);
+  return seq;
+}
+function updateEst() {
+  const seq = recFrames(), sec = (seq.length - 1) * +$("recSpi").value + 2;
+  $("recEst").textContent = `${seq.length - 1} transitions → ≈ ${sec.toFixed(0)} s of video (also the time it takes to record).`;
+}
+["recFrom", "recTo", "recSpi", "recSkip"].forEach(id => $(id).addEventListener("input", updateEst));
+$("bRec").onclick = () => {
+  if (!pickMime()) { alert("This browser cannot record canvas video (MediaRecorder unsupported). Try Chrome, Edge, Firefox or Safari 14.1+."); return; }
+  view.playing = false; syncControls();
+  $("recFrom").max = $("recTo").max = RUN.nF - 1;
+  $("recFrom").value = 0; $("recTo").value = RUN.nF - 1;
+  $("recSkip").checked = view.skip || RUN.nIters > 300;
+  $("recForm").style.display = ""; $("recProg").style.display = "none"; $("recStart").style.display = "";
+  updateEst(); $("recDlg").showModal();
+};
+$("recCancel").onclick = () => { if (recording) recording.cancel = true; else $("recDlg").close(); };
+$("recStart").onclick = () => startRecording();
+
+async function startRecording() {
+  const [w, h] = $("recRes").value.split("x").map(Number), fps = +$("recFps").value, spi = +$("recSpi").value * 1000;
+  const seq = recFrames(), mime = pickMime();
+  const { c, ctx } = offscreen(w, h);
+  c.style.cssText = "position:fixed;left:0;top:0;width:2px;height:2px;opacity:0;pointer-events:none";
+  document.body.appendChild(c);
+  const stream = c.captureStream(fps);
+  const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: Math.round(w * h * fps * 0.12) });
+  const chunks = [];
+  rec.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+  const saved = { f: view.f, fromF: view.fromF, t: view.t };
+  recording = { cancel: false };
+  $("recForm").style.display = "none"; $("recProg").style.display = ""; $("recStart").style.display = "none";
+  const holdStart = 800, holdEnd = 1500;
+  const total = holdStart + (seq.length - 1) * spi + holdEnd;
+  const tweenDur = Math.min(spi * 0.7, 500);
+  view.f = view.fromF = seq[0]; view.t = 1;
+  render(ctx, VW, VH, { offscreen: true });
+  rec.start(250);
+  const t0 = performance.now();
+  await new Promise((resolve) => {
+    const step = () => {
+      if (recording.cancel) return resolve();
+      const el = performance.now() - t0;
+      if (el >= total) return resolve();
+      const k = el - holdStart;
+      if (k < 0) { view.f = view.fromF = seq[0]; view.t = 1; }
+      else {
+        const i = Math.min(seq.length - 1, Math.floor(k / spi) + 1), into = k - (i - 1) * spi;
+        if (i <= seq.length - 1 && k < (seq.length - 1) * spi) {
+          view.f = seq[i]; view.fromF = view.tween ? seq[i] - 1 : seq[i]; view.t = clamp(into / tweenDur, 0, 1);
+          if (view.fromF < 0) view.fromF = 0;
+        } else { view.f = view.fromF = seq[seq.length - 1]; view.t = 1; }
+      }
+      render(ctx, VW, VH, { offscreen: true });
+      $("recBar").value = el / total;
+      $("recStatus").textContent = `Recording… frame ${view.f} / ${RUN.nIters}  (${(el / 1000).toFixed(0)} / ${(total / 1000).toFixed(0)} s)`;
+      requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+  });
+  const cancelled = recording.cancel;
+  await new Promise((resolve) => { rec.onstop = resolve; rec.stop(); });
+  stream.getTracks().forEach(tr => tr.stop());
+  c.remove();
+  Object.assign(view, saved);
+  recording = null; dirty = true;
+  if (!cancelled) {
+    const ext = mime.startsWith("video/mp4") ? "mp4" : "webm";
+    download(new Blob(chunks, { type: mime.split(";")[0] }), `${baseName()}.${ext}`);
+    $("recStatus").textContent = `Saved ${baseName()}.${ext}`;
+    setTimeout(() => $("recDlg").close(), 900);
+  } else $("recDlg").close();
+}
+
+// ---------------------------------------------------------------- loading
+function selectRun(i) {
+  RUN = prepRun(TRACE.runs[i]);
+  view.f = view.fromF = 0; view.t = 1; view.playing = false;
+  $("slider").max = RUN.nF - 1;
+  const ss = $("stationSel"), prevSt = view.station;
+  ss.innerHTML = `<option value="all">All stations</option>` + RUN.stations.map(s => `<option value="${s}">Station S${s}</option>`).join("");
+  view.station = RUN.stations.includes(+prevSt) ? prevSt : "all"; ss.value = view.station;
+  resetZoom(); syncControls(); dirty = true;
+}
+function loadTrace(tr) {
+  TRACE = tr;
+  $("drop").classList.remove("show");
+  $("title").textContent = `${tr.instance} · ${tr.experiment}`;
+  $("title").title = $("title").textContent;
+  document.title = `LNS Replay · ${tr.instance}`;
+  $("runSel").innerHTML = tr.runs.map((r, i) => `<option value="${i}">Run ${r.runId} (${r.nIters} it.)</option>`).join("");
+  const initialHash = location.hash;
+  selectRun(0);
+  readHash(initialHash);
+}
+function readFile(file) {
+  file.text().then(t => loadTrace(JSON.parse(t))).catch(err => alert("Could not read trace: " + err));
+}
+$("fileIn").onchange = (e) => e.target.files[0] && readFile(e.target.files[0]);
+window.addEventListener("dragover", (e) => e.preventDefault());
+window.addEventListener("drop", (e) => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f) readFile(f); });
+
+resize();
+const embedded = JSON.parse(document.getElementById("trace-data").textContent);
+if (embedded && embedded.runs && embedded.runs.length) loadTrace(embedded); else $("drop").classList.add("show");
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>
