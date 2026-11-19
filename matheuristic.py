@@ -211,6 +211,12 @@ def prepare_model_subproblem(config, instance, heur_sol):
     )
 
 
+def neighbourhood(experiment_config):
+    """'graph' or 'subproblem' (experiment configs before Nov 2026: full_neighbourhood)."""
+    return experiment_config.get("neighbourhood",
+                                 experiment_config.get("full_neighbourhood", "graph"))
+
+
 class Solver:
     def __init__(self, experiment_config, instance_config=None, instance_path=None):
         (
@@ -220,9 +226,10 @@ class Solver:
             instance_path,
             instance_config,
         ) = load_instance(instance_config, instance_path)
-        if experiment_config.get("symmetry_breaking") is not None:
-            instance_config = {**instance_config,
-                               "symmetry_breaking": experiment_config["symmetry_breaking"]}
+        # LNS runs without symmetry breaking unless asked: with frozen copies in the
+        # model, the copy-slot chain cuts solutions off the neighbourhood (KNOWN_ISSUES.md)
+        instance_config = {**instance_config,
+                           "symmetry_breaking": bool(experiment_config.get("symmetry_breaking"))}
         self.instance_config = instance_config
         self.vlg = VisualLogger(
             instance_path, instance_config, experiment_config, self.instance
@@ -554,10 +561,15 @@ class Solver:
         """Extract, build, solve and merge one subproblem, logging each stage's time."""
         cfg = self.experiment_config
         backend = cfg["backend"]
-        ctx = subproblem.extract_context(
-            self.current_solution, self.handles, self.instance, active_orders,
-            cfg.get("joinable_exo", True),
-        )
+        if isinstance(active_orders, tuple):  # graph neighbourhood: (orders, visits)
+            ctx = subproblem.extract_context_graph(
+                self.current_solution, self.handles, self.instance, *active_orders
+            )
+        else:
+            ctx = subproblem.extract_context(
+                self.current_solution, self.handles, self.instance, active_orders,
+                cfg.get("joinable_exo", True),
+            )
         skip = subproblem.violates_bound(ctx, self.cp_obj, impr_bound)
         if not skip:
             sub_mdl, sub_handles = subproblem.build_submodel(
@@ -762,9 +774,15 @@ class Solver:
             self.vlg.log_strategy(strat_name, strat_idx)
 
             # create to_optimize set with graph traversal
-            full_sub_nbh = (not self.subproblem_mode and
-                            self.experiment_config.get("full_neighbourhood") == "subproblem")
-            if self.subproblem_mode or full_sub_nbh:
+            nbh = neighbourhood(self.experiment_config)
+            full_sub_nbh = not self.subproblem_mode and nbh == "subproblem"
+            if self.subproblem_mode and nbh == "graph":
+                # exactly the full model's neighbourhood: active orders + freed visits
+                act_o, _, _, act_e = get_associated_indices(
+                    self.handles, self.current_solution, strategy_results
+                )
+                active_orders = (act_o, act_e)
+            elif self.subproblem_mode or full_sub_nbh:
                 active_orders = get_associated_indices(
                     self.handles, self.current_solution, strategy_results
                 )[0]
@@ -1196,7 +1214,7 @@ if __name__ == "__main__":
         action=argparse.BooleanOptionalAction,
         default=True,
         dest="close_sharing",
-        help="Subproblem mode: add every frozen order that shares a bin visit with an "
+        help="Subproblem mode with --neighbourhood subproblem: add every frozen order that shares a bin visit with an "
         "active order to the neighbourhood, so shared visits are fully active "
         "(see KNOWN_ISSUES.md, 'Subproblem LNS: joining frozen bin visits')",
     )
@@ -1205,27 +1223,30 @@ if __name__ == "__main__":
         action=argparse.BooleanOptionalAction,
         default=True,
         dest="joinable_exo",
-        help="Subproblem mode: active orders can pick from frozen bin visits (fixed fetch, "
+        help="Subproblem mode with --neighbourhood subproblem: active orders can pick from frozen bin visits (fixed fetch, "
         "presence and return; optional picks inside the presence window). "
         "--no-joinable-exo restores the subproblems before this option existed",
     )
     parser.add_argument(
+        "--neighbourhood",
         "--full-neighbourhood",
         type=str,
         default="graph",
         choices=["graph", "subproblem"],
-        dest="full_neighbourhood",
-        help="Full-model mode: which variables an iteration frees. 'graph': orders, SKUs "
-        "and every visit of those SKUs found by the graph traversal (visits serving frozen "
-        "orders included). 'subproblem': exactly the variables the subproblem LNS frees "
-        "(visits serving a frozen order stay frozen); use with --no-symmetry-breaking",
+        dest="neighbourhood",
+        help="Which variables an iteration frees, in both LNS models. 'graph' (default): "
+        "the graph traversal of freezing_utils.get_optimized_set (selected orders, their "
+        "SKUs and every visit of those SKUs, including visits serving frozen orders, whose "
+        "picks stay fixed). 'subproblem': the subproblem rule before Nov 2026 (a visit "
+        "serving a frozen order is frozen; --close-sharing and --joinable-exo apply)",
     )
     parser.add_argument(
         "--symmetry-breaking",
         action=argparse.BooleanOptionalAction,
-        default=None,
+        default=False,
         dest="symmetry_breaking",
-        help="Full-model mode: override the instance's symmetry_breaking setting",
+        help="Full-model mode: add the symmetry-breaking constraints (default: off; they "
+        "cut solutions off LNS neighbourhoods, see KNOWN_ISSUES.md)",
     )
     parser.add_argument(
         "--improvement-ref",
@@ -1290,7 +1311,7 @@ if __name__ == "__main__":
             "close_sharing": args.close_sharing,
             "joinable_exo": args.joinable_exo,
             "improvement_ref": args.improvement_ref,
-            "full_neighbourhood": args.full_neighbourhood,
+            "neighbourhood": args.neighbourhood,
             "symmetry_breaking": args.symmetry_breaking,
         }
         solver = Solver(

@@ -204,10 +204,12 @@ def test_bound_shortcut(setup):
     assert not subproblem.violates_bound(ctx, "makespan", hs.makespan - 1)
 
 
-@pytest.mark.parametrize("close_sharing", [True, False], ids=["closure", "no_closure"])
+@pytest.mark.parametrize("neighbourhood,close_sharing",
+                         [("graph", True), ("subproblem", True), ("subproblem", False)],
+                         ids=["graph", "closure", "no_closure"])
 @pytest.mark.parametrize("cycling", [False, True], ids=["makespan", "cycling"])
 @pytest.mark.parametrize("backend", BACKENDS)
-def test_lns_end_to_end(tmp_path, backend, cycling, close_sharing):
+def test_lns_end_to_end(tmp_path, backend, cycling, neighbourhood, close_sharing):
     from matheuristic import Solver
 
     inst = generate_data(num_stations=2, lanes_per_station=2, num_orders=16, num_skus=40,
@@ -234,7 +236,7 @@ def test_lns_end_to_end(tmp_path, backend, cycling, close_sharing):
         "cp_objective_phase_duration": 0, "cp_objective_phase_schedule": "m",
         "render_video": False, "only_first_sol": False,
         "lns_model": "subproblem", "validate_merges": True, "close_sharing": close_sharing,
-        "joinable_exo": True,
+        "joinable_exo": True, "neighbourhood": neighbourhood,
         "improvement_ref": "current",
     }
     if cycling:
@@ -530,6 +532,141 @@ def test_full_neighbourhood_subproblem_matches_subproblem(shared_setup, objectiv
             compared += 1
             with_exo += bool(ctx.exo_visits)
     assert compared >= 3 and with_exo >= 2, (compared, with_exo)
+
+
+def _graph_neighbourhoods(handles, n, seed):
+    """Graph-traversal neighbourhoods (get_associated_indices) from small random seeds."""
+    from types import SimpleNamespace
+
+    rng = random.Random(seed)
+    O, K = sorted(handles["O"]), sorted(handles["orders_demanding_sku"])
+    for _ in range(n):
+        yield SimpleNamespace(seed_orders=rng.sample(O, rng.randint(1, 2)), seed_stations=[],
+                              seed_skus=rng.sample(K, rng.randint(0, 1)))
+
+
+def _full_model_graph_frozen(inst, handles, sol, seeds, objective, backend):
+    """Full model without symmetry breaking, frozen like the full-model LNS (graph nbh.)."""
+    from freezing_utils import get_optimized_set
+
+    free = {v.get_name() for v in get_optimized_set(handles, sol, seeds)}
+    if backend == "docplex":
+        mdl, h = cp_model.build_model(inst, add_symmetry_breaking=False, horizon=H,
+                                      objective_func=objective)
+        for group in DECISION:
+            for var in h[group].values():
+                if var.get_name() not in free:
+                    _fix(mdl, var, sol.var_sols.get(var.get_name()))
+        return mdl, h, free
+    import cpp_cp_model
+
+    mdl, h = cpp_cp_model.build_model(inst, add_symmetry_breaking=False, horizon=H,
+                                      objective_func=objective)
+    names = [n for n in sol.var_sols if n not in free]  # as Solver.run with backend cpp
+    vs = [sol.var_sols[n] for n in names]
+    mdl.apply_delta_freezing(names, [1 if v.get("present") else 0 for v in vs],
+                             [v.get("start", 0) if v.get("present") else 0 for v in vs],
+                             [v.get("end", 0) if v.get("present") else 0 for v in vs], [])
+    return mdl, h, free
+
+
+def _graph_ctx(sol, handles, inst, seeds):
+    from freezing_utils import get_associated_indices
+
+    act_o, _, _, act_e = get_associated_indices(handles, sol, seeds)
+    return subproblem.extract_context_graph(sol, handles, inst, act_o, act_e)
+
+
+def _same(a, b):
+    a, b = a or ABSENT_, b or ABSENT_
+    if not a.get("present") or not b.get("present"):
+        return bool(a.get("present")) == bool(b.get("present"))
+    return (a["start"], a["end"]) == (b["start"], b["end"])
+
+
+ABSENT_ = {"present": False}
+
+
+def _assert_frozen_unchanged(sol, merged, handles, free):
+    """Every decision variable the full-model LNS would freeze keeps its incumbent value."""
+    for group in DECISION:
+        for var in handles[group].values():
+            name = var.get_name()
+            if name not in free:
+                assert _same(sol.var_sols.get(name), merged.var_sols.get(name)), name
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_graph_subproblem_keeps_the_incumbent(shared_setup, backend):
+    """Graph neighbourhood: the warm start, with every subproblem variable fixed to it
+    (fixings included), is feasible and has the incumbent's KPIs."""
+    inst, handles, sol = shared_setup
+    pinned = 0
+    for seeds in _graph_neighbourhoods(handles, 10, seed=3):
+        ctx = _graph_ctx(sol, handles, inst, seeds)
+        pinned += bool(ctx.pinned)
+        mdl, sub_handles = subproblem.build_submodel(ctx, backend, H, "makespan")
+        variables = [v for group in DECISION + ("PX",) for v in sub_handles[group].values()]
+        if backend == "docplex":
+            sp = subproblem.warm_start(ctx, mdl, sub_handles)
+            for var in variables:
+                vsol = sp.get_var_solution(var)
+                assert vsol is not None, var.get_name()
+                value = {"present": vsol.is_present()}
+                if vsol.is_present():
+                    value.update(start=vsol.get_start(), end=vsol.get_end())
+                _fix(mdl, var, value)
+        else:
+            import cpp_cp_model
+
+            state = subproblem.warm_start(ctx, cpp_cp_model.MockCpoModel(),
+                                          sub_handles).state_dict
+            names = [v.get_name() for v in variables]
+            assert set(names) <= set(state)
+            mdl.apply_delta_freezing(
+                names, [state[n]["present"] for n in names],
+                [state[n].get("start", 0) for n in names],
+                [state[n].get("end", 0) for n in names], [])
+        res, _ = subproblem.solve_submodel(mdl, sub_handles, backend, "makespan", -1, CFG)
+        assert res.is_solution(), seeds
+        for name in KPIS:
+            assert res.get_kpis()[name] == sol.get_kpis()[name], (name, seeds)
+    assert pinned >= 3, pinned
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("objective", KPIS)
+def test_graph_subproblem_matches_full_model(shared_setup, objective, backend):
+    """Graph neighbourhood: same optimum as the full model frozen by the full-model LNS;
+    the merged solution is feasible, reports its KPIs, and leaves every variable the
+    full-model LNS freezes at its incumbent value."""
+    inst, handles, sol = shared_setup
+    cfg = {**CFG, "iter_time_limit": 10}
+    compared = pinned = 0
+    for seeds in _graph_neighbourhoods(handles, 6, seed=5):
+        ctx = _graph_ctx(sol, handles, inst, seeds)
+        mdl, sub_handles = subproblem.build_submodel(ctx, backend, H, objective)
+        raw, _ = subproblem.solve_submodel(mdl, sub_handles, backend, objective, -1, cfg)
+        full_mdl, full_h, free = _full_model_graph_frozen(inst, handles, sol, seeds,
+                                                          objective, backend)
+        ref, _ = subproblem.solve_submodel(full_mdl, full_h, backend, objective, -1, cfg)
+        assert raw.is_solution() and ref.is_solution(), seeds
+        sub_val, ref_val = raw.get_kpis()[objective], ref.get_kpis()[objective]
+        sub_opt = raw.get_solve_status() == "Optimal"
+        ref_opt = ref.get_solve_status() == "Optimal"
+        if sub_opt:
+            assert ref_val >= sub_val, (objective, seeds, ref_val, sub_val)
+        if ref_opt:
+            assert sub_val >= ref_val, (objective, seeds, sub_val, ref_val)
+        merged = subproblem.to_full_result(sol, ctx, raw, sub_handles, handles, backend,
+                                           objective)
+        assert subproblem.check_merged(merged, handles, inst, H) == []
+        _assert_feasible_in_full_model(inst, merged)
+        _assert_frozen_unchanged(sol, merged, handles, free)
+        if sub_opt and ref_opt:
+            compared += 1
+            pinned += bool(ctx.pinned)
+    assert compared >= 3 and pinned >= 2, (compared, pinned)
 
 
 @pytest.mark.parametrize("backend", BACKENDS)

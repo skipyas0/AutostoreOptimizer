@@ -29,20 +29,24 @@ the frozen orders and their visits fixed (all six KPIs, both backends); every me
 full model with the reported KPIs; the warm start is feasible when all variables are fixed to it.
 `--no-joinable-exo` builds exactly the subproblems from before the option existed (identical `.cpo`).
 
-**Not a bug: the two LNS modes free different variables.** Frozen variables are fixed in both modes; what
-differs is which variables a neighbourhood frees for the same strategy output.
-- Full model (`freezing_utils.get_optimized_set`, `--full-neighbourhood graph`, default): F, B, R, Block of *every*
-  present visit of the selected SKUs are free, including visits that serve frozen orders (those orders' picks stay
-  fixed, so the free visit must still cover them), plus one absent copy slot per (s, k).
-- Subproblem: F, B, R, Block of a visit that serves a frozen order are frozen (order-side and bin-side); all other
-  copy slots of the active orders' SKUs are free. Active orders can only join such a visit where its fixed presence
-  window has room: with PickCap = 1, an idle gap of at least `p[k]`. On the 600-order benchmark instance about 9 of
-  about 600 candidate frozen visits per 100-order neighbourhood have such a gap.
+**Neighbourhood definitions (`--neighbourhood`, both LNS models).** Frozen variables are fixed in every mode; the
+rules differ in which variables a neighbourhood frees for the same strategy output.
+- `graph` (default since Nov 2026, both models; `freezing_utils.get_optimized_set`): I_os, lanes and C of the
+  selected orders; F, B, R, Block of *every* present visit of the selected SKUs, including visits that serve frozen
+  orders (those orders' picks stay fixed, so the free visit must still cover them), plus one absent copy slot per
+  (s, k); a pick P[o,s,k,e] is free iff o is selected and (s, k, e) is free. The subproblem reproduces it exactly
+  (`subproblem.extract_context_graph`): frozen orders with a pick on a free visit enter the subproblem *pinned*
+  (every variable fixed), active orders' picks on frozen visits are fixed (`PX` fixed to the incumbent), and copy
+  slots beyond the freed ones are fixed absent. Validated in `test_graph_subproblem_matches_full_model` (same
+  optimum as the frozen full model for all six KPIs, both backends; every variable the full-model LNS freezes is
+  unchanged after the merge).
+- `subproblem` (the subproblem rule before Nov 2026): F, B, R, Block of a visit that serves a frozen order are
+  frozen too; active orders can only join it where its fixed presence window has room (`--joinable-exo`), and
+  `--close-sharing` adds frozen orders sharing a visit. In the full model it is `subproblem_optimized_set`.
 
-`--full-neighbourhood subproblem --no-symmetry-breaking` makes the full model free exactly the subproblem's variables
-(`freezing_utils.subproblem_optimized_set`; same optimum as the subproblem for makespan, bin fetches and flow time,
-`test_full_neighbourhood_subproblem_matches_subproblem`). Other freeze rules, e.g. freezing only the order side so
-that a visit serving frozen orders stays free, are possible neighbourhood definitions, not fixes.
+Benchmark (Nov 2026, 10 instances x 4 runs x 150 iterations, `mmb`, full model, no symmetry breaking): `graph`
+reduced bin fetches by 2.6 percentage points more than `subproblem` (10/10 instances); with the same neighbourhood the
+full model and the subproblem were equivalent (+0.04 pp, within +-1 pp, p < 1e-6).
 The `bin_sharing` strategies (`refetched_sku_pick_slices`, `refetched_sku_fetch_density`,
 `fetch_pick_ratio_timeslice`) work around this by selecting all orders in a time window around repeated visits of
 a SKU, so the visits that could be merged are all active.
@@ -54,14 +58,15 @@ shared visits fully movable. `--no-close-sharing --no-joinable-exo` restores the
 Nov 2026, in which neighbourhoods with shared picks (43% of the strategies' neighbourhoods on the benchmark
 instance) started behind the incumbent.
 
-### Full-model LNS: symmetry breaking restricts the neighbourhood
+### Full-model LNS: symmetry breaking restricts the neighbourhood (off by default since Nov 2026)
 `symmetry_breaking` (instance config, true for the benchmark instances) adds, per (s, k), the copy-slot chain
 `presence(B[s,k,e+1]) ⇒ presence(B[s,k,e])` and `endBeforeStart(B[s,k,e], B[s,k,e+1])`. In a full model with frozen
 visits, the free slots must keep that order around the frozen ones, so some solutions of the neighbourhood are cut
 off. On the small test instances (16 orders, matched subproblem neighbourhood, 16 neighbourhoods proven optimal
 both ways) the bin-fetch optimum was worse with symmetry breaking in 4 of 16 (e.g. 32 instead of 30); the makespan
-optimum was never affected. The subproblem has no symmetry breaking. `--no-symmetry-breaking` overrides the instance
-setting for an LNS run.
+optimum was never affected. The subproblem has no symmetry breaking. **Since Nov 2026 every LNS run builds its model without
+symmetry breaking** (`--symmetry-breaking` turns it back on). In the benchmark above, dropping it raised the full
+model's fetch reduction by 2.0 percentage points (10/10 instances) and improved makespan as well.
 
 ### Acceptance is by makespan only
 `Solver.rrt_acceptance` compares makespans, whatever the active objective. In a `bin_fetches` / `total_flow_time` /
