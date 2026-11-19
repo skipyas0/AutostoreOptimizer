@@ -1,3 +1,4 @@
+from collections import defaultdict
 from loguru import logger
 
 
@@ -247,27 +248,41 @@ def get_optimized_set(handles, solution, strategy_results):
 def subproblem_optimized_set(handles, solution, active_orders):
     """Variables the subproblem LNS leaves free, as variables of the full model.
 
-    For the active orders: all I_os, I_os_lane, C and P. For every SKU an active order
-    needs: F, B, R, Block of each copy slot (s, k, e) that is not a present visit serving
-    a frozen order. Everything else (frozen orders, visits serving them, SKUs no active
-    order needs) is frozen. With --joinable-exo the subproblem has exactly this
-    neighbourhood; requires the full model without symmetry breaking, which the
-    subproblem does not have either.
+    For the active orders: all I_os, I_os_lane, C and P. For every SKU k an active order
+    needs, per station s: F, B, R, Block of each present copy slot (s, k, e) that serves no
+    frozen order, and of as many absent slots as active orders that need k minus those
+    free present slots. Everything else (frozen orders, visits serving them, SKUs no
+    active order needs) is frozen.
+
+    The subproblem frees every absent slot; without symmetry breaking the slots are
+    interchangeable, and a solution never needs more new visits at (s, k) than active
+    orders need k, so the neighbourhood is the same up to relabelling the copies. The
+    surplus slots only slow the full model down. Requires the full model without
+    symmetry breaking, which the subproblem does not have either.
     """
     active = set(active_orders)
     to_optimize = set()
     for group in ("I_os", "I_os_lane", "C", "P"):
         to_optimize.update(v for key, v in handles[group].items() if key[0] in active)
+    demand = handles["orders_demanding_sku"]
     skus = {k for o in active for k in handles["orders_req"][o]}
+    absent = defaultdict(list)
+    free_present = defaultdict(int)
     for (s, k, e) in handles["B"]:
         if k not in skus:
             continue
-        if is_bin_present_in_solution(handles, solution, s, k, e) and any(
-            o not in active and is_pick_present_in_solution(handles, solution, o, s, k, e)
-            for o in handles["orders_demanding_sku"][k]
-        ):
+        if not is_bin_present_in_solution(handles, solution, s, k, e):
+            absent[(s, k)].append(e)
             continue
+        if any(o not in active and is_pick_present_in_solution(handles, solution, o, s, k, e)
+               for o in demand[k]):
+            continue  # serves a frozen order: frozen
+        free_present[(s, k)] += 1
         to_optimize.update(handles[g][(s, k, e)] for g in ("F", "B", "R", "Block"))
+    for (s, k), slots in absent.items():
+        n_active = sum(1 for o in demand[k] if o in active)
+        for e in slots[:max(0, n_active - free_present[(s, k)])]:
+            to_optimize.update(handles[g][(s, k, e)] for g in ("F", "B", "R", "Block"))
     return to_optimize
 
 
