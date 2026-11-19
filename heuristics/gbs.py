@@ -9,13 +9,21 @@ happens to be at the pickface. GBS turns this around and schedules *bin visits*:
    - ``"lpt"``: Longest Processing Time on picking workload. Largest ``Σ p`` first, each order to
      the station with the smallest ``Σ p`` so far; ties -> most SKUs shared with the station's
      orders, then the first station.
+   - ``"cluster_lpt"``: LPT over order *clusters* instead of single orders. Clusters come from the
+     CFSS clustering (UPGMA on normalised rt-weighted Jaccard, threshold 0.1, at most
+     ``cluster_max_orders`` orders); cluster mates share a station, the balance stays LPT-like.
 2. **Seed** the lanes of every station: the order with the smallest ``sum_rt`` takes the first lane,
    then each next lane takes the unscheduled order with the largest ``Σ (rt + rt_ret)`` overlap with
    the SKUs of the orders already seeded (ties: smaller ``sum_rt``).
 3. **Step** at one station: one *bin task* per SKU still needed by an active order; the task serves
    **every** active order that needs that SKU. Schedule the best-scored task that fits in the
    horizon: fetch as soon as the pickface frees up (copy availability and MoveCap permitting); the
-   served orders pick one after another, at most PickCap at a time; the bin then returns. An order
+   served orders pick one after another, at most PickCap at a time; the bin then returns.
+   ``defer`` (SKU deferral): a task is *deferred* when unscheduled orders of the same station also
+   need its SKU. ``"strict"`` (default) schedules deferred tasks only when no other task is left,
+   ``"soft"`` subtracts one visit's robot time ``rt + rt_ret`` from their score, ``None`` ignores
+   it. An order may pick its SKUs in any order, so a deferred SKU tends to become its last pick and
+   the visit can also serve the next order admitted to a freed lane. An order
    whose picks are all done frees its lane; the unscheduled order of that station with the largest
    overlap with the remaining SKUs of the active orders takes the lane.
 4. **Which station steps** (``interleave``):
@@ -46,6 +54,7 @@ needed for valid solutions (``interleave=False, partition="overlap"`` is the ori
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 
 from heuristics.heuristic_utils import BinEvent, ExoState, HeuristicState, init_state
@@ -53,7 +62,8 @@ from heuristics.solution import HeuristicSolution
 from instance import Instance
 
 GBS_RULES = ("max_sharing", "critical_path", "readiness_weighted")
-GBS_PARTITIONS = ("overlap", "lpt")
+GBS_PARTITIONS = ("overlap", "lpt", "cluster_lpt")
+GBS_DEFER = (None, "soft", "strict")
 
 
 @dataclass
@@ -72,6 +82,13 @@ class _Station:
     pending: dict[int, set[int]] = field(default_factory=dict)  # active order -> SKUs still to pick
     unscheduled: list[int] = field(default_factory=list)
     pickface_free: int = 0
+    future: Counter = field(default_factory=Counter)  # SKU -> unscheduled orders of this station needing it
+
+    def admit(self, o: int, inst: Instance) -> None:
+        """Move unscheduled order o to the active orders."""
+        self.unscheduled.remove(o)
+        self.future.subtract(inst.req_sets[o])
+        self.pending[o] = set(inst.orders_req[o])
 
 
 @dataclass
@@ -81,6 +98,7 @@ class _Task:
     earliest_fetch: int  # before the MoveCap delay
     copy_id: int
     score: float = 0.0
+    deferred: bool = False  # strict deferral: schedule only when no other task is left
 
 
 # ======================================================================
@@ -88,28 +106,43 @@ class _Task:
 # ======================================================================
 
 
-def partition_orders(inst: Instance, method: str = "overlap") -> dict[int, list[int]]:
+def partition_orders(inst: Instance, method: str = "overlap", cluster_max_orders: int = 4) -> dict[int, list[int]]:
     """Station -> orders (in assignment order), see ``GBS_PARTITIONS``."""
     if method == "overlap":
         return _partition_overlap(inst)
     if method == "lpt":
-        return _partition_lpt(inst)
+        return _partition_lpt(inst, [[o] for o in inst.O])
+    if method == "cluster_lpt":
+        return _partition_lpt(inst, order_clusters(inst, cluster_max_orders))
     raise ValueError(f"Unknown GBS partition {method!r}; choose from {GBS_PARTITIONS}")
 
 
-def _partition_lpt(inst: Instance) -> dict[int, list[int]]:
-    """LPT on picking workload Σ p; ties -> most shared SKUs, then the first station."""
+def order_clusters(inst: Instance, max_orders: int = 4, threshold: float = 0.1) -> list[list[int]]:
+    """CFSS clustering: UPGMA on normalised rt-weighted Jaccard similarity (clusters of <= max_orders)."""
+    from heuristics.cfss import agglomerative_cluster
+    from jaccard_similarity import build_similarity_matrix
+
+    sim, _ = build_similarity_matrix(inst.O, inst.orders_req, inst.rt, inst.rt_ret, normalize=True)
+    return [c.order_ids for c in agglomerative_cluster(inst, sim, threshold=threshold, max_cluster_orders=max_orders)]
+
+
+def _partition_lpt(inst: Instance, groups: list[list[int]]) -> dict[int, list[int]]:
+    """LPT on picking workload Σ p over groups of orders (single orders or clusters).
+
+    Largest group first (stable: earlier groups win ties), to the station with the smallest load;
+    ties -> most SKUs shared with the station's orders, then the first station.
+    """
     p, req = inst.p, inst.orders_req
-    work = {o: sum(p[k] for k in req[o]) for o in inst.O}
+    work = [sum(p[k] for o in g for k in req[o]) for g in groups]
     station_orders: dict[int, list[int]] = {s: [] for s in inst.S}
     station_skus: dict[int, set[int]] = {s: set() for s in inst.S}
     load = {s: 0 for s in inst.S}
-    for o in sorted(inst.O, key=lambda o: work[o], reverse=True):  # stable: order id breaks ties
-        skus = set(req[o])
+    for i in sorted(range(len(groups)), key=lambda i: work[i], reverse=True):
+        skus = {k for o in groups[i] for k in req[o]}
         best_s = min(inst.S, key=lambda s: (load[s], -len(station_skus[s] & skus), inst.S.index(s)))
-        station_orders[best_s].append(o)
+        station_orders[best_s].extend(groups[i])
         station_skus[best_s] |= skus
-        load[best_s] += work[o]
+        load[best_s] += work[i]
     return station_orders
 
 
@@ -154,8 +187,7 @@ def _seed_lanes(st: _Station, inst: Instance, t0: int) -> None:
             o = st.unscheduled[0]
         else:
             o = _pick_by_overlap(st.unscheduled, set().union(*(inst.orders_req[a] for a in st.pending)), inst)
-        st.unscheduled.remove(o)
-        st.pending[o] = set(inst.orders_req[o])
+        st.admit(o, inst)
         ln.order, ln.free_at = o, t0
 
 
@@ -171,7 +203,7 @@ def _score(task: _Task, st: _Station, inst: Instance, rule: str) -> float:
     raise ValueError(f"Unknown GBS rule {rule!r}; choose from {GBS_RULES} or 'adaptive'")
 
 
-def _build_tasks(st: _Station, state: HeuristicState, rule: str) -> list[_Task]:
+def _build_tasks(st: _Station, state: HeuristicState, rule: str, defer: str | None = None) -> list[_Task]:
     inst = state.inst
     lane_of = {ln.order: i for i, ln in enumerate(st.lanes) if ln.order is not None}
     tasks = []
@@ -180,8 +212,13 @@ def _build_tasks(st: _Station, state: HeuristicState, rule: str) -> list[_Task]:
         copy_free, copy_id = state.bin_pools[k].get_earliest_free()
         task = _Task(k, served, max(st.pickface_free - inst.rt[k], copy_free), copy_id)
         task.score = _score(task, st, inst, rule)
+        if defer is not None and st.future[k] > 0:
+            if defer == "strict":
+                task.deferred = True
+            else:  # soft
+                task.score -= inst.rt[k] + inst.rt_ret[k]
         tasks.append(task)
-    tasks.sort(key=lambda t: t.score, reverse=True)  # stable: SKU id breaks ties
+    tasks.sort(key=lambda t: (t.deferred, -t.score))  # stable: SKU id breaks ties
     return tasks
 
 
@@ -222,13 +259,12 @@ def _complete_and_admit(st: _Station, inst: Instance, windows: dict[int, tuple[i
         if st.unscheduled:
             remaining = set().union(*st.pending.values()) if st.pending else set()
             new_o = _pick_by_overlap(st.unscheduled, remaining, inst)
-            st.unscheduled.remove(new_o)
-            st.pending[new_o] = set(inst.orders_req[new_o])
+            st.admit(new_o, inst)
             ln.order = new_o
 
 
 def _step(
-    st: _Station, state: HeuristicState, rule: str,
+    st: _Station, state: HeuristicState, rule: str, defer: str | None,
     pick_events: dict, windows: dict[int, tuple[int, int]], lane_of: dict[int, int],
 ) -> bool:
     """Schedule one bin visit at station st. False if no task fits the horizon (station is stuck)."""
@@ -236,7 +272,7 @@ def _step(
         if ln.order is not None:
             lane_of[ln.order] = ln.lane
     ev = task = None
-    for task in _build_tasks(st, state, rule):
+    for task in _build_tasks(st, state, rule, defer):
         ev = _schedule_task(task, st, state)
         if ev is not None:
             break
@@ -256,32 +292,44 @@ def _step(
 # ======================================================================
 
 
-def _run_gbs_rule(
-    inst: Instance, horizon: int, rule: str, exo: ExoState | None, interleave: bool, partition: str
-) -> HeuristicSolution:
+@dataclass(frozen=True)
+class _Options:
+    rule: str
+    defer: str | None
+    interleave: bool
+    partition: str
+    cluster_max_orders: int
+
+
+def _run_gbs_rule(inst: Instance, horizon: int, exo: ExoState | None, opt: _Options) -> HeuristicSolution:
     state = init_state(inst, horizon, exo)
     t0 = (exo.batch_start_time if exo else 0)
-    assignment = partition_orders(inst, partition)
+    assignment = partition_orders(inst, opt.partition, opt.cluster_max_orders)
     pick_events: dict[tuple[int, int, int], tuple[int, int]] = {}
     windows: dict[int, tuple[int, int]] = {}
     lane_of: dict[int, int] = {}
-    stations = [
-        _Station(s, [_Lane(ln, None, t0) for ln in inst.L], unscheduled=list(assignment[s]), pickface_free=t0)
-        for s in inst.S
-    ]
+    stations = []
+    for s in inst.S:
+        st = _Station(s, [_Lane(ln, None, t0) for ln in inst.L], unscheduled=list(assignment[s]), pickface_free=t0)
+        for o in st.unscheduled:
+            st.future.update(inst.req_sets[o])
+        stations.append(st)
 
-    if interleave:
+    def step(st: _Station) -> bool:
+        return _step(st, state, opt.rule, opt.defer, pick_events, windows, lane_of)
+
+    if opt.interleave:
         for st in stations:
             _seed_lanes(st, inst, t0)
         active = [st for st in stations if st.pending]  # in station order: min() breaks ties by station
         while active:
             st = min(active, key=lambda x: x.pickface_free)
-            if not _step(st, state, rule, pick_events, windows, lane_of) or not st.pending:
+            if not step(st) or not st.pending:
                 active.remove(st)  # done, or horizon reached: its remaining orders stay incomplete
     else:
         for st in stations:
             _seed_lanes(st, inst, t0)
-            while st.pending and _step(st, state, rule, pick_events, windows, lane_of):
+            while st.pending and step(st):
                 pass
 
     station_of = {o: s for s, os_ in assignment.items() for o in os_}
@@ -299,8 +347,8 @@ def _run_gbs_rule(
         total_moves=2 * sum(len(evs) for evs in state.station_bin_events.values()),
         feasible=not failed,
         pick_events={key: t for key, t in pick_events.items() if key[0] in order_assignments},
-        meta={"heuristic": "gbs", "rule": rule, "interleave": interleave, "partition": partition,
-              "assignment": assignment},
+        meta={"heuristic": "gbs", "rule": opt.rule, "defer": opt.defer, "interleave": opt.interleave,
+              "partition": opt.partition, "assignment": assignment},
     )
 
 
@@ -311,29 +359,39 @@ def run_gbs(
     alpha: float = 1.0,
     beta: float = 0.0,
     rule: str = "max_sharing",
+    defer: str | None = "strict",
     interleave: bool = True,
     partition: str = "overlap",
+    cluster_max_orders: int = 4,
     exo: ExoState | None = None,
 ) -> HeuristicSolution:
     """Global Bin Scheduling (see the module docstring).
 
+    ``defer``: SKU deferral, ``"strict"`` (default), ``"soft"`` or ``None``.
     ``interleave``: advance the station whose pickface frees first (default) instead of building
-    the stations one after another (the original GBS). ``partition``: ``"overlap"`` (original)
-    or ``"lpt"`` (load-balanced on picking workload).
+    the stations one after another (the original GBS). ``partition``: ``"overlap"`` (original),
+    ``"lpt"`` (load-balanced on picking workload) or ``"cluster_lpt"`` (LPT over order clusters
+    of at most ``cluster_max_orders`` orders).
 
     ``alpha`` / ``beta`` only matter for ``rule="adaptive"``, which keeps the best feasible
     rule by ``alpha * C_max + beta * Σ_s span_s`` (``meta["runs"]``: one record per rule).
     """
     if partition not in GBS_PARTITIONS:
         raise ValueError(f"Unknown GBS partition {partition!r}; choose from {GBS_PARTITIONS}")
+    if defer not in GBS_DEFER:
+        raise ValueError(f"Unknown GBS defer {defer!r}; choose from {GBS_DEFER}")
+    if rule != "adaptive" and rule not in GBS_RULES:
+        raise ValueError(f"Unknown GBS rule {rule!r}; choose from {GBS_RULES} or 'adaptive'")
+
+    def opts(r: str) -> _Options:
+        return _Options(r, defer, interleave, partition, cluster_max_orders)
+
     if rule != "adaptive":
-        if rule not in GBS_RULES:
-            raise ValueError(f"Unknown GBS rule {rule!r}; choose from {GBS_RULES} or 'adaptive'")
-        return _run_gbs_rule(inst, horizon, rule, exo, interleave, partition)
+        return _run_gbs_rule(inst, horizon, exo, opts(rule))
 
     best, best_obj, runs = None, float("inf"), []
     for r in GBS_RULES:
-        sol = _run_gbs_rule(inst, horizon, r, exo, interleave, partition)
+        sol = _run_gbs_rule(inst, horizon, exo, opts(r))
         obj = sol.objective(alpha, beta, inst.S) if sol.feasible else float("inf")
         runs.append({"rule": r, "feasible": sol.feasible, "makespan": sol.makespan, "total_moves": sol.total_moves})
         if best is None or obj < best_obj or (obj == best_obj and sol.total_moves < best.total_moves):

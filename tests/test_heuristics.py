@@ -423,14 +423,15 @@ def four_stations():
 
 
 @pytest.mark.parametrize("interleave", [True, False])
-@pytest.mark.parametrize("partition", ["overlap", "lpt"])
+@pytest.mark.parametrize("partition", ["overlap", "lpt", "cluster_lpt"])
+@pytest.mark.parametrize("defer", [None, "soft", "strict"])
 @pytest.mark.parametrize("pickcap", [1, 2])
-def test_gbs_variants_valid(interleave, partition, pickcap):
+def test_gbs_variants_valid(interleave, partition, defer, pickcap):
     inst = generate_data(num_stations=4, lanes_per_station=3, num_orders=40, num_skus=8000,
                          seed=5, pick_touch_time=4, movecap=12, pickcap=pickcap)
-    sol = run_gbs(inst, interleave=interleave, partition=partition)
+    sol = run_gbs(inst, interleave=interleave, partition=partition, defer=defer)
     assert sol.feasible and sol.validate(inst) == []
-    assert (sol.meta["interleave"], sol.meta["partition"]) == (interleave, partition)
+    assert (sol.meta["interleave"], sol.meta["partition"], sol.meta["defer"]) == (interleave, partition, defer)
     # every visit serves all its orders within its presence, at most PickCap at a time
     for evs in sol.bin_events.values():
         for ev in evs:
@@ -449,10 +450,50 @@ def test_gbs_lpt_partition_is_balanced(four_stations):
     assert max(load) - min(load) <= max(work.values())  # LPT: spread below the largest job
 
 
+def test_gbs_cluster_lpt_keeps_clusters_together(four_stations):
+    from heuristics.gbs import order_clusters, partition_orders
+
+    inst = four_stations
+    clusters = order_clusters(inst, max_orders=4)
+    assert max(len(c) for c in clusters) <= 4 and sorted(o for c in clusters for o in c) == sorted(inst.O)
+    station_of = {o: s for s, os_ in partition_orders(inst, "cluster_lpt").items() for o in os_}
+    assert all(len({station_of[o] for o in c}) == 1 for c in clusters)
+    work = {o: sum(inst.p[k] for k in inst.orders_req[o]) for o in inst.O}
+    load = [sum(work[o] for o in inst.O if station_of[o] == s) for s in inst.S]
+    assert max(load) - min(load) <= max(sum(work[o] for o in c) for c in clusters)  # LPT bound over clusters
+
+
+def test_gbs_strict_deferral_orders_tasks(four_stations):
+    """Deferred tasks (SKU still needed by unscheduled orders of the station) come after all others."""
+    from heuristics.gbs import _Lane, _Station, _build_tasks, _seed_lanes
+    from heuristics.heuristic_utils import init_state
+
+    inst = four_stations
+    state = init_state(inst, 10000)
+    st = _Station(inst.S[0], [_Lane(ln) for ln in inst.L], unscheduled=list(inst.O))
+    for o in st.unscheduled:
+        st.future.update(inst.req_sets[o])
+    _seed_lanes(st, inst, 0)
+    expected = {k: sum(k in inst.req_sets[o] for o in st.unscheduled) for k in inst.demand_count}
+    assert all(st.future[k] == n for k, n in expected.items())  # counter tracks admissions
+    tasks = _build_tasks(st, state, "max_sharing", "strict")
+    flags = [t.deferred for t in tasks]
+    assert flags == sorted(flags) and flags == [expected[t.sku] > 0 for t in tasks]
+    assert [t.sku for t in _build_tasks(st, state, "max_sharing", None)] == [
+        t.sku for t in sorted(tasks, key=lambda t: -t.score)]  # same scores, only the deferral key differs
+
+
+def test_gbs_deferral_shares_more(four_stations):
+    plain = run_gbs(four_stations, defer=None)
+    strict = run_gbs(four_stations, defer="strict")
+    assert strict.validate(four_stations) == []
+    assert strict.total_moves < plain.total_moves
+
+
 def test_gbs_interleave_reduces_station_drift(four_stations):
     """Sequential GBS lets later stations drift (copies only free after their last return)."""
-    seq = run_gbs(four_stations, interleave=False)
-    inter = run_gbs(four_stations, interleave=True)
+    seq = run_gbs(four_stations, interleave=False, defer=None)
+    inter = run_gbs(four_stations, interleave=True, defer=None)
     assert inter.validate(four_stations) == [] and seq.validate(four_stations) == []
     assert inter.makespan <= seq.makespan
 
@@ -462,6 +503,8 @@ def test_gbs_rejects_unknown_options(four_stations):
         run_gbs(four_stations, rule="nope")
     with pytest.raises(ValueError):
         run_gbs(four_stations, partition="nope")
+    with pytest.raises(ValueError):
+        run_gbs(four_stations, defer="nope")
 
 
 def test_gbs_tight_horizon_is_infeasible_not_false_feasible(four_stations):

@@ -59,8 +59,9 @@ CLI: `python -m heuristics --list`, `python -m heuristics <name> [--orders 40 ..
 | `partitioned_rdi_{random,similarity,load_balanced}` | `run_partitioned_rdi(partition=...)` (seed 0) |
 | `partitioned_rdi_load_balanced_share` | as above with the `rdi_share` options |
 | `cfss` / `cfss_normalized` | `run_cfss(normalize_similarity=False / True)` |
-| `gbs_max_sharing` (alias `gbs`) / `gbs_critical_path` / `gbs_readiness_weighted` / `gbs_adaptive` | `run_gbs(rule=...)` (stations interleaved, overlap partition) |
-| `gbs_lpt` / `gbs_sequential` | `run_gbs(partition="lpt")` / `run_gbs(interleave=False)` (original construction) |
+| `gbs_max_sharing` (alias `gbs`) / `gbs_critical_path` / `gbs_readiness_weighted` / `gbs_adaptive` | `run_gbs(rule=...)` (interleaved stations, strict SKU deferral, overlap partition) |
+| `gbs_lpt` / `gbs_cluster_lpt` | `run_gbs(partition="lpt" / "cluster_lpt")` |
+| `gbs_no_defer` / `gbs_sequential` | `run_gbs(defer=None)` / `run_gbs(defer=None, interleave=False)` (original construction) |
 
 Aliases such as `greedy`, `load_balanced_greedy` and `rdi_sgc` are accepted by `run_heuristic`
 and by `precalculate_instances_for_lns.py`.
@@ -262,19 +263,30 @@ at the station that needs the SKU.
    - `"overlap"` (default, original): largest `sum_rt` first, to the station maximising rt-overlap with its SKUs minus its rt load.
    - `"lpt"`: Longest Processing Time on picking workload. Largest `Σ p` first, to the station with the smallest `Σ p` so far.
      Ties go to the station sharing the most SKUs with the order, then the first station.
+   - `"cluster_lpt"`: the same LPT over order *clusters* (CFSS clustering: UPGMA on normalised rt-weighted Jaccard,
+     threshold 0.1, at most `cluster_max_orders = 4` orders), so cluster mates share a station.
 2. Seed every station's lanes with mutually overlapping orders.
-3. A *step* at a station schedules the best-scored *bin task* (one per SKU still needed by an active order) that fits the
+3. A *step* at a station schedules the best *bin task* (one per SKU still needed by an active order) that fits the
    horizon: fetch when the pickface frees up (copy, MoveCap), the served orders pick one after another (PickCap at a
    time), return. A finished order frees its lane for the unscheduled order with the largest overlap with the active
    orders' remaining SKUs.
-4. Which station steps next (`interleave`):
+4. SKU deferral (`defer`): a task is *deferred* if unscheduled orders of the same station also need its SKU (a per-station
+   counter, updated on admission).
+   - `"strict"` (default): deferred tasks come after all other tasks.
+   - `"soft"`: their score drops by one visit's robot time `rt + rt_ret`.
+   - `None`: no deferral (registry `gbs_no_defer`).
+   An order may pick its SKUs in any order, so a deferred SKU tends to become its last pick, and the visit then also serves
+   the next order admitted to a freed lane.
+5. Which station steps next (`interleave`):
    - `True` (default): the station whose pickface frees first (ties: first station), so visits are committed roughly in
      time order over all stations.
    - `False` (original, registry `gbs_sequential`): each station runs to completion before the next starts.
 
-Rules: `max_sharing` (n_served·(rt+rt_ret)), `critical_path` (largest remaining Σ(rt+p+rt_ret) of a served order),
-`readiness_weighted` (max_sharing − pickface idle gap), `adaptive` (best feasible of the three by `objective(alpha, beta)`).
-Parameters: `horizon, alpha, beta, rule, interleave, partition, exo` (`exo.lanes` is ignored, as in SGC).
+Rules (task score, higher first): `max_sharing` (n_served·(rt+rt_ret)), `critical_path` (largest remaining
+Σ(rt+p+rt_ret) of a served order), `readiness_weighted` (max_sharing − pickface idle gap), `adaptive` (best feasible of
+the three by `objective(alpha, beta)`).
+Parameters: `horizon, alpha, beta, rule, defer, interleave, partition, cluster_max_orders, exo` (`exo.lanes` is ignored,
+as in SGC). `defer=None` reproduces the GBS of `93fa0f9` exactly.
 
 Fixed against the scrapped version: picks respect PickCap (previously all served orders picked at once during one
 `p[k]`), and `feasible` is honest (previously pre-filled `(0, 0)` picks made it always `True`).
@@ -282,15 +294,26 @@ Fixed against the scrapped version: picks respect PickCap (previously all served
 Why interleaving matters: a `BinCopyPool` copy is only free after its *last* return. Built station by station, a later
 station cannot use a copy in an earlier station's idle gaps, so station end times grow with the station index.
 
-On the 15 LNS benchmark instances (β = 1), relative to `lb_sgc_share` (runtime ≈ 2.5 s for all GBS variants):
+Why deferral matters: a visit can only serve orders that are active (on a lane) at the time, at most |L| per station.
+If every SKU were fetched once per station, the overlap partition would need 0.68 fetches per order line; without
+deferral GBS uses 0.88 (37% of that saving), with strict deferral 0.77 (73%).
 
-| | makespan | fetches | robot work | robot util. | workload imb. | makespan imb. |
-|---|---|---|---|---|---|---|
-| `lb_sgc_share` | 0 | 0 | 0 | 88% | 6.9% | 9.3% |
-| `gbs_sequential` | +49.8% | −9.3% | −5.3% | 57% | 14.9% | 71.5% |
-| `gbs_max_sharing` | −1.4% | −9.3% | −5.3% | 85% | 14.9% | 10.9% |
-| `gbs_readiness_weighted` | −0.1% | −9.2% | −5.2% | 84% | 14.9% | 12.7% |
-| `gbs_lpt` | +0.3% | −7.6% | −4.3% | 85% | 0.2% | 17.6% |
+On the 15 LNS benchmark instances (β = 1), relative to `lb_sgc_share`:
+
+| | makespan | fetches | robot work | robot util. | workload imb. | makespan imb. | runtime |
+|---|---|---|---|---|---|---|---|
+| `lb_sgc_share` | 0 | 0 | 0 | 88% | 6.9% | 9.3% | 1.0 s |
+| `gbs_sequential` | +49.8% | −9.3% | −5.3% | 57% | 14.9% | 71.5% | 1.2 s |
+| `gbs_no_defer` | −1.4% | −9.3% | −5.3% | 85% | 14.9% | 10.9% | 1.3 s |
+| `gbs_max_sharing` | −8.8% | −20.4% | −12.4% | 85% | 14.9% | 14.1% | 1.1 s |
+| `gbs_critical_path` | −7.6% | −18.1% | −11.0% | 85% | 14.9% | 12.3% | 1.1 s |
+| `gbs_readiness_weighted` | −9.4% | −20.4% | −12.4% | 86% | 14.9% | 13.4% | 1.1 s |
+| `gbs_adaptive` | −9.3% | −20.1% | −12.2% | 86% | 14.9% | 13.9% | 3.3 s |
+| `gbs_lpt` | −6.7% | −18.4% | −10.9% | 85% | 0.2% | 19.8% | 1.1 s |
+| `gbs_cluster_lpt` | −8.9% | −20.9% | −12.8% | 85% | 0.2% | 17.7% | 2.6 s |
+
+For comparison, `rdi_lb_share` reaches −6.9% makespan and −2.9% robot work at ~100× the runtime. The clustering
+(O(n³) in `agglomerative_cluster`) is what makes `gbs_cluster_lpt` slower.
 
 LNS keeps the start's robot work almost unchanged (final makespan ≈ 1.03·W/MoveCap on these instances), so the robot-work
 saving is what a GBS warm start should carry over; this has not been validated with LNS runs yet.

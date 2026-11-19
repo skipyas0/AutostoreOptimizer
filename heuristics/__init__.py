@@ -17,7 +17,7 @@ import time
 from typing import Callable
 
 from heuristics.cfss import run_cfss
-from heuristics.gbs import GBS_PARTITIONS, GBS_RULES, run_gbs
+from heuristics.gbs import GBS_DEFER, GBS_PARTITIONS, GBS_RULES, run_gbs
 from heuristics.heuristic_utils import BinEvent, ExoState
 from heuristics.partitioned_rdi import PARTITION_METHODS, run_partitioned_rdi
 from heuristics.rdi import TIEBREAKERS, run_rdi
@@ -64,15 +64,17 @@ HEURISTICS: dict[str, tuple[Callable[..., HeuristicSolution], dict]] = {
     "cfss": (run_cfss, {}),
     "cfss_normalized": (run_cfss, {"normalize_similarity": True}),
     # bin-centred: schedule bin visits serving every active order that needs the SKU
-    # (stations interleaved in time, original overlap partition)
+    # (stations interleaved in time, strict SKU deferral, original overlap partition)
     "gbs_max_sharing": (run_gbs, {"rule": "max_sharing"}),
     "gbs_critical_path": (run_gbs, {"rule": "critical_path"}),
     "gbs_readiness_weighted": (run_gbs, {"rule": "readiness_weighted"}),
     "gbs_adaptive": (run_gbs, {"rule": "adaptive"}),
-    # LPT partition on picking workload (near-perfect workload balance, a little less sharing)
+    # LPT partition on picking workload / on CFSS order clusters (near-perfect workload balance)
     "gbs_lpt": (run_gbs, {"rule": "max_sharing", "partition": "lpt"}),
-    # the original station-by-station construction (ablation)
-    "gbs_sequential": (run_gbs, {"rule": "max_sharing", "interleave": False}),
+    "gbs_cluster_lpt": (run_gbs, {"rule": "max_sharing", "partition": "cluster_lpt"}),
+    # ablations: no SKU deferral / the original station-by-station construction
+    "gbs_no_defer": (run_gbs, {"rule": "max_sharing", "defer": None}),
+    "gbs_sequential": (run_gbs, {"rule": "max_sharing", "defer": None, "interleave": False}),
 }
 
 # Alternative spellings accepted by run_heuristic (e.g. LNS precalculation configs).
@@ -124,6 +126,7 @@ __all__ = [
     "ALL_RULES",
     "BinEvent",
     "ExoState",
+    "GBS_DEFER",
     "GBS_PARTITIONS",
     "GBS_RULES",
     "HEURISTICS",
