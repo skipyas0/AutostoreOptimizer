@@ -19,6 +19,7 @@ def build_model(
     exo_station_bins: dict = None,  # station -> list of (start, end) bin presences
     obj_offsets=None,  # subproblem.ObjectiveOffsets: frozen part of every KPI
     exo_visits: list = None,  # joinable frozen visits: (s, k, e, b_start, b_end, frozen_picks)
+    anchors: list = None,  # (s, k, e, fixed picks): free visit slots carrying frozen picks
 ):
     """
     Intervals per (s,k,e):
@@ -41,6 +42,10 @@ def build_model(
     exo_moves = exo_moves or []
     exo_station_bins = exo_station_bins or {}
     exo_visits = exo_visits or []
+    # Anchored picks (LNS subproblems): fixed picks of frozen orders on a *free* visit
+    # slot (s, k, e). The slot is present and its fetch / return must leave room for
+    # them (F -> pick -> R); the picks count in the station's PickCap.
+    anchor_picks = {(s, k, e): picks for s, k, e, picks in (anchors or [])}
 
     mdl = CpoModel()
     O = sorted(orders_req.keys())
@@ -63,13 +68,15 @@ def build_model(
         for k in orders_req[o]:
             orders_demanding_sku[k].add(o)
             need_count[k] += 1
-    active_K = [k for k in K if need_count[k] > 0]
     Lcap = max(1, len(L))
 
     # Conservative U: one bin visit per order item requirement.
     # This prevents heuristic warmstart from failing if it doesn't cluster perfectly.
     # The CP model will prune unused F/B/R/P variables quickly anyway.
-    U = {k: need_count[k] for k in K}
+    # LNS subproblems may ask for more slots (visits carrying only anchored picks).
+    min_copies = getattr(instance, "min_copies", None) or {}
+    U = {k: max(need_count[k], min_copies.get(k, 0)) for k in K}
+    active_K = [k for k in K if U[k] > 0]
 
     # --- intervals ---
     # Station-level order window + lane window (keep I_os, I_os_lane)
@@ -125,7 +132,13 @@ def build_model(
 
                 # The bin arrival (B) is present IFF at least one order's pick (P) uses it.
                 # This links the presence of P[(o,s,k,e)] to B[(s,k,e)].
-                if all_picks_for_this_copy:
+                if (s, k, e) in anchor_picks:
+                    # Carries fixed picks: present, F ends before and R starts after them
+                    mdl.add(mdl.presence_of(B[(s, k, e)]) == 1)
+                    for st, en in anchor_picks[(s, k, e)]:
+                        mdl.add(mdl.end_of(F[(s, k, e)]) <= st)
+                        mdl.add(mdl.start_of(R[(s, k, e)]) >= en)
+                elif all_picks_for_this_copy:
                     # any_P_present is a 0/1 expression that is 1 if any P is present
                     any_P_present = mdl.max(
                         mdl.presence_of(iv) for iv in all_picks_for_this_copy
@@ -292,6 +305,12 @@ def build_model(
             for o in sorted(orders_demanding_sku[k]):
                 station_pulses.append(mdl.pulse(PX[(o, s, k, e)], 1))
             for st, en in frozen_picks:
+                station_pulses.append(mdl.pulse((st, en), 1))
+        # Anchored picks on free visit slots at this station
+        for (xs, k, e), picks in anchor_picks.items():
+            if xs != s:
+                continue
+            for st, en in picks:
                 station_pulses.append(mdl.pulse((st, en), 1))
 
         if station_pulses:

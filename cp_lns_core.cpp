@@ -280,7 +280,14 @@ public:
                const std::map<int, int>& station_pick_count,
                // Joinable frozen visits: (s, k, e, b_start, b_end, frozen picks). Active
                // orders get optional picks PX[o,s,k,e] inside the fixed presence window.
-               const std::vector<std::tuple<int, int, int, int, int, std::vector<std::pair<int, int>>>>& exo_visits) {
+               const std::vector<std::tuple<int, int, int, int, int, std::vector<std::pair<int, int>>>>& exo_visits,
+               // Anchored picks: fixed picks of frozen orders on a free visit slot (s, k, e).
+               // The slot is present and F / R must leave room for them; they count in PickCap.
+               const std::vector<std::tuple<int, int, int, std::vector<std::pair<int, int>>>>& anchors) {
+        std::map<std::tuple<int, int, int>, std::vector<std::pair<int, int>>> anchor_picks;
+        for (const auto& a : anchors) {
+            anchor_picks[std::make_tuple(std::get<0>(a), std::get<1>(a), std::get<2>(a))] = std::get<3>(a);
+        }
         
         model = IloModel(env);
         cp = IloCP(model);
@@ -377,7 +384,14 @@ public:
                     model.add(IloPresenceOf(env, iv_B) == IloPresenceOf(env, iv_F));
                     model.add(IloPresenceOf(env, iv_R) == IloPresenceOf(env, iv_B));
                     
-                    if (!all_picks_for_this_copy.empty()) {
+                    auto anchored = anchor_picks.find(std::make_tuple(s, k, e));
+                    if (anchored != anchor_picks.end()) {
+                        model.add(IloPresenceOf(env, iv_B) == 1);
+                        for (const auto& st_en : anchored->second) {
+                            model.add(IloEndOf(iv_F) <= st_en.first);
+                            model.add(IloStartOf(iv_R) >= st_en.second);
+                        }
+                    } else if (!all_picks_for_this_copy.empty()) {
                         IloIntExprArray presences(env, all_picks_for_this_copy.size());
                         for (size_t i = 0; i < all_picks_for_this_copy.size(); ++i) {
                             presences[i] = IloPresenceOf(env, all_picks_for_this_copy[i]);
@@ -498,6 +512,13 @@ public:
                         }
                     }
                     for (const auto& st_en : std::get<5>(visit)) {
+                        station_picks += IloPulse(env, st_en.first, st_en.second, 1);
+                        has_picks = true;
+                    }
+                }
+                for (const auto& a : anchor_picks) {
+                    if (std::get<0>(a.first) != s) continue;
+                    for (const auto& st_en : a.second) {
                         station_picks += IloPulse(env, st_en.first, st_en.second, 1);
                         has_picks = true;
                     }
@@ -1131,7 +1152,8 @@ PYBIND11_MODULE(cp_lns_core, m) {
         .def(py::init<std::vector<int>, std::vector<int>, std::vector<int>, std::map<int, std::vector<int>>, std::map<int, int>, std::map<int, int>, std::map<int, int>, std::optional<int>, std::optional<int>, std::map<int, int>, std::vector<int>, std::map<int, int>, int, bool, std::map<std::pair<int, int>, std::vector<std::pair<int, int>>>, std::map<int, std::vector<std::pair<int, int>>>, std::vector<std::pair<int, int>>, int, std::string,
                       std::map<int, std::vector<std::pair<int, int>>>, int, int, int,
                       std::map<int, std::pair<int, int>>, std::map<int, int>, std::map<int, int>,
-                      std::vector<std::tuple<int, int, int, int, int, std::vector<std::pair<int, int>>>>>())
+                      std::vector<std::tuple<int, int, int, int, int, std::vector<std::pair<int, int>>>>,
+                      std::vector<std::tuple<int, int, int, std::vector<std::pair<int, int>>>>>())
         .def("apply_warm_start", &CpLnsModel::apply_warm_start)
         .def("apply_delta_freezing", &CpLnsModel::apply_delta_freezing)
         .def("solve", &CpLnsModel::solve,

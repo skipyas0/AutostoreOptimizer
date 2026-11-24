@@ -35,11 +35,20 @@ rules differ in which variables a neighbourhood frees for the same strategy outp
   selected orders; F, B, R, Block of *every* present visit of the selected SKUs, including visits that serve frozen
   orders (those orders' picks stay fixed, so the free visit must still cover them), plus one absent copy slot per
   (s, k); a pick P[o,s,k,e] is free iff o is selected and (s, k, e) is free. The subproblem reproduces it exactly
-  (`subproblem.extract_context_graph`): frozen orders with a pick on a free visit enter the subproblem *pinned*
-  (every variable fixed), active orders' picks on frozen visits are fixed (`PX` fixed to the incumbent), and copy
-  slots beyond the freed ones are fixed absent. Validated in `test_graph_subproblem_matches_full_model` (same
-  optimum as the frozen full model for all six KPIs, both backends; every variable the full-model LNS freezes is
-  unchanged after the merge).
+  (`subproblem.extract_context_graph`) with only the selected orders in the model:
+  - fixed picks of frozen orders on a free visit enter as *anchored picks* of its copy slot (`anchors`: the slot is
+    present, `endOf(F) <= start` and `startOf(R) >= end` of each pick, a constant pulse in the station's PickCap);
+  - active orders' picks on frozen visits are fixed (`PX` fixed to the incumbent);
+  - copy slots beyond the freed ones are fixed absent (`SubInstance.min_copies` adds slots for visits carrying
+    only anchored picks).
+
+  Validated in `test_graph_subproblem_matches_full_model`: same optimum as the frozen full model for all six KPIs,
+  on both backends, and every variable the full-model LNS freezes is unchanged after the merge.
+  `test_cpp_submodel_matches_docplex_with_anchors` checks that both backends export the same `.cpo`.
+
+  An earlier version (Nov 2026, used in the `fetch_benchmark` graph run) added those frozen orders whole, with
+  every variable fixed. On 400 orders that pinned 230–260 orders even for 20 selected ones, and an iteration took
+  13.4 s instead of about 5 s. With anchored picks, the same instance takes 3.6 s per iteration.
 - `subproblem` (the subproblem rule before Nov 2026): F, B, R, Block of a visit that serves a frozen order are
   frozen too; active orders can only join it where its fixed presence window has room (`--joinable-exo`), and
   `--close-sharing` adds frozen orders sharing a visit. In the full model it is `subproblem_optimized_set`.

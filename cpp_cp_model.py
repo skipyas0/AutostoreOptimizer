@@ -119,8 +119,10 @@ def _index_sets(instance):
         for k in orders_req[o]:
             orders_demanding_sku[k].add(o)
             need_count[k] += 1
-    active_K = [k for k in K if need_count[k] > 0]
-    U = {k: need_count[k] for k in K}
+    # LNS subproblems may ask for more slots (visits carrying only anchored picks)
+    min_copies = getattr(instance, "min_copies", None) or {}
+    U = {k: max(need_count[k], min_copies.get(k, 0)) for k in K}
+    active_K = [k for k in K if U[k] > 0]
     return O, orders_demanding_sku, active_K, U
 
 
@@ -204,6 +206,7 @@ def build_model(
     exo_station_bins: dict = None,  # station -> list of (start, end) bin presences
     obj_offsets=None,  # subproblem.ObjectiveOffsets: frozen part of every KPI
     exo_visits: list = None,  # joinable frozen visits: (s, k, e, b_start, b_end, frozen_picks)
+    anchors: list = None,  # (s, k, e, fixed picks): free visit slots carrying frozen picks
 ):
     if objective_func not in CPP_OBJECTIVES:
         # the C++ model would silently fall back to makespan
@@ -222,6 +225,9 @@ def build_model(
         (s, k, e, int(b_start), int(b_end), [(int(st), int(en)) for st, en in frozen])
         for s, k, e, b_start, b_end, frozen in (exo_visits or [])
     ]
+
+    anchors = [(s, k, e, [(int(st), int(en)) for st, en in picks])
+               for s, k, e, picks in (anchors or [])]
 
     if obj_offsets is None:
         makespan_lb, fetches_off, flow_off = 0, 0, 0
@@ -263,6 +269,7 @@ def build_model(
         station_pick_time,
         station_pick_count,
         exo_visits,
+        anchors,
     )
 
     handles = build_handles(instance, horizon)
