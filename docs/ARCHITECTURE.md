@@ -102,6 +102,7 @@ verified) by `scripts/compact_results.py`.
 See [HEURISTICS.md](HEURISTICS.md).
 - `run_heuristic(name, inst, **params) -> HeuristicSolution`
 - registry `HEURISTICS`
+- `evolve.py` (`gbs_evolve`, `gbs_evolve_work`): search over GBS order sequences, decoded by `gbs.run_gbs_sequence`; experiments in `scripts/evolve_benchmark/`
 - CLI: `python -m heuristics --list`
 - Algorithms: SGC (± load balancing, ± single-item piggybacking), AMA, RDI, partitioned RDI, CFSS.
 

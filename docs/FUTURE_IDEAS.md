@@ -132,3 +132,20 @@ so a warm start should be judged by W and balance.
   (seeds 6–20), select by W under balance constraints, validate with LNS on the eval set.
 - AMA keeps the best run by makespan; selecting by W under balance constraints would pick better warm starts at no
   extra runtime.
+
+## GBS sequence evolution: next steps
+
+Context: `heuristics/evolve.py`, results in docs/HEURISTICS.md (makespan fitness −3.8% C but +0.9% W; work fitness −1.8% W
+after 10 000 evaluations and still improving).
+
+- **Validate in LNS** (not run): `gbs_evolve_work` vs `gbs_cluster_lpt` / `gbs_max_sharing`, and `gbs_evolve_makespan` as the
+  falsification test of "W decides the LNS result" (`scripts/evolve_benchmark/README.md`).
+- **Work fitness is slow.** An evaluation costs a full decode (0.05-0.1 s) although a mutation changes one station.
+  Re-decoding only the stations a move touches is not possible directly (stations share bin copies and MoveCap), but
+  a delta evaluation of the work alone (visits per SKU and station for a fixed sequence) could rank mutations cheaply
+  before decoding.
+- **Move targeting:** operator success is 3-10% on the work fitness. Weight operators by their measured success
+  (`meta["op_stats"]`) or restrict `pull` to orders whose SKUs are fetched more than once at their station.
+- **Not worth repeating:** crossover (no gain over the (1+1) LS) and the SKU-bias gene (the bin order is not where the gain is).
+- **15 stations** at the long budget were not run.
+
