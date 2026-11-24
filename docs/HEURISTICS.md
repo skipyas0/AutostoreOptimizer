@@ -38,7 +38,8 @@ CLI: `python -m heuristics --list`, `python -m heuristics <name> [--orders 40 ..
 | `rdi.py` | RDI (regret insertion with the gap-filling planner) |
 | `partitioned_rdi.py` | Order→station partitioning, `distribute_movecap`, partitioned RDI |
 | `cfss.py` | Clustering plus interleaved SGC |
-| `gbs.py` | GBS: bin-centred construction (one visit serves every active order needing the SKU) |
+| `gbs.py` | GBS: bin-centred construction (one visit serves every active order needing the SKU); `run_gbs_sequence` decoder |
+| `evolve.py` | `run_gbs_evolve`: evolutionary search over GBS order sequences |
 
 ## Registry
 
@@ -62,6 +63,7 @@ CLI: `python -m heuristics --list`, `python -m heuristics <name> [--orders 40 ..
 | `gbs_max_sharing` (alias `gbs`) / `gbs_critical_path` / `gbs_readiness_weighted` / `gbs_adaptive` | `run_gbs(rule=...)` (interleaved stations, strict SKU deferral, overlap partition) |
 | `gbs_lpt` / `gbs_cluster_lpt` | `run_gbs(partition="lpt" / "cluster_lpt")` |
 | `gbs_no_defer` / `gbs_sequential` | `run_gbs(defer=None)` / `run_gbs(defer=None, interleave=False)` (original construction) |
+| `gbs_evolve` / `gbs_evolve_work` | `run_gbs_evolve(method="ga", fitness="makespan")` / `(method="ls", fitness="work")`, both `window=3, max_evals=300` |
 
 Aliases such as `greedy`, `load_balanced_greedy` and `rdi_sgc` are accepted by `run_heuristic`
 and by `precalculate_instances_for_lns.py`.
@@ -109,7 +111,7 @@ Methods:
 
 | Piece | Role |
 |---|---|
-| `HeuristicState` | Committed partial schedule: lane / pickface free times, `DifferenceArray` MoveCap profile, one `BinCopyPool` per SKU, bin events and pickface intervals per station. It also carries `inst`, `horizon` and `pick_cap`, so helpers take only `state`. |
+| `HeuristicState` | Committed partial schedule: lane / pickface free times, `DifferenceArray` MoveCap profile (updated in place per move, O(move length)), one `BinCopyPool` per SKU (created on first use), bin events and pickface intervals per station. It also carries `inst`, `horizon` and `pick_cap`, so helpers take only `state`. |
 | `init_state(inst, horizon, exo=None)` | Initial state. `ExoState(lanes, blocks, moves, batch_start_time)` pre-occupies resources; it is used by decomposition. |
 | `PlanScratch` | Tentative bookkeeping while planning one order at one station: pending and removed moves, pending copy commitments, the local pickface intervals, temporarily extended bins, new bins, shared picks and pick times. `apply_shared_pick` and `add_new_bin` are the two ways an order line gets served. |
 | `find_shared_bin(cands, k, t_cursor, state, s, sc)` | Best existing or tentative visit of SKU k that the order can pick from. The order may wait at most `rt[k]`. It either fits inside the presence window (respecting PickCap via `find_pick_slot`) or extends the window, if the picker is ready by its end and the extended presence still respects pickface, copy, MoveCap and horizon limits (`_can_extend_bin_event`). |
@@ -312,11 +314,77 @@ On the 15 LNS benchmark instances (β = 1), relative to `lb_sgc_share`:
 | `gbs_lpt` | −6.7% | −18.4% | −10.9% | 85% | 0.2% | 19.8% | 1.1 s |
 | `gbs_cluster_lpt` | −8.9% | −20.9% | −12.8% | 85% | 0.2% | 17.7% | 2.6 s |
 
+Runtimes in this table predate the incremental MoveCap profile (see `DifferenceArray`), which made GBS about 50×
+faster (3.0 s → 0.06 s on GEN1-10, bit-identical results); SGC got about 8× faster, RDI is unchanged.
+
 For comparison, `rdi_lb_share` reaches −6.9% makespan and −2.9% robot work at ~100× the runtime. The clustering
 (O(n³) in `agglomerative_cluster`) is what makes `gbs_cluster_lpt` slower.
 
 LNS keeps the start's robot work almost unchanged (final makespan ≈ 1.03·W/MoveCap on these instances), so the robot-work
 saving is what a GBS warm start should carry over; this has not been validated with LNS runs yet.
+
+### GBS sequence evolution (`run_gbs_evolve`, `evolve.py`)
+Searches over the inputs of GBS instead of over schedules; GBS completes every candidate.
+
+- **Genome**: per station, the sequence in which its orders are admitted to the lanes. This fixes
+  the partition and the admission order. Optionally (`evolve_bias=True`) there is also a per-SKU bias added to GBS's
+  bin-task score, which reorders the bin visits at the stations.
+- **Decoder** `run_gbs_sequence(inst, sequence, window=..., sku_bias=...)`: GBS with that partition; a freed lane
+  admits, among the first `window` unscheduled orders of the sequence, the one with the largest overlap with the active
+  orders (`window=1`: strictly in order). Every GBS run records its admission order in `meta["sequence"]`, and
+  decoding it with `window=1` reproduces the run exactly (tested for all rules, partitions and deferral modes).
+- **Seeds**: the GBS runs with the `overlap`, `lpt` and `cluster_lpt` partitions (rule `max_sharing`); their
+  decodings are not counted in the budget. The result is never worse than the best seed.
+- **Fitness**: `"makespan"` = (C, W) or `"work"` = (W, C), lexicographic; W = Σ (rt + rt_ret) over bin visits.
+- **Search**: `"ls"`, a (1+1) EA that accepts children that are not worse; `"ga"`, a steady-state GA (binary tournament,
+  station-group crossover with probability 0.5, replace-worst, no duplicate fitness values in the population of 24).
+- **Operators**: swap of nearby orders, insert within a station, transfer to another station, exchange between
+  stations, *pull* (an order right after a random order sharing one of its SKUs), and the SKU bias.
+- Budget: `max_evals` decodings and/or `time_limit` seconds. `meta`: `history`, `seed_fitness`, `op_stats`,
+  `sequence` (the best genome).
+
+Results on the 15 LNS benchmark instances: see [Evolving GBS sequences](#evolving-gbs-sequences-results) below.
+
+### Evolving GBS sequences: results
+
+`scripts/evolve_benchmark/run.py` (then `analyze.py`): the 15 LNS benchmark instances (GEN1-5 × 5/10/15 stations), 2 seeds,
+1500 decodings per run (~3 min with 10 parallel runs), `window=3`, all solutions valid. Changes are relative to the best of
+the three GBS seeds *on that metric*, as the mean over instances and seeds; wins count instances (seed mean) and p is a one-sided Wilcoxon test.
+
+| arm | ΔC | ΔW | C / (W/MoveCap) | C wins | W wins |
+|---|---|---|---|---|---|
+| best seed (GBS) | 0 | 0 | 1.19 | | |
+| `ls`, makespan | −3.5% | +0.9% | 1.11 | 15/15 | 0/15 |
+| `ga`, makespan | −3.8% (p < 0.001) | +0.9% | 1.11 | 15/15 | 0/15 |
+| `ga`, makespan + SKU bias | −3.5% | +1.1% | 1.11 | 15/15 | 0/15 |
+| `ls`, work | −1.4% | −0.7% (p < 0.001) | 1.16 | 12/15 | 15/15 |
+| `ga`, work | +0.4% | −0.6% | 1.18 | 5/15 | 15/15 |
+| `ls`, work, 10 000 evals (5/10 stations) | −3.1% | **−1.8%** | 1.19 | 10/10 | 10/10 |
+
+- The makespan arms converge fast (90% of the gain by 750 evaluations). They gain by packing robot moves more tightly
+  (C/(W/MoveCap) 1.19 → 1.11), and they do it with slightly *more* robot work. The gain shrinks with size: −6% at
+  5 stations, −3% at 10 and −2% at 15.
+- W decreases slowly and steadily: −0.7% after 1500 evaluations, −1.2% after 3000, −1.8% after 10 000, still improving at the end
+  (~14 min per instance). It closes 26% of the gap between the best seed's W and the evolved partition's own
+  bound (one visit per station and SKU). GBS seeds are 6% above that bound and 19% above one visit per SKU.
+- The (1+1) LS is as good as the GA on makespan and better on W. Crossover adds nothing measurable. The SKU-bias
+  gene (bin order) does not help: GBS's task order is already good, and the order sequence is what matters.
+- Since LNS keeps W and ends at C ≈ 1.04–1.08 · W / MoveCap (warm-start benchmark), the makespan arms should *not*
+  carry over to LNS, while the work arm predicts about −1.8% final makespan. This is not yet validated with LNS:
+  `scripts/evolve_benchmark/prepare_lns.py` builds the two starts in the warm-start benchmark layout.
+
+**Status and limits.**
+- The LNS validation (see `scripts/evolve_benchmark/README.md`, step 4) has **not been run**. Until it has, the
+  statement above is a prediction.
+- The registry defaults (`max_evals=300`) give only a small gain, about −3% makespan (`gbs_evolve`) and −0.3% W (`gbs_evolve_work`). For a real warm start
+  pass a larger budget, e.g. `run_heuristic("gbs_evolve_work", inst, max_evals=10000)` (~14 min on 400 orders), or
+  `time_limit=`.
+- Only 5- and 10-station instances were run with the 10 000-evaluation budget.
+
+**Complexity.** One decode is O(V·(L·m + S + d) + n·(w·m + n/S) + H): with n orders, S stations, L lanes, m SKUs per order,
+V ≈ 0.77·n·m bin visits, d the robot move length and w the window. For a fixed instance shape that is linear in n
+(0.05, 0.06 and 0.10 s at 300, 400 and 600 orders). Variation and bookkeeping are O(n) per evaluation. A run costs
+O(E · decode) for E evaluations, plus the one-off O(n³) `cluster_lpt` clustering of the seeds (4 s at 600 orders).
 
 ---
 

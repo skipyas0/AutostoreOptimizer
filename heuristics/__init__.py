@@ -17,7 +17,8 @@ import time
 from typing import Callable
 
 from heuristics.cfss import run_cfss
-from heuristics.gbs import GBS_DEFER, GBS_PARTITIONS, GBS_RULES, run_gbs
+from heuristics.evolve import EVOLVE_FITNESS, EVOLVE_METHODS, run_gbs_evolve
+from heuristics.gbs import GBS_DEFER, GBS_PARTITIONS, GBS_RULES, run_gbs, run_gbs_sequence
 from heuristics.heuristic_utils import BinEvent, ExoState
 from heuristics.partitioned_rdi import PARTITION_METHODS, run_partitioned_rdi
 from heuristics.rdi import TIEBREAKERS, run_rdi
@@ -75,6 +76,10 @@ HEURISTICS: dict[str, tuple[Callable[..., HeuristicSolution], dict]] = {
     # ablations: no SKU deferral / the original station-by-station construction
     "gbs_no_defer": (run_gbs, {"rule": "max_sharing", "defer": None}),
     "gbs_sequential": (run_gbs, {"rule": "max_sharing", "defer": None, "interleave": False}),
+    # evolutionary search over GBS order sequences (partition + lane admission order), seeded with
+    # the overlap / lpt / cluster_lpt GBS runs; budget in decodings (~0.05-0.1 s each)
+    "gbs_evolve": (run_gbs_evolve, {"method": "ga", "fitness": "makespan", "window": 3, "max_evals": 300}),
+    "gbs_evolve_work": (run_gbs_evolve, {"method": "ls", "fitness": "work", "window": 3, "max_evals": 300}),
 }
 
 # Alternative spellings accepted by run_heuristic (e.g. LNS precalculation configs).
@@ -122,6 +127,8 @@ def run_heuristic(name: str, inst: Instance, **params) -> HeuristicSolution:
 
 
 __all__ = [
+    "EVOLVE_FITNESS",
+    "EVOLVE_METHODS",
     "ALIASES",
     "ALL_RULES",
     "BinEvent",
@@ -139,6 +146,8 @@ __all__ = [
     "run_ama",
     "run_cfss",
     "run_gbs",
+    "run_gbs_evolve",
+    "run_gbs_sequence",
     "run_heuristic",
     "run_partitioned_rdi",
     "run_rdi",

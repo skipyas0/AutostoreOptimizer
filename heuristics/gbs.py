@@ -83,10 +83,13 @@ class _Station:
     unscheduled: list[int] = field(default_factory=list)
     pickface_free: int = 0
     future: Counter = field(default_factory=Counter)  # SKU -> unscheduled orders of this station needing it
+    admitted: list[int] = field(default_factory=list)  # admission order (replays the run with window=1)
+    window: int | None = None  # admit among the first `window` unscheduled orders only (None: all, by overlap)
 
     def admit(self, o: int, inst: Instance) -> None:
         """Move unscheduled order o to the active orders."""
         self.unscheduled.remove(o)
+        self.admitted.append(o)
         self.future.subtract(inst.req_sets[o])
         self.pending[o] = set(inst.orders_req[o])
 
@@ -177,16 +180,21 @@ def _pick_by_overlap(cands: list[int], skus: set[int], inst: Instance) -> int:
     return max(cands, key=lambda o: (_overlap_weight(o, skus, inst), -sum(rt[k] for k in inst.orders_req[o])))
 
 
+def _candidates(st: _Station) -> list[int]:
+    return st.unscheduled if st.window is None else st.unscheduled[:st.window]
+
+
 def _seed_lanes(st: _Station, inst: Instance, t0: int) -> None:
     rt = inst.rt
-    st.unscheduled.sort(key=lambda o: sum(rt[k] for k in inst.orders_req[o]))
+    if st.window is None:  # with a window, `unscheduled` is the given sequence
+        st.unscheduled.sort(key=lambda o: sum(rt[k] for k in inst.orders_req[o]))
     for ln in st.lanes:
         if not st.unscheduled:
             break
         if not st.pending:
             o = st.unscheduled[0]
         else:
-            o = _pick_by_overlap(st.unscheduled, set().union(*(inst.orders_req[a] for a in st.pending)), inst)
+            o = _pick_by_overlap(_candidates(st), set().union(*(inst.orders_req[a] for a in st.pending)), inst)
         st.admit(o, inst)
         ln.order, ln.free_at = o, t0
 
@@ -203,7 +211,8 @@ def _score(task: _Task, st: _Station, inst: Instance, rule: str) -> float:
     raise ValueError(f"Unknown GBS rule {rule!r}; choose from {GBS_RULES} or 'adaptive'")
 
 
-def _build_tasks(st: _Station, state: HeuristicState, rule: str, defer: str | None = None) -> list[_Task]:
+def _build_tasks(st: _Station, state: HeuristicState, rule: str, defer: str | None = None,
+                 sku_bias: dict[int, float] | None = None) -> list[_Task]:
     inst = state.inst
     lane_of = {ln.order: i for i, ln in enumerate(st.lanes) if ln.order is not None}
     tasks = []
@@ -212,6 +221,8 @@ def _build_tasks(st: _Station, state: HeuristicState, rule: str, defer: str | No
         copy_free, copy_id = state.bin_pools[k].get_earliest_free()
         task = _Task(k, served, max(st.pickface_free - inst.rt[k], copy_free), copy_id)
         task.score = _score(task, st, inst, rule)
+        if sku_bias:
+            task.score += sku_bias.get(k, 0.0)
         if defer is not None and st.future[k] > 0:
             if defer == "strict":
                 task.deferred = True
@@ -258,7 +269,7 @@ def _complete_and_admit(st: _Station, inst: Instance, windows: dict[int, tuple[i
         ln.order, ln.free_at = None, windows[o][1]
         if st.unscheduled:
             remaining = set().union(*st.pending.values()) if st.pending else set()
-            new_o = _pick_by_overlap(st.unscheduled, remaining, inst)
+            new_o = _pick_by_overlap(_candidates(st), remaining, inst)
             st.admit(new_o, inst)
             ln.order = new_o
 
@@ -266,13 +277,14 @@ def _complete_and_admit(st: _Station, inst: Instance, windows: dict[int, tuple[i
 def _step(
     st: _Station, state: HeuristicState, rule: str, defer: str | None,
     pick_events: dict, windows: dict[int, tuple[int, int]], lane_of: dict[int, int],
+    sku_bias: dict[int, float] | None = None,
 ) -> bool:
     """Schedule one bin visit at station st. False if no task fits the horizon (station is stuck)."""
     for ln in st.lanes:
         if ln.order is not None:
             lane_of[ln.order] = ln.lane
     ev = task = None
-    for task in _build_tasks(st, state, rule, defer):
+    for task in _build_tasks(st, state, rule, defer, sku_bias):
         ev = _schedule_task(task, st, state)
         if ev is not None:
             break
@@ -301,22 +313,28 @@ class _Options:
     cluster_max_orders: int
 
 
-def _run_gbs_rule(inst: Instance, horizon: int, exo: ExoState | None, opt: _Options) -> HeuristicSolution:
+def _run_gbs_rule(
+    inst: Instance, horizon: int, exo: ExoState | None, opt: _Options,
+    assignment: dict[int, list[int]] | None = None, window: int | None = None,
+    sku_bias: dict[int, float] | None = None, quiet: bool = False,
+) -> HeuristicSolution:
     state = init_state(inst, horizon, exo)
     t0 = (exo.batch_start_time if exo else 0)
-    assignment = partition_orders(inst, opt.partition, opt.cluster_max_orders)
+    if assignment is None:
+        assignment = partition_orders(inst, opt.partition, opt.cluster_max_orders)
     pick_events: dict[tuple[int, int, int], tuple[int, int]] = {}
     windows: dict[int, tuple[int, int]] = {}
     lane_of: dict[int, int] = {}
     stations = []
     for s in inst.S:
-        st = _Station(s, [_Lane(ln, None, t0) for ln in inst.L], unscheduled=list(assignment[s]), pickface_free=t0)
+        st = _Station(s, [_Lane(ln, None, t0) for ln in inst.L], unscheduled=list(assignment.get(s, ())),
+                      pickface_free=t0, window=window)
         for o in st.unscheduled:
             st.future.update(inst.req_sets[o])
         stations.append(st)
 
     def step(st: _Station) -> bool:
-        return _step(st, state, opt.rule, opt.defer, pick_events, windows, lane_of)
+        return _step(st, state, opt.rule, opt.defer, pick_events, windows, lane_of, sku_bias)
 
     if opt.interleave:
         for st in stations:
@@ -337,7 +355,7 @@ def _run_gbs_rule(inst: Instance, horizon: int, exo: ExoState | None, opt: _Opti
     complete = [o for o in inst.O if o in windows and all((o, station_of[o], k) in pick_events for k in req[o])]
     order_assignments = {o: (station_of[o], lane_of[o], *windows[o]) for o in complete}
     failed = [o for o in inst.O if o not in order_assignments]
-    if failed:
+    if failed and not quiet:
         print(f"[GBS] WARNING: {len(failed)} orders could not be scheduled: {failed}")
 
     return HeuristicSolution(
@@ -348,7 +366,8 @@ def _run_gbs_rule(inst: Instance, horizon: int, exo: ExoState | None, opt: _Opti
         feasible=not failed,
         pick_events={key: t for key, t in pick_events.items() if key[0] in order_assignments},
         meta={"heuristic": "gbs", "rule": opt.rule, "defer": opt.defer, "interleave": opt.interleave,
-              "partition": opt.partition, "assignment": assignment},
+              "partition": opt.partition, "assignment": assignment,
+              "sequence": {st.s: list(st.admitted) for st in stations}},
     )
 
 
@@ -398,3 +417,36 @@ def run_gbs(
             best, best_obj = sol, obj
     best.meta.update({"heuristic": "gbs", "best_rule": best.meta["rule"], "rule": "adaptive", "runs": runs})
     return best
+
+
+def run_gbs_sequence(
+    inst: Instance,
+    sequence: dict[int, list[int]],
+    *,
+    horizon: int = 10000,
+    rule: str = "max_sharing",
+    defer: str | None = "strict",
+    window: int = 1,
+    sku_bias: dict[int, float] | None = None,
+    exo: ExoState | None = None,
+    quiet: bool = True,
+) -> HeuristicSolution:
+    """GBS with a given partition *and* lane-admission order (the decoder of ``heuristics.evolve``).
+
+    ``sequence``: station -> its orders in admission order. Each freed lane admits, among the first
+    ``window`` unscheduled orders of the sequence, the one with the largest overlap with the active
+    orders (``window=1``: strictly in sequence order). ``sku_bias``: SKU -> value added to every bin
+    task score of that SKU (strict deferral still comes first).
+
+    ``run_gbs(...).meta["sequence"]`` decoded with ``window=1`` and the same rule and deferral
+    reproduces that GBS solution exactly.
+    """
+    if rule not in GBS_RULES:
+        raise ValueError(f"Unknown GBS rule {rule!r}; choose from {GBS_RULES}")
+    if window < 1:
+        raise ValueError("window must be >= 1")
+    opt = _Options(rule, defer, True, "given", 0)
+    sol = _run_gbs_rule(inst, horizon, exo, opt, assignment=sequence, window=window,
+                        sku_bias=sku_bias, quiet=quiet)
+    sol.meta["window"] = window
+    return sol

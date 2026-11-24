@@ -19,6 +19,7 @@ Everything here is behaviour-preserving relative to the pre-refactor
 
 from __future__ import annotations
 
+import copy
 import heapq
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -83,7 +84,11 @@ class ExoState:
 
 
 class DifferenceArray:
-    """Tracks concurrent robot moves via a difference array + prefix sum."""
+    """Tracks concurrent robot moves: a difference array plus its prefix sum (the profile).
+
+    ``add_move`` / ``remove_move`` update the profile in place in O(move duration), so queries
+    never rebuild it (the old O(H) rebuild per query was ~90% of the GBS runtime).
+    """
 
     def __init__(self, horizon: int):
         self.H = horizon
@@ -91,28 +96,27 @@ class DifferenceArray:
         self.prefix = [0] * (horizon + 2)  # prefix[t]: total moves active at t
         self._dirty = False
 
-    def add_move(self, start: int, end: int) -> None:
-        """Register one move active during [start, end)."""
+    def _update(self, start: int, end: int, delta: int) -> None:
         if start >= end:
             return
         s = max(0, start)
         e = min(end, self.H + 1)
-        self.diff[s] += 1
-        self.diff[e] -= 1
-        self._dirty = True
+        self.diff[s] += delta
+        self.diff[e] -= delta
+        prefix = self.prefix
+        for t in range(s, e):
+            prefix[t] += delta
+
+    def add_move(self, start: int, end: int) -> None:
+        """Register one move active during [start, end)."""
+        self._update(start, end, 1)
 
     def remove_move(self, start: int, end: int) -> None:
         """Undo one move previously added for [start, end)."""
-        if start >= end:
-            return
-        s = max(0, start)
-        e = min(end, self.H + 1)
-        self.diff[s] -= 1
-        self.diff[e] += 1
-        self._dirty = True
+        self._update(start, end, -1)
 
     def build_prefix(self) -> None:
-        """Rebuild cumulative profile from difference array. O(H)."""
+        """Rebuild the profile from the difference array, O(H). Only needed after editing ``diff`` directly."""
         self.prefix[0] = self.diff[0]
         for t in range(1, self.H + 2):
             self.prefix[t] = self.prefix[t - 1] + self.diff[t]
@@ -184,6 +188,36 @@ class BinCopyPool:
         return new
 
 
+class _LazyPools(dict):
+    """SKU -> BinCopyPool, created on first access with all copies free at t0.
+
+    Instances have tens of thousands of SKUs but a schedule touches only a few thousand, and
+    building every pool upfront dominated ``init_state``.
+    """
+
+    def __init__(self, skus, n_copies, t0: int):
+        super().__init__()
+        self.skus = set(skus)
+        self._n, self._t0 = n_copies, t0
+
+    def __missing__(self, k: int) -> BinCopyPool:
+        if k not in self.skus:
+            raise KeyError(k)
+        pool = BinCopyPool(k, self._n[k])
+        pool._heap = [(self._t0, i) for i in range(pool.n_copies)]
+        self[k] = pool
+        return pool
+
+    def __contains__(self, k) -> bool:
+        return k in self.skus
+
+    def __deepcopy__(self, memo):
+        new = _LazyPools(self.skus, self._n, self._t0)
+        for k, pool in self.items():
+            dict.__setitem__(new, k, copy.deepcopy(pool, memo))
+        return new
+
+
 # ============================================================
 # Mutable construction state
 # ============================================================
@@ -245,12 +279,10 @@ def init_state(
                 move_da.add_move(st, en)
     move_da.build_prefix()
 
-    bin_pools = {k: BinCopyPool(k, N[k]) for k in K}
-    for pool in bin_pools.values():
-        pool._heap = [(t0, i) for i in range(pool.n_copies)]
+    bin_pools = _LazyPools(K, N, t0)
     if exo.blocks:
         for k, blocks in exo.blocks.items():
-            if k in bin_pools:
+            if k in bin_pools.skus:
                 pool = bin_pools[k]
                 for st, en in sorted(blocks):
                     avail, cid = heapq.heappop(pool._heap)
@@ -657,8 +689,6 @@ def commit_plan(plan: OrderPlan, state: HeuristicState) -> None:
         (ev.presence_end for ev in state.station_bin_events[s]),
         default=state.pickface_free[s],
     )
-
-    state.move_da.build_prefix()
 
     if plan.start < state.first_pick.get(s, float("inf")):
         state.first_pick[s] = plan.start

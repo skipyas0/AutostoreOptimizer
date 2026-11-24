@@ -512,3 +512,69 @@ def test_gbs_tight_horizon_is_infeasible_not_false_feasible(four_stations):
     assert not sol.feasible
     assert set(sol.order_assignments) < set(four_stations.O)
     assert all(v.startswith("Order") for v in sol.validate(four_stations, 200))  # only missing orders
+
+
+# ----------------------------------------------------------------------
+# GBS sequence decoder and evolutionary search
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("partition", ["overlap", "lpt", "cluster_lpt"])
+@pytest.mark.parametrize("rule", ["max_sharing", "critical_path", "readiness_weighted"])
+@pytest.mark.parametrize("defer", [None, "strict"])
+def test_gbs_sequence_replays_gbs(four_stations, partition, rule, defer):
+    from heuristics import run_gbs_sequence
+
+    a = run_gbs(four_stations, rule=rule, partition=partition, defer=defer)
+    b = run_gbs_sequence(four_stations, a.meta["sequence"], rule=rule, defer=defer, window=1)
+    assert b.bin_events == a.bin_events
+    assert b.order_assignments == a.order_assignments and b.pick_events == a.pick_events
+    assert sorted(o for seq in a.meta["sequence"].values() for o in seq) == sorted(four_stations.O)
+
+
+def test_gbs_sequence_window_and_bias_stay_valid(four_stations):
+    from heuristics import run_gbs_sequence
+
+    seq = run_gbs(four_stations).meta["sequence"]
+    rev = {s: list(reversed(v)) for s, v in seq.items()}
+    k = four_stations.orders_req[four_stations.O[0]][0]
+    for window in (1, 3, 1000):
+        sol = run_gbs_sequence(four_stations, rev, window=window, sku_bias={k: 50.0})
+        assert sol.feasible and sol.validate(four_stations) == []
+    with pytest.raises(ValueError):
+        run_gbs_sequence(four_stations, rev, window=0)
+
+
+@pytest.mark.parametrize("method", ["ls", "ga"])
+@pytest.mark.parametrize("fitness", ["makespan", "work"])
+def test_gbs_evolve_never_worse_than_seeds(four_stations, method, fitness):
+    from heuristics import run_gbs_evolve
+    from heuristics.evolve import robot_work
+
+    sol = run_gbs_evolve(four_stations, method=method, fitness=fitness, max_evals=40, seed=1, evolve_bias=True)
+    assert sol.feasible and sol.validate(four_stations) == []
+    f = (sol.makespan, robot_work(sol, four_stations))
+    f = f if fitness == "makespan" else f[::-1]
+    assert tuple(sol.meta["fitness_value"]) == f
+    assert f <= min(tuple(v) for v in sol.meta["seed_fitness"].values())
+    assert sol.meta["evals"] == 40
+    # deterministic for a fixed seed
+    again = run_gbs_evolve(four_stations, method=method, fitness=fitness, max_evals=40, seed=1, evolve_bias=True)
+    assert again.bin_events == sol.bin_events
+
+
+def test_gbs_evolve_crossover_is_a_partition(four_stations):
+    import random
+
+    from heuristics.evolve import Genome, _Problem, crossover, mutate
+
+    pb = _Problem(four_stations, 10000, "max_sharing", "strict", 1, "makespan")
+    rng = random.Random(0)
+    base = Genome([list(v) for v in run_gbs(four_stations).meta["sequence"].values()])
+    for _ in range(50):
+        a, b = base.copy(), base.copy()
+        for _ in range(10):
+            mutate(a, pb, rng, True)
+            mutate(b, pb, rng, True)
+        c = crossover(a, b, pb, rng)
+        assert sorted(o for x in c.seq for o in x) == sorted(four_stations.O)
