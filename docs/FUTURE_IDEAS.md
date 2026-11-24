@@ -33,10 +33,21 @@ other stations still have unstarted orders. Let it take one of those orders inst
 Robot work and fetches are unchanged (only unstarted orders move). Valid on the regression grid (438 runs incl.
 PickCap 2–3, MoveCap 3, tight horizon; 125 runs actually stole).
 
-**Open question.** Stealing trades workload balance (Σ p per station) for finish-time balance: stations that share
-more need fewer visits and finish early, so they take extra picking work. In earlier LNS results, LNS evened finishing
-times on its own (makespan imbalance ~3%) while workload imbalance stayed at 7–10%. Decide with an LNS run which
-balance a warm start should have before adding the option (`steal_min_queue: int | None = None`, off by default).
+**Trade-off.** Stealing trades workload balance (Σ p per station) for finish-time balance: stations that share
+more need fewer visits and finish early, so they take extra picking work.
+
+**Verdict for LNS warm starts: not worth it** (warm-start benchmark, 2026-11-24, `scripts/warmstart_benchmark/`,
+10 instances × 4 runs × 150 iterations, full-model LNS):
+- LNS evens finishing times on its own from every start (makespan imbalance 8–16% → 0.6–2.5%), which is the only
+  thing stealing improves.
+- LNS does not keep the start's workload balance either: `gbs_cluster_lpt` 0.2% → 10.1%, `gbs_max_sharing`
+  14.8% → 17.4%, LB-SGC 6.6% → 8.3%.
+- The two GBS starts have the same robot work but very different balance; their final makespans differ by
+  −0.2 pp (95% CI −0.6 to +0.2, 7/3 instances, p = 0.28). Final makespan follows the start's robot work (r = 0.98),
+  which stealing does not change.
+
+Stealing would only matter where the GBS schedule itself is used (no LNS afterwards). The option would be
+`steal_min_queue: int | None = None`, off by default.
 
 ## GBS: cheaper clustering for `cluster_lpt`
 
