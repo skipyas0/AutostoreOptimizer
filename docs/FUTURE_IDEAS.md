@@ -49,6 +49,48 @@ more need fewer visits and finish early, so they take extra picking work.
 Stealing would only matter where the GBS schedule itself is used (no LNS afterwards). The option would be
 `steal_min_queue: int | None = None`, off by default.
 
+## GBS: regret-based partition (and last-chance admission)
+
+**Idea.** Assign orders to stations in regret order, as RDI does, instead of a fixed largest-first order. A bin
+visit can only be shared at one station, so the partition caps sharing: with one visit per (station, SKU), the
+current partitions would need 0.68–0.72 fetches per order line (0.55 if every SKU were fetched once overall).
+
+**Rule (as tested, scratch prototype, 2026-11-24).**
+- *Fit*: `fit(o, s)` = robot time `Σ (rt + rt_ret)` of o's SKUs that station s already has (the trips co-location
+  can save). Updated incrementally: when o goes to s, each SKU new at s adds its robot time to every unassigned
+  order needing it (one numpy fit matrix, 0.03 s for 600 orders).
+- *Balance cap*: s is eligible for o only while `load_s + Σp(o) <= (1 + ε) · Σp / |S|`; no eligible station →
+  least loaded.
+- *Order*: the unassigned order with the largest regret-2 (best eligible fit − second best), ties larger Σp, then
+  lower id; it goes to its best station (ties: least loaded).
+- Regret-3 and regret over all stations gave identical results: overlaps are sparse, an order usually overlaps one
+  station only, so regret ≈ best fit ("most co-location value first").
+
+**Evidence (15 eval instances, GBS with strict deferral, interleaved, relative to `gbs_max_sharing`).**
+
+| partition / admission | bound per line | fetches | robot work | makespan | workload imb. |
+|---|---|---|---|---|---|
+| overlap (current) | 0.683 | 0 | 0 | 0 | 14.9% |
+| `cluster_lpt` | 0.687 | −0.6% | −0.5% | 0.0% | 0.2% |
+| control: same fit and cap, largest-first | 0.676 | −0.6% | −0.3% | +1.3% | 4.9% |
+| regret-2, ε = 0.05 | 0.644 | −2.8% | −1.8% (15/15) | −0.6% | 4.9% |
+| regret-2, ε = 0.02 | 0.645 | −2.7% | −1.8% | +0.4% | 1.9% |
+| regret-2, ε = 0.20 | 0.639 | −2.7% | −1.7% | +0.6% | 19.9% |
+| regret-2 (ε = 0.05) + last-chance bonus | – | −3.3% | −2.1% (15/15) | +0.9% | 4.9% |
+
+Makespan imbalance rises to ~22%; LNS evens finishing times from any start (warm-start benchmark), so this should
+not matter for warm starts.
+
+**Last-chance admission.** When a lane frees, prefer the waiting order that is the *last* one at the station needing
+an SKU the active orders still have to pick (`future[k] == 1` for k in the active orders' remaining SKUs): admitting
+it lets one visit serve all of them, otherwise strict deferral keeps holding that SKU back. Tested as a bonus
+(score = last-chance robot time + overlap robot time): −0.27 pp robot work alone (14/15), −0.25 pp on top of the
+regret partition. Small; only worth it together with the partition.
+
+**Not done.** LNS validation (expected ≈ −1.8% final makespan, since final makespan follows the start's robot work,
+r = 0.98); a dynamic version (a freed lane takes the order for which this station is relatively best from the global
+pool) would need deferral's per-station demand counts and the balance cap redesigned.
+
 ## GBS: cheaper clustering for `cluster_lpt`
 
 `agglomerative_cluster` rescans all pair similarities on every merge (O(n³)); it makes `gbs_cluster_lpt` take ~2.6 s
