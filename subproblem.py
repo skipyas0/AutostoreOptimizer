@@ -23,9 +23,9 @@ as one more candidate of alternative(C[o,k,s], ...). The visit's own variables s
 frozen (see docs/KNOWN_ISSUES.md, "Subproblem LNS: joining frozen bin visits").
 
 With the graph neighbourhood (``extract_context_graph``, default in the LNS) the
-subproblem frees exactly the variables the full-model LNS frees: frozen orders that pick
-from a freed visit are added with all their variables fixed (pinned), active orders'
-picks on frozen visits are fixed, and surplus copy slots are fixed absent.
+subproblem frees exactly the variables the full-model LNS frees: fixed picks of frozen
+orders on a freed visit enter as *anchored picks* of that visit slot (``anchors``), active
+orders' picks on frozen visits are fixed, and surplus copy slots are fixed absent.
 
 The subproblem result is written back into a full-model solution dict
 (``CppSolveResult``), so strategies, logging and acceptance are unchanged.
@@ -76,8 +76,10 @@ class ObjectiveOffsets:
 class SubInstance:
     """Minimal stand-in for ``Instance`` with only the fields the model builders read."""
 
-    def __init__(self, S, L, K, orders_req, rt, p, N, movecap, pickcap, rt_ret):
+    def __init__(self, S, L, K, orders_req, rt, p, N, movecap, pickcap, rt_ret,
+                 min_copies=None):
         self.S, self.L, self.K = S, L, K
+        self.min_copies = min_copies  # k -> copy slots at least (visits with anchored picks)
         self.orders_req = orders_req
         self.rt, self.p, self.N = rt, p, N
         self.movecap, self.pickcap, self.rt_ret = movecap, pickcap, rt_ret
@@ -106,10 +108,11 @@ class FrozenContext:
     exo_visits: list = field(default_factory=list)
     warm_px: dict = field(default_factory=dict)  # (o, s, k, e) -> incumbent pick on an exo visit
     # Graph neighbourhood (extract_context_graph), None/empty otherwise:
-    pinned: set = field(default_factory=set)  # frozen orders on free visits, all variables fixed
+    # (s, k, e_sub, fixed picks): free visit slots carrying frozen orders' picks
+    anchors: list = field(default_factory=list)
+    anchor_slot: dict = field(default_factory=dict)  # (s, k, e_sub) -> full copy index
     slot_limit: dict | None = None  # (s, k) -> number of free copy slots; others absent
     slot_pool: dict = field(default_factory=dict)  # (s, k) -> full-model copy indices freed
-    pin_slot: dict = field(default_factory=dict)  # (o, s, k) -> full copy index of a pinned pick
     incumbent: dict = field(default_factory=dict)  # var_sols of the incumbent (fixed values)
 
 
@@ -301,15 +304,16 @@ def extract_context_graph(solution, handles, instance, active_orders, free_visit
     Free: I_os, I_os_lane and C of the active orders; F, B, R, Block of ``free_visits``
     (full-model (s, k, e)); P[o,s,k,e] for an active order o on a free visit. Everything
     else is frozen, as in the full-model LNS:
-    - a free visit may still carry picks of frozen orders. Those orders are *pinned*:
-      they enter the subproblem with every variable fixed, so their fixed picks keep
-      constraining the free visit (F -> P -> R, PickCap, presence);
+    - a free visit may still carry picks of frozen orders. They stay fixed and enter the
+      subproblem as *anchored picks* of the visit's copy slot (``anchors``): the slot is
+      present, its fetch ends before and its return starts after each of them, and they
+      count in the station's PickCap. The frozen orders themselves are exo data;
     - an active order's pick on a frozen visit is fixed (PX fixed to the incumbent,
       no joining); on any other frozen visit it stays absent;
     - per (s, k) the subproblem has as many free copy slots as ``free_visits`` has
       there; the remaining slots are fixed absent. Free slots are interchangeable
       (no symmetry breaking), so this is the full neighbourhood up to relabelling the
-      copies; a pinned pick keeps its visit's copy index (merge).
+      copies; a visit with anchored picks keeps its copy index (merge).
     """
     vs = solution.var_sols
     active = set(active_orders)
@@ -319,21 +323,6 @@ def extract_context_graph(solution, handles, instance, active_orders, free_visit
     P, F, R, B, Block = (handles[x] for x in ("P", "F", "R", "B", "Block"))
     demand = handles["orders_demanding_sku"]
     p = handles["p"]
-
-    visits = {}  # present (s, k, e) -> (presence, {order: pick})
-    for key, b_var in B.items():
-        b = _present(vs, b_var)
-        if b is None:
-            continue
-        s, k, e = key
-        picks = {}
-        for o in demand[k]:
-            iv = _present(vs, P[(o, s, k, e)])
-            if iv is not None:
-                picks[o] = iv
-        visits[key] = (b, picks)
-    pinned = {o for key, (_, picks) in visits.items() if key in V for o in picks} - active
-    sub_orders = active | pinned
 
     offsets = ObjectiveOffsets()
     exo_lanes = defaultdict(list)
@@ -346,7 +335,7 @@ def extract_context_graph(solution, handles, instance, active_orders, free_visit
         st, en = _present(vs, I_os[(o, s_sel)])
         ln_sel = next(ln for ln in L if _present(vs, I_os_lane[(o, s_sel, ln)]))
         assignments[o] = (s_sel, ln_sel, st, en)
-        if o in sub_orders:
+        if o in active:
             continue
         exo_lanes[(s_sel, ln_sel)].append((st, en))
         offsets.makespan_lb = max(offsets.makespan_lb, en)
@@ -355,53 +344,82 @@ def extract_context_graph(solution, handles, instance, active_orders, free_visit
         window[s_sel] = (min(lo, st), max(hi, en))
     offsets.station_window = window
 
-    sub_skus = {k for o in sub_orders for k in handles["orders_req"][o]}
+    def count_frozen_pick(s, k):
+        offsets.station_pick_time[s] = offsets.station_pick_time.get(s, 0) + p[k]
+        offsets.station_pick_count[s] = offsets.station_pick_count.get(s, 0) + 1
+
     exo_station_bins = defaultdict(list)
     exo_blocks = defaultdict(list)
     exo_moves = []
     frozen_slots = defaultdict(set)
     free_present, warm_events, warm_picks = [], defaultdict(list), {}
-    exo_visits, warm_px, pin_slot = [], {}, {}
-    for key, (b, picks) in visits.items():
+    exo_visits, warm_px = [], {}
+    anchored_full = {}  # full (s, k, e) -> fixed picks of frozen orders
+    for key, b_var in B.items():
+        b = _present(vs, b_var)
+        if b is None:
+            continue
         s, k, e = key
+        picks = {}
+        for o in demand[k]:
+            iv = _present(vs, P[(o, s, k, e)])
+            if iv is not None:
+                picks[o] = iv
         f = _present(vs, F[key])
         r = _present(vs, R[key])
+        frozen = [o for o in picks if o not in active]
+        for _ in frozen:
+            count_frozen_pick(s, k)
+        mine = sorted(o for o in picks if o in active)
         if key in V:
             free_present.append(key)
-            served = sorted(picks)
+            if frozen:
+                anchored_full[key] = sorted(picks[o] for o in frozen)
             warm_events[s].append(
                 BinEvent(sku=k, copy_id=e, fetch_start=f[0], fetch_end=f[1],
                          presence_start=b[0], presence_end=b[1],
-                         return_start=r[0], return_end=r[1], orders_served=served,
-                         pick_intervals=sorted(picks.values()))
+                         return_start=r[0], return_end=r[1], orders_served=mine,
+                         pick_intervals=sorted(picks[o] for o in mine))
             )
-            for o in served:
+            for o in mine:
                 warm_picks[(o, s, k)] = picks[o]
-                if o in pinned:
-                    pin_slot[(o, s, k)] = e
             continue
         exo_station_bins[s].append(b)
         exo_blocks[k].append(_present(vs, Block[key]))
         exo_moves.extend([f, r])
         frozen_slots[(s, k)].add(e)
         offsets.bin_fetches += 1
-        outside = [o for o in picks if o not in sub_orders]
-        for o in outside:
-            offsets.station_pick_time[s] = offsets.station_pick_time.get(s, 0) + p[k]
-            offsets.station_pick_count[s] = offsets.station_pick_count.get(s, 0) + 1
-        inside = [o for o in picks if o in sub_orders]
-        if inside:  # fixed picks of subproblem orders on a frozen visit
-            exo_visits.append((s, k, e, b[0], b[1], sorted(picks[o] for o in outside)))
-            for o in inside:
+        if mine:  # fixed picks of active orders on a frozen visit
+            exo_visits.append((s, k, e, b[0], b[1], sorted(picks[o] for o in frozen)))
+            for o in mine:
                 warm_px[(o, s, k, e)] = picks[o]
 
+    # Copy slot of each free present visit in the subproblem: inject_warmstart puts the
+    # visits of (s, k) into slots 0, 1, ... by fetch start.
+    anchors, anchor_slot = [], {}
+    for s, events in warm_events.items():
+        by_sku = defaultdict(list)
+        for be in events:
+            by_sku[be.sku].append(be)
+        for k, evts in by_sku.items():
+            for rank, be in enumerate(sorted(evts, key=lambda x: x.fetch_start)):
+                picks = anchored_full.get((s, k, be.copy_id))
+                if picks is not None:
+                    anchors.append((s, k, rank, picks))
+                    anchor_slot[(s, k, rank)] = be.copy_id
+
+    sub_skus = {k for o in active for k in handles["orders_req"][o]}
     slot_pool = defaultdict(list)
     for (s, k, e) in sorted(V):
-        if k in sub_skus:
-            slot_pool[(s, k)].append(e)
+        slot_pool[(s, k)].append(e)
+    # SKUs of the active orders, plus those of free visits that carry only anchored picks
+    K_sub = sorted(sub_skus | {k for (_, k, _) in anchored_full})
+    slot_pool = {key: v for key, v in slot_pool.items() if key[1] in K_sub}
+    min_copies = defaultdict(int)
+    for (s, k), v in slot_pool.items():
+        min_copies[k] = max(min_copies[k], len(v))
 
-    orders_req = {o: list(handles["orders_req"][o]) for o in sorted(sub_orders)}
-    K_sub = sorted(sub_skus)
+    orders_req = {o: list(handles["orders_req"][o]) for o in sorted(active)}
     sub = SubInstance(
         S=S, L=L, K=K_sub, orders_req=orders_req,
         rt={k: handles["rt"][k] for k in K_sub},
@@ -409,11 +427,12 @@ def extract_context_graph(solution, handles, instance, active_orders, free_visit
         N={k: handles["N"][k] for k in K_sub},
         movecap=instance.movecap, pickcap=instance.pickcap,
         rt_ret={k: handles["rt_return"][k] for k in K_sub},
+        min_copies=dict(min_copies),
     )
-    warm_assign = {o: assignments[o] for o in sub_orders}
+    warm_assign = {o: assignments[o] for o in active}
     warm = HeuristicSolution(
         order_assignments=warm_assign,
-        bin_events=dict(warm_events),
+        bin_events={s: [be for be in evts if be.sku in K_sub] for s, evts in warm_events.items()},
         makespan=max((a[3] for a in warm_assign.values()), default=0),
         total_moves=2 * sum(len(v) for v in warm_events.values()),
         feasible=True,
@@ -421,11 +440,11 @@ def extract_context_graph(solution, handles, instance, active_orders, free_visit
         meta={"heuristic": "lns_subproblem_warmstart_graph"},
     )
     return FrozenContext(
-        active_orders=sorted(sub_orders),
+        active_orders=sorted(active),
         instance=sub,
         exo_lanes=dict(exo_lanes),
         exo_station_bins=dict(exo_station_bins),
-        exo_blocks={k: v for k, v in exo_blocks.items() if k in sub_skus},
+        exo_blocks={k: v for k, v in exo_blocks.items() if k in K_sub},
         exo_moves=exo_moves,
         offsets=offsets,
         warm=warm,
@@ -434,10 +453,10 @@ def extract_context_graph(solution, handles, instance, active_orders, free_visit
         shared_picks=[],
         exo_visits=exo_visits,
         warm_px=warm_px,
-        pinned=pinned,
+        anchors=anchors,
+        anchor_slot=anchor_slot,
         slot_limit={key: len(v) for key, v in slot_pool.items()},
-        slot_pool=dict(slot_pool),
-        pin_slot=pin_slot,
+        slot_pool=slot_pool,
         incumbent=vs,
     )
 
@@ -445,8 +464,6 @@ def extract_context_graph(solution, handles, instance, active_orders, free_visit
 def graph_fixings(ctx: FrozenContext, handles) -> list:
     """(subproblem variable, value) pairs that ``extract_context_graph`` keeps frozen."""
     fix = []
-    vs = ctx.incumbent
-    U = handles["U"]
     # Copy slots beyond the freed ones are absent
     for (s, k, e) in handles["F"]:
         if e >= ctx.slot_limit.get((s, k), 0):
@@ -455,31 +472,6 @@ def graph_fixings(ctx: FrozenContext, handles) -> list:
     for key, var in handles["PX"].items():
         iv = ctx.warm_px.get(key)
         fix.append((var, _iv(*iv) if iv is not None else ABSENT))
-    # Pinned orders: everything fixed. Their picks on free visits sit in the slot that
-    # inject_warmstart gives the visit (rank by fetch start among the (s, k) visits).
-    slot_of = {}
-    for s, events in ctx.warm.bin_events.items():
-        by_sku = defaultdict(list)
-        for be in events:
-            by_sku[be.sku].append(be)
-        for k, evts in by_sku.items():
-            for rank, be in enumerate(sorted(evts, key=lambda x: x.fetch_start)):
-                for o in be.orders_served:
-                    slot_of[(o, s, k)] = rank
-    for o in ctx.pinned:
-        for (oo, s), var in handles["I_os"].items():
-            if oo == o:
-                fix.append((var, vs.get(var.get_name(), ABSENT)))
-        for (oo, s, ln), var in handles["I_os_lane"].items():
-            if oo == o:
-                fix.append((var, vs.get(var.get_name(), ABSENT)))
-        for (oo, k, s), var in handles["C"].items():
-            if oo == o:
-                fix.append((var, vs.get(var.get_name(), ABSENT)))
-                for e in range(U[k]):
-                    pick = ctx.warm.pick_events.get((o, s, k))
-                    present = pick is not None and slot_of.get((o, s, k)) == e
-                    fix.append((handles["P"][(o, s, k, e)], _iv(*pick) if present else ABSENT))
     return fix
 
 
@@ -517,6 +509,8 @@ def build_submodel(ctx: FrozenContext, backend: str, horizon: int, objective: st
         obj_offsets=ctx.offsets,
         exo_visits=ctx.exo_visits,
     )
+    if ctx.anchors:
+        kwargs["anchors"] = ctx.anchors
     import cp_model
 
     if backend == "docplex":
@@ -661,13 +655,10 @@ def merge(solution, ctx: FrozenContext, sub_sol, sub_handles, handles, written=N
         for k, evts in by_sku.items():
             evts.sort(key=lambda be: be.fetch_start)
             if ctx.slot_limit is not None:
-                # graph neighbourhood: a visit with a pinned pick keeps its copy index,
+                # graph neighbourhood: a visit with anchored picks keeps its copy index,
                 # the others take the remaining freed indices
-                anchored = {}
-                for be in evts:
-                    for o in be.orders_served:
-                        if o in ctx.pinned:
-                            anchored[id(be)] = ctx.pin_slot[(o, s, k)]
+                anchored = {id(be): ctx.anchor_slot[(s, k, be.copy_id)] for be in evts
+                            if (s, k, be.copy_id) in ctx.anchor_slot}
                 pool = iter(e for e in ctx.slot_pool.get((s, k), [])
                             if e not in set(anchored.values()))
                 try:

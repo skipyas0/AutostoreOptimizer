@@ -595,7 +595,11 @@ def _graph_ctx(sol, handles, inst, seeds):
     from freezing_utils import get_associated_indices
 
     act_o, _, _, act_e = get_associated_indices(handles, sol, seeds)
-    return subproblem.extract_context_graph(sol, handles, inst, act_o, act_e)
+    ctx = subproblem.extract_context_graph(sol, handles, inst, act_o, act_e)
+    # Frozen orders stay outside the subproblem (their picks on free visits are anchors)
+    assert ctx.active_orders == sorted(act_o)
+    assert set(ctx.instance.orders_req) == set(act_o)
+    return ctx
 
 
 def _same(a, b):
@@ -622,10 +626,10 @@ def test_graph_subproblem_keeps_the_incumbent(shared_setup, backend):
     """Graph neighbourhood: the warm start, with every subproblem variable fixed to it
     (fixings included), is feasible and has the incumbent's KPIs."""
     inst, handles, sol = shared_setup
-    pinned = 0
+    anchored = 0
     for seeds in _graph_neighbourhoods(handles, 10, seed=3):
         ctx = _graph_ctx(sol, handles, inst, seeds)
-        pinned += bool(ctx.pinned)
+        anchored += bool(ctx.anchors)
         mdl, sub_handles = subproblem.build_submodel(ctx, backend, H, "makespan")
         variables = [v for group in DECISION + ("PX",) for v in sub_handles[group].values()]
         if backend == "docplex":
@@ -652,7 +656,7 @@ def test_graph_subproblem_keeps_the_incumbent(shared_setup, backend):
         assert res.is_solution(), seeds
         for name in KPIS:
             assert res.get_kpis()[name] == sol.get_kpis()[name], (name, seeds)
-    assert pinned >= 3, pinned
+    assert anchored >= 3, anchored
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
@@ -663,7 +667,7 @@ def test_graph_subproblem_matches_full_model(shared_setup, objective, backend):
     full-model LNS freezes at its incumbent value."""
     inst, handles, sol = shared_setup
     cfg = {**CFG, "iter_time_limit": 10}
-    compared = pinned = 0
+    compared = anchored = 0
     for seeds in _graph_neighbourhoods(handles, 6, seed=5):
         ctx = _graph_ctx(sol, handles, inst, seeds)
         mdl, sub_handles = subproblem.build_submodel(ctx, backend, H, objective)
@@ -686,8 +690,8 @@ def test_graph_subproblem_matches_full_model(shared_setup, objective, backend):
         _assert_frozen_unchanged(sol, merged, handles, free)
         if sub_opt and ref_opt:
             compared += 1
-            pinned += bool(ctx.pinned)
-    assert compared >= 3 and pinned >= 2, (compared, pinned)
+            anchored += bool(ctx.anchors)
+    assert compared >= 3 and anchored >= 2, (compared, anchored)
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
@@ -740,3 +744,27 @@ def test_cpp_submodel_matches_docplex_with_exo_visits(shared_setup, tmp_path, ob
             diff = [ln for ln in diff if not ln[1:].startswith("minimize(")]
         assert not diff, "".join(diff[:60])
     assert with_exo >= 3, with_exo
+
+
+@pytest.mark.skipif("cpp" not in BACKENDS, reason="C++ extension not built")
+@pytest.mark.parametrize("objective", ["makespan", "bin_fetches", "max_picks"])
+def test_cpp_submodel_matches_docplex_with_anchors(shared_setup, tmp_path, objective):
+    """Graph-neighbourhood subproblems (anchored picks, extra copy slots, fixings):
+    the C++ and docplex models export the same .cpo."""
+    import cpp_cp_model
+
+    inst, handles, sol = shared_setup
+    with_anchors = 0
+    for i, seeds in enumerate(_graph_neighbourhoods(handles, 6, seed=3)):
+        ctx = _graph_ctx(sol, handles, inst, seeds)
+        with_anchors += bool(ctx.anchors)
+        py_mdl, _ = subproblem.build_submodel(ctx, "docplex", H, objective)
+        cpp_mdl, _ = subproblem.build_submodel(ctx, "cpp", H, objective)
+        py_path, cpp_path = tmp_path / f"py{i}.cpo", tmp_path / f"cpp{i}.cpo"
+        py_mdl.export_model(str(py_path))
+        cpp_cp_model.export_model(cpp_mdl, str(cpp_path))
+        _, diff = compare_cpo_files(str(py_path), str(cpp_path))
+        diff = [ln for ln in diff if ln[:1] in "+-" and ln[:3] not in ("+++", "---")
+                and "shift_len" not in ln and "shift_cost" not in ln]
+        assert not diff, "".join(diff[:60])
+    assert with_anchors >= 3, with_anchors
