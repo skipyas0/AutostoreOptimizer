@@ -91,6 +91,12 @@ regret partition. Small; only worth it together with the partition.
 r = 0.98); a dynamic version (a freed lane takes the order for which this station is relatively best from the global
 pool) would need deferral's per-station demand counts and the balance cap redesigned.
 
+**Ruled out: regret over contested bin copies.** Copy limits `N[k]` do not bind on the eval instances (measured
+2026-11-24): GBS never waits for a copy (0 of ~1,120 visits per instance; 21% wait for a robot, MoveCap is the binding
+resource), and in finished schedules multi-copy SKUs almost never use all copies at once (GBS 0%, LB-SGC share 1.1%,
+LNS finals 0–1.6% of those SKUs). Popularity-correlated copy counts (up to 8 per SKU) give the popular SKUs enough
+copies; this could change for instances with fewer copies per SKU.
+
 ## GBS: cheaper clustering for `cluster_lpt`
 
 `agglomerative_cluster` rescans all pair similarities on every merge (O(n³)); it makes `gbs_cluster_lpt` take ~2.6 s
