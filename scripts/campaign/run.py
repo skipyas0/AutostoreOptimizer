@@ -185,8 +185,13 @@ def main() -> None:
     for j in todo:
         j.prepare(root)
     have_taskset = shutil.which("taskset") is not None
-    have_time = os.path.exists("/usr/bin/time") and subprocess.run(
-        ["/usr/bin/time", "-v", "true"], capture_output=True).returncode == 0
+    gnu_time = next((t for t in ("/usr/bin/time", shutil.which("time"))
+                     if t and os.path.exists(t) and subprocess.run([t, "-v", "true"], capture_output=True).returncode == 0),
+                    None)
+    if not have_taskset:
+        print("WARNING: taskset not found: jobs are NOT pinned to cores (NixOS: util-linux)")
+    if gnu_time is None:
+        print("WARNING: GNU time not found: no peak-memory measurement (NixOS: nix-shell -p time, or add `time`)")
     progress = open(os.path.join(root, "progress.txt"), "a")
 
     def log(msg: str) -> None:
@@ -210,8 +215,8 @@ def main() -> None:
             prefix += ["systemd-run", "--user", "--scope", "--quiet", "-p", f"MemoryMax={int(1.5 * j.mem * 1024)}M"]
         if have_taskset:
             prefix += ["taskset", "-c", str(core)]
-        if have_time:
-            prefix += ["/usr/bin/time", "-v"]
+        if gnu_time:
+            prefix += [gnu_time, "-v"]
         script = " && ".join(" ".join(_q(x) for x in prefix + c) for c in cmds)
         out = open(os.path.join(j.exp_dir, "logs", j.id + ".log"), "w")
         err = open(os.path.join(j.exp_dir, "logs", j.id + ".err"), "w")
