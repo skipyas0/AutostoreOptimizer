@@ -18,7 +18,7 @@ from typing import Callable
 
 from heuristics.cfss import run_cfss
 from heuristics.evolve import EVOLVE_FITNESS, EVOLVE_METHODS, run_gbs_evolve
-from heuristics.gbs import GBS_DEFER, GBS_PARTITIONS, GBS_RULES, run_gbs, run_gbs_sequence
+from heuristics.gbs import GBS_ADMIT, GBS_DEFER, GBS_PARTITIONS, GBS_RULES, run_gbs, run_gbs_sequence
 from heuristics.heuristic_utils import BinEvent, ExoState
 from heuristics.partitioned_rdi import PARTITION_METHODS, run_partitioned_rdi
 from heuristics.rdi import TIEBREAKERS, run_rdi
@@ -64,6 +64,8 @@ HEURISTICS: dict[str, tuple[Callable[..., HeuristicSolution], dict]] = {
     ),
     "cfss": (run_cfss, {}),
     "cfss_normalized": (run_cfss, {"normalize_similarity": True}),
+    # clusters on the lanes together (consecutive), balanced on Σp, + the SGC share options
+    "cfss_share": (run_cfss, {"consecutive": True, "balance": "work", "extend_share_window": True, "share_reward": 1.0}),
     # bin-centred: schedule bin visits serving every active order that needs the SKU
     # (stations interleaved in time, strict SKU deferral, original overlap partition)
     "gbs_max_sharing": (run_gbs, {"rule": "max_sharing"}),
@@ -73,6 +75,9 @@ HEURISTICS: dict[str, tuple[Callable[..., HeuristicSolution], dict]] = {
     # LPT partition on picking workload / on CFSS order clusters (near-perfect workload balance)
     "gbs_lpt": (run_gbs, {"rule": "max_sharing", "partition": "lpt"}),
     "gbs_cluster_lpt": (run_gbs, {"rule": "max_sharing", "partition": "cluster_lpt"}),
+    # regret-2 partition on co-location value (workload cap 1.05 x mean); + last-chance lane admission
+    "gbs_regret": (run_gbs, {"rule": "max_sharing", "partition": "regret"}),
+    "gbs_regret_lc": (run_gbs, {"rule": "max_sharing", "partition": "regret", "admit": "last_chance"}),
     # ablations: no SKU deferral / the original station-by-station construction
     "gbs_no_defer": (run_gbs, {"rule": "max_sharing", "defer": None}),
     "gbs_sequential": (run_gbs, {"rule": "max_sharing", "defer": None, "interleave": False}),
@@ -80,6 +85,8 @@ HEURISTICS: dict[str, tuple[Callable[..., HeuristicSolution], dict]] = {
     # the overlap / lpt / cluster_lpt GBS runs; budget in decodings (~0.05-0.1 s each)
     "gbs_evolve": (run_gbs_evolve, {"method": "ga", "fitness": "makespan", "window": 3, "max_evals": 300}),
     "gbs_evolve_work": (run_gbs_evolve, {"method": "ls", "fitness": "work", "window": 3, "max_evals": 300}),
+    "gbs_evolve_work_regret": (run_gbs_evolve, {"method": "ls", "fitness": "work", "window": 3, "max_evals": 300,
+                                                "seed_partitions": ("overlap", "lpt", "cluster_lpt", "regret")}),
 }
 
 # Alternative spellings accepted by run_heuristic (e.g. LNS precalculation configs).
@@ -134,6 +141,7 @@ __all__ = [
     "BinEvent",
     "ExoState",
     "GBS_DEFER",
+    "GBS_ADMIT",
     "GBS_PARTITIONS",
     "GBS_RULES",
     "HEURISTICS",

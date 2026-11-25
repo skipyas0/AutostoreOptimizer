@@ -423,15 +423,17 @@ def four_stations():
 
 
 @pytest.mark.parametrize("interleave", [True, False])
-@pytest.mark.parametrize("partition", ["overlap", "lpt", "cluster_lpt"])
+@pytest.mark.parametrize("partition", ["overlap", "lpt", "cluster_lpt", "regret"])
 @pytest.mark.parametrize("defer", [None, "soft", "strict"])
 @pytest.mark.parametrize("pickcap", [1, 2])
-def test_gbs_variants_valid(interleave, partition, defer, pickcap):
+@pytest.mark.parametrize("admit", ["overlap", "last_chance"])
+def test_gbs_variants_valid(interleave, partition, defer, pickcap, admit):
     inst = generate_data(num_stations=4, lanes_per_station=3, num_orders=40, num_skus=8000,
                          seed=5, pick_touch_time=4, movecap=12, pickcap=pickcap)
-    sol = run_gbs(inst, interleave=interleave, partition=partition, defer=defer)
+    sol = run_gbs(inst, interleave=interleave, partition=partition, defer=defer, admit=admit)
     assert sol.feasible and sol.validate(inst) == []
-    assert (sol.meta["interleave"], sol.meta["partition"], sol.meta["defer"]) == (interleave, partition, defer)
+    assert (sol.meta["interleave"], sol.meta["partition"], sol.meta["defer"], sol.meta["admit"]) == (
+        interleave, partition, defer, admit)
     # every visit serves all its orders within its presence, at most PickCap at a time
     for evs in sol.bin_events.values():
         for ev in evs:
@@ -461,6 +463,42 @@ def test_gbs_cluster_lpt_keeps_clusters_together(four_stations):
     work = {o: sum(inst.p[k] for k in inst.orders_req[o]) for o in inst.O}
     load = [sum(work[o] for o in inst.O if station_of[o] == s) for s in inst.S]
     assert max(load) - min(load) <= max(sum(work[o] for o in c) for c in clusters)  # LPT bound over clusters
+
+
+@pytest.mark.parametrize("eps", [0.0, 0.05, 0.5])
+def test_gbs_regret_partition_respects_cap(four_stations, eps):
+    """Every order once; a station exceeds the cap only through least-loaded fallbacks."""
+    from heuristics.gbs import partition_orders
+
+    inst = four_stations
+    work = {o: sum(inst.p[k] for k in inst.orders_req[o]) for o in inst.O}
+    part = partition_orders(inst, "regret", regret_eps=eps)
+    assert sorted(o for os_ in part.values() for o in os_) == sorted(inst.O)
+    cap = (1 + eps) * sum(work.values()) / len(inst.S)
+    load = {s: sum(work[o] for o in os_) for s, os_ in part.items()}
+    assert max(load.values()) <= cap + max(work.values())
+    assert partition_orders(inst, "regret", regret_eps=eps) == part  # deterministic
+
+
+def test_gbs_regret_partition_co_locates(four_stations):
+    """Regret puts more of each SKU's demand on one station than the plain LPT partition."""
+    from heuristics.gbs import partition_orders
+
+    inst = four_stations
+
+    def station_sku_pairs(part):
+        return sum(len(set().union(*(inst.req_sets[o] for o in os_))) for os_ in part.values() if os_)
+
+    assert station_sku_pairs(partition_orders(inst, "regret")) <= station_sku_pairs(partition_orders(inst, "lpt"))
+
+
+def test_gbs_rejects_unknown_admit(four_stations):
+    from heuristics import run_gbs_sequence
+
+    with pytest.raises(ValueError):
+        run_gbs(four_stations, admit="nope")
+    with pytest.raises(ValueError):
+        run_gbs_sequence(four_stations, run_gbs(four_stations).meta["sequence"], admit="nope")
 
 
 def test_gbs_strict_deferral_orders_tasks(four_stations):
@@ -519,13 +557,14 @@ def test_gbs_tight_horizon_is_infeasible_not_false_feasible(four_stations):
 # ----------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("partition", ["overlap", "lpt", "cluster_lpt"])
+@pytest.mark.parametrize("partition", ["overlap", "lpt", "cluster_lpt", "regret"])
 @pytest.mark.parametrize("rule", ["max_sharing", "critical_path", "readiness_weighted"])
 @pytest.mark.parametrize("defer", [None, "strict"])
-def test_gbs_sequence_replays_gbs(four_stations, partition, rule, defer):
+@pytest.mark.parametrize("admit", ["overlap", "last_chance"])
+def test_gbs_sequence_replays_gbs(four_stations, partition, rule, defer, admit):
     from heuristics import run_gbs_sequence
 
-    a = run_gbs(four_stations, rule=rule, partition=partition, defer=defer)
+    a = run_gbs(four_stations, rule=rule, partition=partition, defer=defer, admit=admit)
     b = run_gbs_sequence(four_stations, a.meta["sequence"], rule=rule, defer=defer, window=1)
     assert b.bin_events == a.bin_events
     assert b.order_assignments == a.order_assignments and b.pick_events == a.pick_events
@@ -578,3 +617,51 @@ def test_gbs_evolve_crossover_is_a_partition(four_stations):
             mutate(b, pb, rng, True)
         c = crossover(a, b, pb, rng)
         assert sorted(o for x in c.seq for o in x) == sorted(four_stations.O)
+
+
+# ----------------------------------------------------------------------
+# CFSS options
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("consecutive", [False, True])
+@pytest.mark.parametrize("balance", ["rt_mass", "work"])
+@pytest.mark.parametrize("share", [False, True])
+@pytest.mark.parametrize("pickcap", [1, 2])
+def test_cfss_variants_valid(consecutive, balance, share, pickcap):
+    from heuristics import run_cfss
+
+    inst = generate_data(num_stations=4, lanes_per_station=3, num_orders=40, num_skus=8000,
+                         seed=5, pick_touch_time=4, movecap=12, pickcap=pickcap)
+    sol = run_cfss(inst, consecutive=consecutive, balance=balance,
+                   extend_share_window=share, share_reward=1.0 if share else 0.0)
+    assert sol.feasible and sol.validate(inst) == []
+    assert (sol.meta["consecutive"], sol.meta["balance"]) == (consecutive, balance)
+
+
+def test_cfss_consecutive_keeps_clusters_together(four_stations):
+    """With consecutive=True a station starts the orders of one cluster before any later cluster's."""
+    from heuristics import run_cfss
+    from heuristics.cfss import agglomerative_cluster
+    from jaccard_similarity import build_similarity_matrix
+
+    inst = four_stations
+    sol = run_cfss(inst, consecutive=True)
+    sim, _ = build_similarity_matrix(inst.O, inst.orders_req, inst.rt, inst.rt_ret, normalize=False)
+    cluster_of = {o: i for i, c in enumerate(agglomerative_cluster(inst, sim, threshold=0.1, max_cluster_orders=4))
+                  for o in c.order_ids}
+    for s in inst.S:
+        starts = sorted((a, o) for o, (st, _, a, _) in sol.order_assignments.items() if st == s)
+        seen, prev = set(), None
+        for _, o in starts:  # a cluster, once left, is never resumed
+            c = cluster_of[o]
+            assert c == prev or c not in seen
+            seen.add(c)
+            prev = c
+
+
+def test_cfss_rejects_unknown_balance(four_stations):
+    from heuristics import run_cfss
+
+    with pytest.raises(ValueError):
+        run_cfss(four_stations, balance="nope")

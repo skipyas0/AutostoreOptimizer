@@ -12,6 +12,10 @@ happens to be at the pickface. GBS turns this around and schedules *bin visits*:
    - ``"cluster_lpt"``: LPT over order *clusters* instead of single orders. Clusters come from the
      CFSS clustering (UPGMA on normalised rt-weighted Jaccard, threshold 0.1, at most
      ``cluster_max_orders`` orders); cluster mates share a station, the balance stays LPT-like.
+   - ``"regret"``: regret-2 assignment on co-location value. ``fit(o, s)`` is the robot time
+     ``Σ (rt + rt_ret)`` of o's SKUs that station s already has; a station is eligible while
+     ``load_s + Σp(o) <= (1 + regret_eps) · Σp / |S|``. The unassigned order with the largest
+     regret (best eligible fit minus second best) goes to its best station (ties: least loaded).
 2. **Seed** the lanes of every station: the order with the smallest ``sum_rt`` takes the first lane,
    then each next lane takes the unscheduled order with the largest ``Σ (rt + rt_ret)`` overlap with
    the SKUs of the orders already seeded (ties: smaller ``sum_rt``).
@@ -25,7 +29,10 @@ happens to be at the pickface. GBS turns this around and schedules *bin visits*:
    it. An order may pick its SKUs in any order, so a deferred SKU tends to become its last pick and
    the visit can also serve the next order admitted to a freed lane. An order
    whose picks are all done frees its lane; the unscheduled order of that station with the largest
-   overlap with the remaining SKUs of the active orders takes the lane.
+   overlap with the remaining SKUs of the active orders takes the lane. With
+   ``admit="last_chance"`` the robot time of the SKUs for which the candidate is the *last*
+   waiting order of the station counts once more: admitting it lets one visit serve all orders
+   that still need such a SKU, which strict deferral would otherwise keep holding back.
 4. **Which station steps** (``interleave``):
    - ``True`` (default): always the station whose pickface frees up first (ties: first station),
      so bin visits are committed roughly in time order over all stations.
@@ -62,8 +69,9 @@ from heuristics.solution import HeuristicSolution
 from instance import Instance
 
 GBS_RULES = ("max_sharing", "critical_path", "readiness_weighted")
-GBS_PARTITIONS = ("overlap", "lpt", "cluster_lpt")
+GBS_PARTITIONS = ("overlap", "lpt", "cluster_lpt", "regret")
 GBS_DEFER = (None, "soft", "strict")
+GBS_ADMIT = ("overlap", "last_chance")
 
 
 @dataclass
@@ -85,6 +93,7 @@ class _Station:
     future: Counter = field(default_factory=Counter)  # SKU -> unscheduled orders of this station needing it
     admitted: list[int] = field(default_factory=list)  # admission order (replays the run with window=1)
     window: int | None = None  # admit among the first `window` unscheduled orders only (None: all, by overlap)
+    admit_rule: str = "overlap"  # lane admission score, see GBS_ADMIT
 
     def admit(self, o: int, inst: Instance) -> None:
         """Move unscheduled order o to the active orders."""
@@ -109,8 +118,11 @@ class _Task:
 # ======================================================================
 
 
-def partition_orders(inst: Instance, method: str = "overlap", cluster_max_orders: int = 4) -> dict[int, list[int]]:
+def partition_orders(inst: Instance, method: str = "overlap", cluster_max_orders: int = 4,
+                     regret_eps: float = 0.05) -> dict[int, list[int]]:
     """Station -> orders (in assignment order), see ``GBS_PARTITIONS``."""
+    if method == "regret":
+        return _partition_regret(inst, regret_eps)
     if method == "overlap":
         return _partition_overlap(inst)
     if method == "lpt":
@@ -149,6 +161,63 @@ def _partition_lpt(inst: Instance, groups: list[list[int]]) -> dict[int, list[in
     return station_orders
 
 
+def _partition_regret(inst: Instance, eps: float = 0.05) -> dict[int, list[int]]:
+    """Regret-2 partition on co-location value under a picking-workload cap (see the module docstring).
+
+    Ties: larger regret, then larger Σp, then the earlier order in ``inst.O``; among stations, the
+    best fit, then the smaller load, then the first station. An order with no eligible station goes
+    to the least loaded one. Fits are updated incrementally: when o goes to s, each SKU new at s adds
+    its robot time to every unassigned order that needs it.
+    """
+    import numpy as np
+
+    O, S = list(inst.O), list(inst.S)
+    req, p, rt, rr = inst.orders_req, inst.p, inst.rt, inst.rt_ret
+    n, m = len(O), len(S)
+    out: dict[int, list[int]] = {s: [] for s in S}
+    if n == 0:
+        return out
+    work = np.array([sum(p[k] for k in req[o]) for o in O], float)
+    cap = (1 + eps) * work.sum() / m
+    fit = np.zeros((n, m))
+    load = np.zeros(m)
+    has: list[set[int]] = [set() for _ in S]
+    orders_of: dict[int, list[int]] = {}
+    for i, o in enumerate(O):
+        for k in sorted(set(req[o])):
+            orders_of.setdefault(k, []).append(i)
+    free = np.ones(n, bool)
+    for _ in range(n):
+        feas = (load[None, :] + work[:, None]) <= cap + 1e-9
+        f = np.where(feas, fit, -np.inf)
+        if m > 1:
+            top2 = -np.sort(-f, axis=1)[:, :2]
+            second = np.where(np.isfinite(top2[:, 1]), top2[:, 1], 0.0)  # no alternative: fit 0
+            reg = np.where(np.isfinite(top2[:, 0]), top2[:, 0] - second, 0.0)
+        else:
+            reg = np.zeros(n)
+        reg = np.where(free, reg, -np.inf)
+        cand = np.flatnonzero(reg == reg.max())
+        i = int(cand[np.lexsort((cand, -work[cand]))][0])
+        if not feas[i].any():
+            s_i = int(np.argmin(load))
+        else:
+            row = f[i]
+            best = np.flatnonzero(row == row.max())
+            s_i = int(best[np.argmin(load[best])])
+        o = O[i]
+        out[S[s_i]].append(o)
+        load[s_i] += work[i]
+        free[i] = False
+        for k in sorted(set(req[o]) - has[s_i]):
+            has[s_i].add(k)
+            w = rt[k] + rr[k]
+            for j in orders_of[k]:
+                if free[j]:
+                    fit[j, s_i] += w
+    return out
+
+
 def _partition_overlap(inst: Instance) -> dict[int, list[int]]:
     """rt-overlap gain minus rt load, largest sum_rt first (the original GBS partition)."""
     rt, req = inst.rt, inst.orders_req
@@ -178,6 +247,18 @@ def _pick_by_overlap(cands: list[int], skus: set[int], inst: Instance) -> int:
     """Largest (rt + rt_ret) overlap with `skus`; ties -> smaller sum_rt, then earlier in `cands`."""
     rt = inst.rt
     return max(cands, key=lambda o: (_overlap_weight(o, skus, inst), -sum(rt[k] for k in inst.orders_req[o])))
+
+
+def _pick_last_chance(st: _Station, cands: list[int], skus: set[int], inst: Instance) -> int:
+    """Overlap weight plus the robot time of SKUs in `skus` for which o is the station's last waiting order."""
+    rt, rr, future = inst.rt, inst.rt_ret, st.future
+
+    def key(o: int) -> tuple[int, int]:
+        common = inst.req_sets[o] & skus
+        last = sum(rt[k] + rr[k] for k in common if future[k] == 1)
+        return (last + _overlap_weight(o, skus, inst), -sum(rt[k] for k in inst.orders_req[o]))
+
+    return max(cands, key=key)
 
 
 def _candidates(st: _Station) -> list[int]:
@@ -269,7 +350,10 @@ def _complete_and_admit(st: _Station, inst: Instance, windows: dict[int, tuple[i
         ln.order, ln.free_at = None, windows[o][1]
         if st.unscheduled:
             remaining = set().union(*st.pending.values()) if st.pending else set()
-            new_o = _pick_by_overlap(_candidates(st), remaining, inst)
+            if st.admit_rule == "last_chance":
+                new_o = _pick_last_chance(st, _candidates(st), remaining, inst)
+            else:
+                new_o = _pick_by_overlap(_candidates(st), remaining, inst)
             st.admit(new_o, inst)
             ln.order = new_o
 
@@ -311,6 +395,8 @@ class _Options:
     interleave: bool
     partition: str
     cluster_max_orders: int
+    admit: str = "overlap"
+    regret_eps: float = 0.05
 
 
 def _run_gbs_rule(
@@ -321,14 +407,14 @@ def _run_gbs_rule(
     state = init_state(inst, horizon, exo)
     t0 = (exo.batch_start_time if exo else 0)
     if assignment is None:
-        assignment = partition_orders(inst, opt.partition, opt.cluster_max_orders)
+        assignment = partition_orders(inst, opt.partition, opt.cluster_max_orders, opt.regret_eps)
     pick_events: dict[tuple[int, int, int], tuple[int, int]] = {}
     windows: dict[int, tuple[int, int]] = {}
     lane_of: dict[int, int] = {}
     stations = []
     for s in inst.S:
         st = _Station(s, [_Lane(ln, None, t0) for ln in inst.L], unscheduled=list(assignment.get(s, ())),
-                      pickface_free=t0, window=window)
+                      pickface_free=t0, window=window, admit_rule=opt.admit)
         for o in st.unscheduled:
             st.future.update(inst.req_sets[o])
         stations.append(st)
@@ -366,7 +452,7 @@ def _run_gbs_rule(
         feasible=not failed,
         pick_events={key: t for key, t in pick_events.items() if key[0] in order_assignments},
         meta={"heuristic": "gbs", "rule": opt.rule, "defer": opt.defer, "interleave": opt.interleave,
-              "partition": opt.partition, "assignment": assignment,
+              "partition": opt.partition, "admit": opt.admit, "assignment": assignment,
               "sequence": {st.s: list(st.admitted) for st in stations}},
     )
 
@@ -382,6 +468,8 @@ def run_gbs(
     interleave: bool = True,
     partition: str = "overlap",
     cluster_max_orders: int = 4,
+    admit: str = "overlap",
+    regret_eps: float = 0.05,
     exo: ExoState | None = None,
 ) -> HeuristicSolution:
     """Global Bin Scheduling (see the module docstring).
@@ -390,7 +478,9 @@ def run_gbs(
     ``interleave``: advance the station whose pickface frees first (default) instead of building
     the stations one after another (the original GBS). ``partition``: ``"overlap"`` (original),
     ``"lpt"`` (load-balanced on picking workload) or ``"cluster_lpt"`` (LPT over order clusters
-    of at most ``cluster_max_orders`` orders).
+    of at most ``cluster_max_orders`` orders) or ``"regret"`` (regret-2 on co-location value,
+    picking-workload cap ``(1 + regret_eps)`` times the mean). ``admit``: lane admission,
+    ``"overlap"`` (default) or ``"last_chance"``.
 
     ``alpha`` / ``beta`` only matter for ``rule="adaptive"``, which keeps the best feasible
     rule by ``alpha * C_max + beta * Σ_s span_s`` (``meta["runs"]``: one record per rule).
@@ -401,9 +491,11 @@ def run_gbs(
         raise ValueError(f"Unknown GBS defer {defer!r}; choose from {GBS_DEFER}")
     if rule != "adaptive" and rule not in GBS_RULES:
         raise ValueError(f"Unknown GBS rule {rule!r}; choose from {GBS_RULES} or 'adaptive'")
+    if admit not in GBS_ADMIT:
+        raise ValueError(f"Unknown GBS admit {admit!r}; choose from {GBS_ADMIT}")
 
     def opts(r: str) -> _Options:
-        return _Options(r, defer, interleave, partition, cluster_max_orders)
+        return _Options(r, defer, interleave, partition, cluster_max_orders, admit, regret_eps)
 
     if rule != "adaptive":
         return _run_gbs_rule(inst, horizon, exo, opts(rule))
@@ -428,6 +520,7 @@ def run_gbs_sequence(
     defer: str | None = "strict",
     window: int = 1,
     sku_bias: dict[int, float] | None = None,
+    admit: str = "overlap",
     exo: ExoState | None = None,
     quiet: bool = True,
 ) -> HeuristicSolution:
@@ -435,7 +528,8 @@ def run_gbs_sequence(
 
     ``sequence``: station -> its orders in admission order. Each freed lane admits, among the first
     ``window`` unscheduled orders of the sequence, the one with the largest overlap with the active
-    orders (``window=1``: strictly in sequence order). ``sku_bias``: SKU -> value added to every bin
+    orders (``window=1``: strictly in sequence order; ``admit="last_chance"`` scores the window as
+    ``run_gbs`` does). ``sku_bias``: SKU -> value added to every bin
     task score of that SKU (strict deferral still comes first).
 
     ``run_gbs(...).meta["sequence"]`` decoded with ``window=1`` and the same rule and deferral
@@ -445,7 +539,9 @@ def run_gbs_sequence(
         raise ValueError(f"Unknown GBS rule {rule!r}; choose from {GBS_RULES}")
     if window < 1:
         raise ValueError("window must be >= 1")
-    opt = _Options(rule, defer, True, "given", 0)
+    if admit not in GBS_ADMIT:
+        raise ValueError(f"Unknown GBS admit {admit!r}; choose from {GBS_ADMIT}")
+    opt = _Options(rule, defer, True, "given", 0, admit)
     sol = _run_gbs_rule(inst, horizon, exo, opt, assignment=sequence, window=window,
                         sku_bias=sku_bias, quiet=quiet)
     sol.meta["window"] = window

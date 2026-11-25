@@ -60,10 +60,13 @@ CLI: `python -m heuristics --list`, `python -m heuristics <name> [--orders 40 ..
 | `partitioned_rdi_{random,similarity,load_balanced}` | `run_partitioned_rdi(partition=...)` (seed 0) |
 | `partitioned_rdi_load_balanced_share` | as above with the `rdi_share` options |
 | `cfss` / `cfss_normalized` | `run_cfss(normalize_similarity=False / True)` |
+| `cfss_share` | `run_cfss(consecutive=True, balance="work", extend_share_window=True, share_reward=1.0)` |
 | `gbs_max_sharing` (alias `gbs`) / `gbs_critical_path` / `gbs_readiness_weighted` / `gbs_adaptive` | `run_gbs(rule=...)` (interleaved stations, strict SKU deferral, overlap partition) |
 | `gbs_lpt` / `gbs_cluster_lpt` | `run_gbs(partition="lpt" / "cluster_lpt")` |
+| `gbs_regret` / `gbs_regret_lc` | `run_gbs(partition="regret")` / `run_gbs(partition="regret", admit="last_chance")` |
 | `gbs_no_defer` / `gbs_sequential` | `run_gbs(defer=None)` / `run_gbs(defer=None, interleave=False)` (original construction) |
 | `gbs_evolve` / `gbs_evolve_work` | `run_gbs_evolve(method="ga", fitness="makespan")` / `(method="ls", fitness="work")`, both `window=3, max_evals=300` |
+| `gbs_evolve_work_regret` | `gbs_evolve_work` with the regret partition as a fourth seed |
 
 Aliases such as `greedy`, `load_balanced_greedy` and `rdi_sgc` are accepted by `run_heuristic`
 and by `precalculate_instances_for_lns.py`.
@@ -253,7 +256,28 @@ This is the heuristic-only counterpart of `decomposition.solve_station_decomposi
 3. Assign clusters to the station with the least rt mass. Multi-order clusters go first, then singletons, each group by mass descending.
 4. Interleave: repeatedly take the station whose earliest lane frees first and commit its pending order with the best SGC plan.
 
-Parameters: `horizon, alpha, beta (default 1.0), sim_threshold (0.1), max_cluster_orders (4), normalize_similarity`.
+Parameters: `horizon, alpha, beta (default 1.0), sim_threshold (0.1), max_cluster_orders (4), normalize_similarity,
+balance, consecutive, extend_share_window, share_reward`.
+- `balance="work"` balances the clusters on picking workload Σ p instead of rt mass (`"rt_mass"`, default).
+- `consecutive=True`: the earliest-free station only considers the orders of its current cluster (the first one in
+  assignment order with pending orders); if none of them fits, all its pending orders. Cluster mates are then on the
+  lanes together and can share visits. Without it, phase 2 takes the best-scored (usually shortest) pending order
+  wherever it sits, so clusters are co-located but rarely share (~3 shared visits per instance).
+- `extend_share_window`, `share_reward`: the SGC bin-sharing options.
+
+On the 15 LNS benchmark instances, relative to `lb_sgc_share` (main, Nov 2026):
+
+| CFSS variant | makespan | fetches | robot work | workload imb. | shared visits |
+|---|---|---|---|---|---|
+| `cfss` | 0.0% | +4.0% | +2.3% | 23.7% | 3 |
+| + share options | −1.3% | +2.2% | +1.2% | 23.7% | 25 |
+| consecutive | +2.2% | +2.7% | +1.5% | 23.7% | 17 |
+| consecutive + share | +0.5% | −0.5% | −0.4% | 23.7% | 56 |
+| consecutive + share + `balance="work"` (`cfss_share`) | −0.8% | −0.6% | −0.5% | 0.4% | 57 |
+
+The scratch prototype in docs/FUTURE_IDEAS.md had reported −2.0% makespan and −1.9% fetches for "consecutive +
+share". That code was lost, and the version here gets about the same number of shared visits but a smaller fetch
+saving. CFSS stays order-centred; GBS saves −20% fetches on the same instances.
 Plans use the SGC planner, so MoveCap and PickCap hold. Clusters and pending orders are visited in a fixed order, so the
 result is deterministic.
 
@@ -284,6 +308,17 @@ at the station that needs the SKU.
      time order over all stations.
    - `False` (original, registry `gbs_sequential`): each station runs to completion before the next starts.
 
+Partition `"regret"` (`regret_eps`, default 0.05): regret-2 assignment on co-location value. `fit(o, s)` = robot
+time `Σ (rt + rt_ret)` of o's SKUs that station s already has (updated incrementally as orders are assigned); s
+is eligible while `load_s + Σp(o) <= (1 + ε) · Σp / |S|` (no eligible station: least loaded). The unassigned
+order with the largest regret (best eligible fit − second best; ties: larger Σp, then order id) goes to its best
+station (ties: least loaded). Overlaps are sparse, so regret ≈ "most co-location value first".
+
+Admission `admit="last_chance"`: a freed lane takes the waiting order with the largest overlap weight plus the
+robot time of the active orders' remaining SKUs for which it is the station's *last* waiting order
+(`future[k] == 1`). Admitting it lets one visit serve all of them; strict deferral would otherwise keep holding the
+SKU back. Default `"overlap"` (overlap weight only).
+
 Rules (task score, higher first): `max_sharing` (n_served·(rt+rt_ret)), `critical_path` (largest remaining
 Σ(rt+p+rt_ret) of a served order), `readiness_weighted` (max_sharing − pickface idle gap), `adaptive` (best feasible of
 the three by `objective(alpha, beta)`).
@@ -313,6 +348,18 @@ On the 15 LNS benchmark instances (β = 1), relative to `lb_sgc_share`:
 | `gbs_adaptive` | −9.3% | −20.1% | −12.2% | 86% | 14.9% | 13.9% | 3.3 s |
 | `gbs_lpt` | −6.7% | −18.4% | −10.9% | 85% | 0.2% | 19.8% | 1.1 s |
 | `gbs_cluster_lpt` | −8.9% | −20.9% | −12.8% | 85% | 0.2% | 17.7% | 2.6 s |
+
+Regret partition and last-chance admission, relative to `gbs_max_sharing` (same 15 instances; main, Nov 2026):
+
+| | makespan | fetches | robot work | W better on |
+|---|---|---|---|---|
+| `admit="last_chance"` alone | −0.2% | −0.5% | −0.3% | 14/15 |
+| `gbs_regret` | −0.6% | −2.8% | −1.8% | 15/15 |
+| `gbs_regret_lc` | +0.9% | −3.3% | −2.1% | 15/15 |
+
+These are the scratch-prototype numbers of docs/FUTURE_IDEAS.md, reproduced exactly (same partition on all 15
+instances). LNS keeps the start's W, so `gbs_regret_lc` should give about −2% final LNS makespan; this has not been
+validated yet.
 
 Runtimes in this table predate the incremental MoveCap profile (see `DifferenceArray`), which made GBS about 50×
 faster (3.0 s → 0.06 s on GEN1-10, bit-identical results); SGC got about 8× faster, RDI is unchanged.

@@ -313,7 +313,12 @@ class VisualLogger:
             "num_discovered_solutions": np.full(iters, -1, dtype=np.int32),
         }
 
-        self.current_barcode = np.full((iters, num_variables), -1, dtype=np.int8)
+        # iterations x variables int8 matrix of which strategy freed what; off with --no-barcode
+        # (a 1 h time-limited run preallocates time_limit / 0.5 s rows, ~6 GB at 600 orders)
+        if self.experiment_config.get("barcode", True):
+            self.current_barcode = np.full((iters, num_variables), -1, dtype=np.int8)
+        else:
+            self.current_barcode = None
         self.current_iteration = 0
         self.completed_iterations = 0
         self.active_run_start = time.perf_counter()

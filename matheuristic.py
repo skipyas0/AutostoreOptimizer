@@ -1145,6 +1145,15 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--barcode",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        dest="barcode",
+        help="Record the per-iteration neighbourhood barcode (iterations x variables int8 in memory) and "
+        "plot it at the end. --no-barcode saves memory on long runs of large instances; the replay "
+        "(solutions.npz) and the history strategies do not need it",
+    )
+    parser.add_argument(
         "--replay-html",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -1317,6 +1326,7 @@ if __name__ == "__main__":
             "cp_objective_phase_schedule": args.cp_objective_phase_schedule,
             "render_video": args.render_video,
             "replay_html": args.replay_html,
+            "barcode": args.barcode,
             "only_first_sol": args.only_first_sol,
             "lns_model": args.lns_model,
             "validate_merges": args.validate_merges,

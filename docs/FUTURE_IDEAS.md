@@ -51,6 +51,9 @@ Stealing would only matter where the GBS schedule itself is used (no LNS afterwa
 
 ## GBS: regret-based partition (and last-chance admission)
 
+**Implemented on main (Nov 2026):** `run_gbs(partition="regret", admit="last_chance")`, registry `gbs_regret` /
+`gbs_regret_lc` (see docs/HEURISTICS.md). The evidence below was reproduced exactly. LNS validation is still open.
+
 **Idea.** Assign orders to stations in regret order, as RDI does, instead of a fixed largest-first order. A bin
 visit can only be shared at one station, so the partition caps sharing: with one visit per (station, SKU), the
 current partitions would need 0.68–0.72 fetches per order line (0.55 if every SKU were fetched once overall).
@@ -104,6 +107,10 @@ instead of ~1.1 s. Only ~11% of order pairs share any SKU, so a sparse similarit
 candidate merges would make it near-linear in the number of overlapping pairs. Results must stay identical.
 
 ## CFSS: let the clusters reach the schedule
+
+**Implemented on main (Nov 2026):** `run_cfss(consecutive=..., balance="work", extend_share_window=...,
+share_reward=...)`, registry `cfss_share`. The reimplementation gives −0.5% fetches instead of −1.9% (table in
+docs/HEURISTICS.md); the scratch code behind the table below was lost.
 
 Diagnosis (15 eval instances): clusters are co-located at a station, but phase 2 commits the lowest-score (shortest)
 pending order wherever it sits, and the SGC planner runs without the share options. With PickCap 1 a bin can only be
