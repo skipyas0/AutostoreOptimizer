@@ -41,16 +41,17 @@ def cfg(base: dict, **kw) -> dict:
 # Resource model (per process). orders -> GB / seconds; measured values from the server logs.
 # ---------------------------------------------------------------------------------------------
 
-MEM_GB = {  # peak RSS
-    ("full", 300): 4.0, ("full", 400): 10.5,           # measured (warm-start benchmark, 150 iterations)
-    ("full", 600): 30.0, ("full", 800): 55.0,          # guess (x variables)
-    ("subproblem", 300): 3.0, ("subproblem", 400): 5.0,  # guess
-    ("subproblem", 600): 9.0, ("subproblem", 800): 16.0,  # guess
-    ("cp", 300): 5.0, ("cp", 400): 12.0, ("cp", 600): 35.0, ("cp", 800): 60.0,  # guess
+MEM_GB = {  # peak RSS with margin for 1 h growth. P0 (server, 2026-11-25): sub 15 iters 1.1/1.7/4.4/8.3 GB,
+    # sub 1 h 5.3 (600) / 10.1 (800); full 15 iters 1.6/3.6/9.1/19.1; CP at 120 s 10.8 (600) / 20.9 (800)
+    ("subproblem", 300): 1.5, ("subproblem", 400): 2.5, ("subproblem", 600): 6.5, ("subproblem", 800): 12.0,
+    ("full", 300): 3.0, ("full", 400): 6.0, ("full", 600): 14.0, ("full", 800): 28.0,
+    ("cp", 300): 4.0, ("cp", 400): 7.0, ("cp", 600): 14.0, ("cp", 800): 28.0,  # 300/400: extrapolated
 }
-SETUP_S = {300: 60, 400: 90, 600: 200, 800: 400}  # per run: model setup + final validation/plots (guess)
-ITER_S = {("full", 300): 4.7, ("full", 400): 9.0, ("subproblem", 300): 3.5, ("subproblem", 400): 4.5,
-          ("full", 600): 25.0, ("full", 800): 50.0, ("subproblem", 600): 6.0, ("subproblem", 800): 9.0}
+SETUP_S = {300: 40, 400: 45, 600: 70, 800: 130}  # per run: wall time beyond the time limit (P0_long: 58 / 108 s)
+ITER_S = {  # median s/iter on an idle machine (P0_lns); at 7 concurrent jobs x1.26 (P0_concurrency)
+    ("subproblem", 300): 3.2, ("subproblem", 400): 3.5, ("subproblem", 600): 5.4, ("subproblem", 800): 6.6,
+    ("full", 300): 4.2, ("full", 400): 7.4, ("full", 600): 17.6, ("full", 800): 33.3,
+}
 
 
 def orders_of(instance: str) -> int:
