@@ -30,11 +30,17 @@ BASE = {
     "improvement-constr": True, "improvement-ref": "current", "rrt-threshold": 0.05,
     "stagnation-th": 50, "default-percent": 0.2, "barcode": False,
 }
-FINAL = dict(BASE)  # set after the S2 analysis
 
 
 def cfg(base: dict, **kw) -> dict:
     return {**base, **{k.replace("_", "-"): v for k, v in kw.items()}}
+
+
+# S2 (2026-11-26, results/S1_S2_campaign): the per-iteration search limit is the only factor with signal,
+# 10 s vs 3 s: -0.83% C (9/10 instances, p = 0.004), formed by 120 s and stable to 600 s. Objectives and
+# strategy presets are within noise (|d| <= 0.3%). default-percent does not reach the bin_sharing strategies
+# (all timeslice-based), so neighbourhood size is screened in S2b via default-timeslice-width.
+FINAL = cfg(BASE, iter_time_limit=10)  # fallback until S2b is analysed
 
 
 # ---------------------------------------------------------------------------------------------
@@ -137,6 +143,13 @@ _add(Experiment("P0_cp", "resources: monolithic CP memory and build time", sets=
 _add(Experiment("S2_screen", "H6-H8: objectives, strategies, neighbourhood size x search limit",
                 sets=["tune"], shapes=TENTH, starts=["gbs_cluster_lpt"], arms=_screen_arms(),
                 runs=2, time_limit=600, stage="S2"))
+
+# S2b: the real neighbourhood size (timeslice width; S2's default-percent does not reach bin_sharing) x longer
+# search limits. 20 min runs, so 20-30 s iterations still get 40-60 iterations.
+_S2B = {f"it{itl}_w{w}": cfg(BASE, iter_time_limit=itl, default_timeslice_width=w)
+        for itl, w in ((10, 100), (20, 100), (30, 100), (10, 50), (10, 200), (20, 200))}
+_add(Experiment("S2b_screen", "H8: timeslice width x search limit (follow-up of S2)", sets=["tune"], shapes=TENTH,
+                starts=["gbs_cluster_lpt"], arms=_S2B, runs=2, time_limit=1200, stage="S2"))
 
 # --- S3: main experiments on eval / scale / regime instances with FINAL ----------------------------
 _add(Experiment("H1_starts", "H1/H4/H16: warm-start dose-response; headline (subproblem LNS, 1 h)",
