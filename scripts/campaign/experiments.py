@@ -40,7 +40,10 @@ def cfg(base: dict, **kw) -> dict:
 # 10 s vs 3 s: -0.83% C (9/10 instances, p = 0.004), formed by 120 s and stable to 600 s. Objectives and
 # strategy presets are within noise (|d| <= 0.3%). default-percent does not reach the bin_sharing strategies
 # (all timeslice-based), so neighbourhood size is screened in S2b via default-timeslice-width.
-FINAL = cfg(BASE, iter_time_limit=10)  # fallback until S2b is analysed
+# S2b (20 min runs, vs it10_w100): width 50 -0.28% (9/10, p = 0.014, gap widening over time), width 200 +0.42%;
+# 20 s iterations -0.32% (10/10) but the gap shrinks after 600 s (-0.43 -> -0.32%) and 30 s is no better.
+# FINAL takes the narrower window: its advantage grows with time, and it keeps ~90 iterations per 20 min.
+FINAL = cfg(BASE, iter_time_limit=10, default_timeslice_width=50)
 
 
 # ---------------------------------------------------------------------------------------------
